@@ -2109,6 +2109,10 @@ class TUI:
 
     def switch_to_next_window(self):
         self.current_window_index = (self.current_window_index + 1) % len(self.windows)
+        win = self.get_current_window()
+        if win.name not in ("*status*", "*dashboard*"):
+            self.current_channel = win.name
+        self._userlist_dirty = True
         self.dirty = True
 
     def do_nick_complete(self) -> None:
@@ -2430,6 +2434,10 @@ class TUI:
                     idx = int(args) - 1
                     if 0 <= idx < len(self.windows):
                         self.current_window_index = idx
+                        win = self.windows[idx]
+                        if win.name not in ("*status*", "*dashboard*"):
+                            self.current_channel = win.name
+                        self._userlist_dirty = True
             elif cmd in ("quit", "exit"):
                 self.client.send_raw(f"QUIT :{args}" if args else "QUIT :Client exiting")
                 raise SystemExit
