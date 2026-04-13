@@ -1301,14 +1301,13 @@ class IRCClient:
             u_state = self.users[nick]
             u_score = self.scoring.score_user(u_state)
             m_score = self.scoring.score_message(None, u_state)
-            loop = asyncio.get_running_loop()
-            a_prob = await loop.run_in_executor(None, self.scoring.ai_detector.predict_prob, msg)
-            a_score = int(a_prob * 100)
-            u_state.record_message(msg, a_score)
-            rolling_ai = int(u_state.rolling_ai_likelihood())
 
-            await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, a_score, rolling_ai, is_action))
-            log_ai_event(nick, target, msg, u_score, m_score, a_score, rolling_ai)
+            # Display immediately with placeholder AI score (0) so the message
+            # appears on screen without waiting for ML inference (which can take
+            # hundreds of ms on CPU).  A background task scores it and sends an
+            # "ai_score" update event once inference finishes.
+            await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0, is_action))
+            asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
 
         elif cmd == "NICK":
             new_nick = trailing or (params[0] if params else "")
@@ -1455,6 +1454,21 @@ class IRCClient:
 
     def cmd_names(self, channel: str = "") -> None:
         self.send_raw(f"NAMES {channel}" if channel else "NAMES")
+
+    async def _score_msg_bg(self, nick: str, target: str, msg: str,
+                            u_state: "UserState", u_score: int, m_score: int) -> None:
+        """Run AI inference off the read loop, then push an update event."""
+        try:
+            loop = asyncio.get_running_loop()
+            a_prob = await loop.run_in_executor(
+                None, self.scoring.ai_detector.predict_prob, msg)
+            a_score = int(a_prob * 100)
+            u_state.record_message(msg, a_score)
+            rolling_ai = int(u_state.rolling_ai_likelihood())
+            log_ai_event(nick, target, msg, u_score, m_score, a_score, rolling_ai)
+            await self.ui_queue.put(("ai_score", nick, rolling_ai))
+        except Exception:
+            u_state.record_message(msg, 0)
 
 # =========================
 # TUI - Enhanced Dashboard
@@ -2059,9 +2073,9 @@ class TUI:
         except curses.error:
             pass
 
-    def redraw(self) -> None:
+    def redraw(self) -> bool:
         if time.time() - self.last_redraw < 0.033:
-            return
+            return False
         self.last_redraw = time.time()
 
         new_h, new_w = self.stdscr.getmaxyx()
@@ -2088,6 +2102,7 @@ class TUI:
             w.noutrefresh()
         if refreshed:
             curses.doupdate()
+        return True
 
     def get_current_window(self) -> ChatWindow:
         return self.windows[self.current_window_index]
@@ -2158,6 +2173,17 @@ class TUI:
                 self._sorted_users.pop(target, None)
                 self._userlist_dirty = True
             self._chat_dirty = True
+            self.dirty = True
+
+        elif etype == "ai_score":
+            _, nick, rolling_ai = event
+            self.user_ai_scores[nick] = rolling_ai
+            if rolling_ai >= self.ai_suspect_threshold:
+                self._suspect_nicks.add(nick)
+                self._dashboard_dirty = True
+            else:
+                self._suspect_nicks.discard(nick)
+            self._userlist_dirty = True
             self.dirty = True
 
         elif etype == "notice":
@@ -2629,21 +2655,244 @@ class TUI:
         self.dirty = True
         self.completion_state = None
 
+    def _handle_key(self, ch: int) -> bool:
+        """Process a single keycode synchronously.  Returns True if the key was
+        Enter (so the caller can await handle_input_line and break the drain loop),
+        False for all other keys."""
+        if ch in (curses.KEY_ENTER, 10, 13):
+            return True   # caller handles asynchronously
+
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            if self.input_cursor > 0:
+                self.input_buffer = (self.input_buffer[:self.input_cursor - 1]
+                                     + self.input_buffer[self.input_cursor:])
+                self.input_cursor -= 1
+            self.completion_state = None
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_DC:
+            if self.input_cursor < len(self.input_buffer):
+                self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                     + self.input_buffer[self.input_cursor + 1:])
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_LEFT:
+            if self.input_cursor > 0:
+                self.input_cursor -= 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_RIGHT:
+            if self.input_cursor < len(self.input_buffer):
+                self.input_cursor += 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_HOME:
+            if self.input_buffer:
+                if self.input_cursor > 0:
+                    self.input_cursor = 0
+                    self._input_dirty = True
+                    self.dirty = True
+                else:
+                    win = self.get_current_window()
+                    self._wrap_window(win)
+                    win.scroll_offset = max(0, len(win.wrapped_cache) - self._content_height)
+                    self._chat_dirty = True
+                    self.dirty = True
+            else:
+                win = self.get_current_window()
+                self._wrap_window(win)
+                win.scroll_offset = max(0, len(win.wrapped_cache) - self._content_height)
+                self._chat_dirty = True
+                self.dirty = True
+
+        elif ch == curses.KEY_END:
+            if self.input_cursor < len(self.input_buffer):
+                self.input_cursor = len(self.input_buffer)
+                self._input_dirty = True
+                self.dirty = True
+            else:
+                self.get_current_window().scroll_offset = 0
+                self._chat_dirty = True
+                self.dirty = True
+
+        elif ch == 1:    # Ctrl+A
+            self.input_cursor = 0
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 5:    # Ctrl+E
+            self.input_cursor = len(self.input_buffer)
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 11:   # Ctrl+K
+            self.input_buffer = self.input_buffer[:self.input_cursor]
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 21:   # Ctrl+U
+            self.input_buffer = ""
+            self.input_cursor = 0
+            self.history_index  = -1
+            self._history_draft = ""
+            self.completion_state = None
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 23:   # Ctrl+W
+            buf = self.input_buffer
+            pos = self.input_cursor
+            while pos > 0 and buf[pos - 1] == " ": pos -= 1
+            while pos > 0 and buf[pos - 1] != " ": pos -= 1
+            self.input_buffer = buf[:pos] + buf[self.input_cursor:]
+            self.input_cursor = pos
+            self.completion_state = None
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 2:    # Ctrl+B — bold
+            self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                 + "\x02" + self.input_buffer[self.input_cursor:])
+            self.input_cursor += 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 29:   # Ctrl+] — italic
+            self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                 + "\x1D" + self.input_buffer[self.input_cursor:])
+            self.input_cursor += 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 31:   # Ctrl+_ — underline
+            self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                 + "\x1F" + self.input_buffer[self.input_cursor:])
+            self.input_cursor += 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 15:   # Ctrl+O — reset formatting
+            self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                 + "\x0F" + self.input_buffer[self.input_cursor:])
+            self.input_cursor += 1
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 6:    # Ctrl+F — word right
+            pos = self.input_cursor
+            buf = self.input_buffer
+            while pos < len(buf) and buf[pos] == " ": pos += 1
+            while pos < len(buf) and buf[pos] != " ": pos += 1
+            self.input_cursor = pos
+            self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 16:   # Ctrl+P — previous history
+            _hlen = len(self.input_history)
+            if _hlen:
+                if self.history_index == -1:
+                    self._history_draft = self.input_buffer
+                self.history_index = min(self.history_index + 1, _hlen - 1)
+                self.input_buffer = self.input_history[self.history_index]
+                self.input_cursor = len(self.input_buffer)
+                self._input_dirty = True
+                self.dirty = True
+
+        elif ch == curses.KEY_UP:
+            if self.input_buffer or self.history_index >= 0:
+                _hlen = len(self.input_history)
+                if _hlen:
+                    if self.history_index == -1:
+                        self._history_draft = self.input_buffer
+                    self.history_index = min(self.history_index + 1, _hlen - 1)
+                    self.input_buffer = self.input_history[self.history_index]
+                    self.input_cursor = len(self.input_buffer)
+                    self._input_dirty = True
+                    self.dirty = True
+            else:
+                win = self.get_current_window()
+                self._wrap_window(win)
+                max_off = max(0, len(win.wrapped_cache) - self._content_height)
+                win.scroll_offset = min(win.scroll_offset + 1, max_off)
+                self._chat_dirty = True
+                self.dirty = True
+
+        elif ch == curses.KEY_DOWN:
+            if self.history_index >= 0:
+                self.history_index -= 1
+                self.input_buffer = (self._history_draft if self.history_index < 0
+                                     else self.input_history[self.history_index])
+                self.input_cursor = len(self.input_buffer)
+                self._input_dirty = True
+                self.dirty = True
+            else:
+                win = self.get_current_window()
+                win.scroll_offset = max(0, win.scroll_offset - 1)
+                self._chat_dirty = True
+                self.dirty = True
+
+        elif ch == 9:    # Tab — nick completion
+            prev_len = len(self.input_buffer)
+            self.do_nick_complete()
+            self.input_cursor += len(self.input_buffer) - prev_len
+
+        elif ch == 3:    # Ctrl+C
+            raise SystemExit
+
+        elif ch == 14:   # Ctrl+N — next window
+            self.switch_to_next_window()
+            self._chat_dirty = self._userlist_dirty = True
+
+        elif ch == curses.KEY_PPAGE:
+            win = self.get_current_window()
+            self._wrap_window(win)
+            max_off = max(0, len(win.wrapped_cache) - self._content_height)
+            win.scroll_offset = min(win.scroll_offset + self._content_height // 2, max_off)
+            self._chat_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_NPAGE:
+            win = self.get_current_window()
+            win.scroll_offset = max(0, win.scroll_offset - self._content_height // 2)
+            self._chat_dirty = True
+            self.dirty = True
+
+        elif 32 <= ch <= 1114111:
+            try:
+                ch_str = chr(ch)
+            except (ValueError, OverflowError):
+                ch_str = ""
+            if ch_str:
+                self.input_buffer = (self.input_buffer[:self.input_cursor]
+                                     + ch_str + self.input_buffer[self.input_cursor:])
+                self.input_cursor += 1
+                self.history_index  = -1
+                self.completion_state = None
+                self._input_dirty = True
+                self.dirty = True
+
+        elif ch == curses.KEY_RESIZE:
+            self.dirty = True
+
+        return False
+
     async def run(self) -> None:
         while True:
-            # Cap events per iteration so a message flood can't starve keyboard/redraw
-            n = 0
-            try:
-                while n < 64:
-                    event = self.ui_queue.get_nowait()
-                    await self.handle_event(event)
-                    n += 1
-            except asyncio.QueueEmpty:
-                pass
-
-            ch = self.stdscr.getch()
-            if ch != -1:
-                if ch in (curses.KEY_ENTER, 10, 13):
+            # ── 1. Keyboard — checked first so local input beats network traffic ──
+            # Drain all pending keys in one pass.  Enter is async so we break after
+            # it and let the redraw fire before consuming the next key.
+            had_key = False
+            while True:
+                ch = self.stdscr.getch()
+                if ch == -1:
+                    break
+                had_key = True
+                is_enter = self._handle_key(ch)
+                if is_enter:
                     line = self.input_buffer
                     if line.strip():
                         self.input_history.appendleft(line)
@@ -2655,237 +2904,28 @@ class TUI:
                     self.input_cursor  = 0
                     self.completion_state = None
                     self._input_dirty  = True
+                    break  # redraw before consuming the next key
 
-                elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                    # Delete char before cursor
-                    if self.input_cursor > 0:
-                        self.input_buffer = (self.input_buffer[:self.input_cursor - 1]
-                                             + self.input_buffer[self.input_cursor:])
-                        self.input_cursor -= 1
-                    self.completion_state = None
-                    self._input_dirty = True
-                    self.dirty = True
+            # ── 2. Immediate input refresh — bypasses the 30fps chat throttle ────
+            # Typing, cursor movement and backspace feel instantaneous because the
+            # input pane is repainted right here, not in the next throttled frame.
+            if had_key and self._input_dirty:
+                self._draw_input()
+                self._input_dirty = False
+                self.input_win.noutrefresh()
+                curses.doupdate()
 
-                elif ch == curses.KEY_DC:  # Delete key — remove char at cursor
-                    if self.input_cursor < len(self.input_buffer):
-                        self.input_buffer = (self.input_buffer[:self.input_cursor]
-                                             + self.input_buffer[self.input_cursor + 1:])
-                    self._input_dirty = True
-                    self.dirty = True
+            # ── 3. Network events (capped to prevent flood from starving keyboard) ─
+            n = 0
+            try:
+                while n < 64:
+                    event = self.ui_queue.get_nowait()
+                    await self.handle_event(event)
+                    n += 1
+            except asyncio.QueueEmpty:
+                pass
 
-                elif ch == curses.KEY_LEFT:
-                    if self.input_cursor > 0:
-                        self.input_cursor -= 1
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == curses.KEY_RIGHT:
-                    if self.input_cursor < len(self.input_buffer):
-                        self.input_cursor += 1
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == curses.KEY_HOME:
-                    if self.input_buffer:
-                        # First press → go to start of input; if already there → scroll chat
-                        if self.input_cursor > 0:
-                            self.input_cursor = 0
-                            self._input_dirty = True
-                            self.dirty = True
-                        else:
-                            win = self.get_current_window()
-                            self._wrap_window(win)
-                            win.scroll_offset = max(0, len(win.wrapped_cache) - self._content_height)
-                            self._chat_dirty = True
-                            self.dirty = True
-                    else:
-                        win = self.get_current_window()
-                        self._wrap_window(win)
-                        win.scroll_offset = max(0, len(win.wrapped_cache) - self._content_height)
-                        self._chat_dirty = True
-                        self.dirty = True
-
-                elif ch == curses.KEY_END:
-                    if self.input_cursor < len(self.input_buffer):
-                        self.input_cursor = len(self.input_buffer)
-                        self._input_dirty = True
-                        self.dirty = True
-                    else:
-                        self.get_current_window().scroll_offset = 0
-                        self._chat_dirty = True
-                        self.dirty = True
-
-                elif ch == 1:   # Ctrl+A — beginning of line
-                    self.input_cursor = 0
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == 5:   # Ctrl+E — end of line
-                    self.input_cursor = len(self.input_buffer)
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == 11:  # Ctrl+K — kill to end of line
-                    self.input_buffer = self.input_buffer[:self.input_cursor]
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == 21:  # Ctrl+U — clear entire line
-                    self.input_buffer = ""
-                    self.input_cursor = 0
-                    self.history_index  = -1
-                    self._history_draft = ""
-                    self.completion_state = None
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == 23:  # Ctrl+W — delete word before cursor
-                    buf  = self.input_buffer
-                    pos  = self.input_cursor
-                    # skip trailing spaces then delete back to next space
-                    while pos > 0 and buf[pos - 1] == " ":
-                        pos -= 1
-                    while pos > 0 and buf[pos - 1] != " ":
-                        pos -= 1
-                    self.input_buffer = buf[:pos] + buf[self.input_cursor:]
-                    self.input_cursor = pos
-                    self.completion_state = None
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == 2:   # Ctrl+B — insert IRC bold toggle \x02
-                    self.input_buffer = (self.input_buffer[:self.input_cursor]
-                                         + "\x02"
-                                         + self.input_buffer[self.input_cursor:])
-                    self.input_cursor += 1
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == 29:  # Ctrl+] — insert IRC italic toggle \x1D
-                    self.input_buffer = (self.input_buffer[:self.input_cursor]
-                                         + "\x1D"
-                                         + self.input_buffer[self.input_cursor:])
-                    self.input_cursor += 1
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == 31:  # Ctrl+_ — insert IRC underline toggle \x1F
-                    self.input_buffer = (self.input_buffer[:self.input_cursor]
-                                         + "\x1F"
-                                         + self.input_buffer[self.input_cursor:])
-                    self.input_cursor += 1
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == 15:  # Ctrl+O — insert IRC reset \x0F
-                    self.input_buffer = (self.input_buffer[:self.input_cursor]
-                                         + "\x0F"
-                                         + self.input_buffer[self.input_cursor:])
-                    self.input_cursor += 1
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == 6:   # Ctrl+F — move word right (forward)
-                    pos = self.input_cursor
-                    buf = self.input_buffer
-                    while pos < len(buf) and buf[pos] == " ": pos += 1
-                    while pos < len(buf) and buf[pos] != " ": pos += 1
-                    self.input_cursor = pos
-                    self._input_dirty = True
-                    self.dirty = True
-
-                elif ch == 16:  # Ctrl+P — previous history
-                    _hlen = len(self.input_history)
-                    if _hlen:
-                        if self.history_index == -1:
-                            self._history_draft = self.input_buffer
-                        self.history_index = min(self.history_index + 1, _hlen - 1)
-                        self.input_buffer = self.input_history[self.history_index]
-                        self.input_cursor = len(self.input_buffer)
-                        self._input_dirty = True
-                        self.dirty = True
-
-                elif ch == curses.KEY_UP:
-                    # Up with non-empty input: browse history; otherwise scroll chat
-                    if self.input_buffer or self.history_index >= 0:
-                        _hlen = len(self.input_history)
-                        if _hlen:
-                            if self.history_index == -1:
-                                self._history_draft = self.input_buffer
-                            self.history_index = min(self.history_index + 1, _hlen - 1)
-                            self.input_buffer = self.input_history[self.history_index]
-                            self.input_cursor = len(self.input_buffer)
-                            self._input_dirty = True
-                            self.dirty = True
-                    else:
-                        win = self.get_current_window()
-                        self._wrap_window(win)
-                        max_off = max(0, len(win.wrapped_cache) - self._content_height)
-                        win.scroll_offset = min(win.scroll_offset + 1, max_off)
-                        self._chat_dirty = True
-                        self.dirty = True
-
-                elif ch == curses.KEY_DOWN:
-                    if self.history_index >= 0:
-                        self.history_index -= 1
-                        if self.history_index < 0:
-                            self.input_buffer = self._history_draft
-                        else:
-                            self.input_buffer = self.input_history[self.history_index]
-                        self.input_cursor = len(self.input_buffer)
-                        self._input_dirty = True
-                        self.dirty = True
-                    else:
-                        win = self.get_current_window()
-                        win.scroll_offset = max(0, win.scroll_offset - 1)
-                        self._chat_dirty = True
-                        self.dirty = True
-
-                elif ch == 9:   # Tab — nick completion
-                    prev_len = len(self.input_buffer)
-                    self.do_nick_complete()
-                    self.input_cursor += len(self.input_buffer) - prev_len
-
-                elif ch == 3:   # Ctrl+C
-                    raise SystemExit
-
-                elif ch == 14:  # Ctrl+N — next window
-                    self.switch_to_next_window()
-                    self._chat_dirty = self._userlist_dirty = True
-
-                elif ch == curses.KEY_PPAGE:  # Page Up
-                    win = self.get_current_window()
-                    self._wrap_window(win)
-                    max_off = max(0, len(win.wrapped_cache) - self._content_height)
-                    win.scroll_offset = min(win.scroll_offset + self._content_height // 2, max_off)
-                    self._chat_dirty = True
-                    self.dirty = True
-
-                elif ch == curses.KEY_NPAGE:  # Page Down
-                    win = self.get_current_window()
-                    win.scroll_offset = max(0, win.scroll_offset - self._content_height // 2)
-                    self._chat_dirty = True
-                    self.dirty = True
-
-                elif 32 <= ch <= 1114111:  # printable / Unicode
-                    try:
-                        ch_str = chr(ch)
-                    except (ValueError, OverflowError):
-                        ch_str = ""
-                    if ch_str:
-                        self.input_buffer = (self.input_buffer[:self.input_cursor]
-                                             + ch_str
-                                             + self.input_buffer[self.input_cursor:])
-                        self.input_cursor += 1
-                        self.history_index  = -1
-                        self.completion_state = None
-                        self._input_dirty = True
-                        self.dirty = True
-
-                elif ch == curses.KEY_RESIZE:
-                    self.dirty = True
-
-            # OTA: if the dashboard window is active, auto-refresh every N seconds
+            # ── 4. Dashboard auto-refresh ─────────────────────────────────────────
             now = time.time()
             on_dashboard = (self.get_current_window().name == "*dashboard*")
             if on_dashboard and now - self._dashboard_last_update >= self._dashboard_ota_interval:
@@ -2895,18 +2935,21 @@ class TUI:
                 self._chat_dirty = True
                 self.dirty = True
             elif self._dashboard_dirty and now - self._dashboard_last_update >= 1.0:
-                # Event-driven refresh when not on the dashboard (throttled to 1 s)
                 await self.update_dashboard()
                 self._dashboard_dirty = False
                 self._dashboard_last_update = now
                 if on_dashboard:
                     self._chat_dirty = True
 
-            if self.dirty:
-                self.redraw()
+            # ── 5. Full redraw (chat + userlist; throttled to ~30fps) ─────────────
+            if self.dirty and self.redraw():
                 self.dirty = False
 
-            await asyncio.sleep(0.016)  # ~60 Hz poll; redraw itself throttles to 30 fps
+            # ── 6. Adaptive sleep: yield once when busy, wait 16ms when idle ──────
+            # asyncio.sleep(0) hands control back to the event loop for one cycle
+            # (lets IRC reads and translation tasks progress) then returns
+            # immediately — keeping the loop hot during active typing or floods.
+            await asyncio.sleep(0 if (had_key or n > 0) else 0.016)
 
 # =========================
 # Main
