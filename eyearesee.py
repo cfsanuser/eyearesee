@@ -2220,7 +2220,8 @@ class TUI:
         elif etype in ("whois", "kick", "mode", "status"):
             msg = str(event[1]) if len(event) > 1 else str(event)
             self.window_by_name["*status*"].add_line(msg)
-            self.current_window_index = 0
+            # Do NOT switch windows — messages go to *status* silently so the
+            # user stays wherever they are.  Use /win 1 or Ctrl+N to visit status.
             self._chat_dirty = True
             self.dirty = True
 
