@@ -1067,9 +1067,18 @@ class IRCClient:
     def _ctcp_allowed(self, nick: str) -> bool:
         """Allow at most 3 CTCP replies per nick per 30 s."""
         now = time.time()
-        q = self._ctcp_times.setdefault(nick, deque())
-        while q and now - q[0] > 30:
-            q.popleft()
+        q = self._ctcp_times.get(nick)
+        if q is not None:
+            while q and now - q[0] > 30:
+                q.popleft()
+            if not q:
+                # All timestamps expired — evict the entry so _ctcp_times doesn't
+                # accumulate thousands of empty deques from high-nick-churn channels.
+                del self._ctcp_times[nick]
+                q = None
+        if q is None:
+            q = deque()
+            self._ctcp_times[nick] = q
         if len(q) >= 3:
             return False
         q.append(now)
@@ -1258,6 +1267,8 @@ class IRCClient:
                 self.current_channel = DEFAULT_CHANNEL
 
         elif cmd == "JOIN":
+            if not params:
+                return
             channel = params[0]
             await self.ui_queue.put(("join", nick, channel))
             if nick == self.nick:
@@ -1266,12 +1277,18 @@ class IRCClient:
                 await self.ui_queue.put(("self_join", channel))
 
         elif cmd == "PART":
+            if not params:
+                return
             await self.ui_queue.put(("part", nick, params[0]))
 
         elif cmd == "KICK":
+            if not params:
+                return
             await self.ui_queue.put(("kick", nick, params[0], params[1] if len(params) > 1 else "", trailing or ""))
 
         elif cmd == "TOPIC":
+            if not params:
+                return
             await self.ui_queue.put(("topic", params[0], trailing or ""))
 
         elif cmd == "MODE":
@@ -1390,6 +1407,9 @@ class IRCClient:
             await self.ui_queue.put(("status", f"*** {nick} invites you to join {channel}"))
 
         elif cmd == "QUIT":
+            # Free the UserState to prevent unbounded memory growth in
+            # long-running sessions on busy channels with high nick churn.
+            self.users.pop(nick, None)
             await self.ui_queue.put(("quit", nick, trailing or (params[0] if params else "")))
 
         elif cmd == "353":  # RPL_NAMREPLY
@@ -1544,9 +1564,12 @@ class TUI:
         self._content_height = max(1, self.chat_height - 1)  # row 0 is always the title bar
         self.userlist_width = 30
 
-        self.chat_win = curses.newwin(self.chat_height, self.width - self.userlist_width, 0, 0)
-        self.user_win = curses.newwin(self.chat_height, self.userlist_width, 0, self.width - self.userlist_width)
-        self.input_win = curses.newwin(4, self.width, self.height - 4, 0)
+        try:
+            self.chat_win  = curses.newwin(self.chat_height, max(1, self.width - self.userlist_width), 0, 0)
+            self.user_win  = curses.newwin(self.chat_height, self.userlist_width, 0, max(0, self.width - self.userlist_width))
+            self.input_win = curses.newwin(4, max(1, self.width), max(0, self.height - 4), 0)
+        except curses.error as e:
+            raise SystemExit(f"Terminal too small to initialise windows: {e}")
 
         self.windows: List[ChatWindow] = []
         self.window_by_name: Dict[str, ChatWindow] = {}
@@ -1642,9 +1665,10 @@ class TUI:
             if not line:
                 wrapped.append("")
                 continue
-            # Use visual width (IRC-stripped, wide-char-aware) so neither
-            # control codes nor CJK characters cause premature or missed wraps.
-            while _str_visual_width(irc_strip_formatting(line)) > max_width:
+            # Strip IRC formatting codes once per line, not on every loop
+            # iteration, to avoid O(n²) cost for long lines without spaces.
+            stripped = irc_strip_formatting(line)
+            while _str_visual_width(stripped) > max_width:
                 raw_max   = _irc_visual_pos(line, max_width)
                 split_pos = line.rfind(" ", 0, raw_max)
                 if split_pos == -1:
@@ -1653,6 +1677,7 @@ class TUI:
                     split_pos = raw_max if raw_max > 0 else 1
                 wrapped.append(line[:split_pos])
                 line = line[split_pos:].lstrip()
+                stripped = irc_strip_formatting(line)
             wrapped.append(line)
         win.wrapped_cache = wrapped
         win._wrap_dirty = False
@@ -2452,6 +2477,9 @@ class TUI:
                             self._unread_windows.add(ch)
                             self._input_dirty = True
             self._suspect_nicks.discard(nick)
+            # Free per-nick score caches to prevent unbounded growth
+            self.user_scores.pop(nick, None)
+            self.user_ai_scores.pop(nick, None)
             self._chat_dirty = self._userlist_dirty = True
             self.dirty = True
 
@@ -3118,6 +3146,12 @@ class TUI:
         return False
 
     async def run(self) -> None:
+        try:
+            await self._run_loop()
+        except (SystemExit, asyncio.CancelledError, KeyboardInterrupt):
+            pass
+
+    async def _run_loop(self) -> None:
         while True:
             # ── 1. Keyboard — checked first so local input beats network traffic ──
             # Drain all pending keys in one pass.  Enter is async so we break after
@@ -3229,16 +3263,33 @@ async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
 
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
-    except SystemExit:
+    except (SystemExit, asyncio.CancelledError, KeyboardInterrupt):
         pass
     finally:
+        # Cancel any tasks still running (e.g. if we exit via SystemExit or
+        # the gather is cancelled by asyncio.run on SIGINT).
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # Drain cancellations — ignore whatever they return.
+        await asyncio.gather(*tasks, return_exceptions=True)
+
         client.running = False
         if client.writer:
             try:
                 client.send_raw("QUIT :Client exiting")
-                await asyncio.sleep(0.5)
+                # Use a short wait that itself can't raise CancelledError
+                # (the event loop may already be winding down here).
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(client.writer.drain()), timeout=0.4)
+                except Exception:
+                    pass
                 client.writer.close()
-                await client.writer.wait_closed()
+                try:
+                    await asyncio.wait_for(client.writer.wait_closed(), timeout=0.4)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -3351,7 +3402,10 @@ def main():
     # Load AI models before curses starts so progress prints go to the normal
     # terminal and don't corrupt the TUI display.
     ai_detector = EnsembleAIDetector()
-    curses.wrapper(lambda stdscr: asyncio.run(main_curses(stdscr, ai_detector)))
+    try:
+        curses.wrapper(lambda stdscr: asyncio.run(main_curses(stdscr, ai_detector)))
+    except (KeyboardInterrupt, SystemExit):
+        pass
 
 if __name__ == "__main__":
     main()
