@@ -588,6 +588,7 @@ def load_nick_history(nick: str) -> dict:
     nick_lower = nick.lower()
     all_scores: list  = []
     all_lengths: list = []
+    all_ts: list      = []
     first_ts = None
     last_ts  = None
     sessions: dict       = {}
@@ -628,6 +629,7 @@ def load_nick_history(nick: str) -> dict:
 
                 all_scores.append(a)
                 all_lengths.append(len(msg))
+                all_ts.append(ts)
                 channels.add(target)
 
                 if first_ts is None or ts < first_ts: first_ts = ts
@@ -670,6 +672,7 @@ def load_nick_history(nick: str) -> dict:
         "last_ts":      last_ts,
         "all_scores":   all_scores,
         "all_lengths":  all_lengths,
+        "all_ts":       all_ts,
         "sessions":     sessions,
         "channels":     sorted(channels),
         "top_messages": top_messages,
@@ -2102,6 +2105,7 @@ class TUI:
         hist = await hist_task
         hs   = hist["all_scores"]
         hl   = hist["all_lengths"]
+        all_ts    = hist["all_ts"]
         h_total   = hist["total_msgs"]
         h_first   = hist["first_ts"]
         h_last    = hist["last_ts"]
@@ -2149,9 +2153,32 @@ class TUI:
             L(f"  Messages this session  : {state.total_msgs}")
             L(f"  Avg message length     : {avg_len:.0f} chars")
             L(f"  Messages / minute      : {mpm:.2f}")
+            # Burst analysis: suspiciously short inter-message gaps suggest automation
+            if state.msg_times:
+                _gaps = list(state.msg_times)
+                _min_gap  = min(_gaps)
+                _burst_n  = sum(1 for g in _gaps if g < 2.0)
+                _burst_pct = 100 * _burst_n // len(_gaps)
+                _gap_tag  = "suspicious" if _min_gap < 0.5 else ("fast" if _min_gap < 1.5 else "normal")
+                L(f"  Min msg interval       : {_min_gap:.1f}s  ({_gap_tag})")
+                L(f"  Burst rate (<2s gap)   : {_burst_pct}%  ({_burst_n}/{len(_gaps)} msgs)")
+            # Message length uniformity: low CoV suggests templated / AI text
+            if len(state.msg_lengths) >= 4:
+                _lens  = list(state.msg_lengths)
+                _m_len = sum(_lens) / len(_lens)
+                _std_l = (sum((l - _m_len) ** 2 for l in _lens) / len(_lens)) ** 0.5
+                _cov   = _std_l / _m_len if _m_len > 0 else 0
+                _utag  = "very uniform" if _cov < 0.15 else ("uniform" if _cov < 0.30 else "variable")
+                L(f"  Msg length uniformity  : CoV {_cov:.2f}  ({_utag})")
             L(f"  Joined                 : {join_ago}m ago")
             if last_ago is not None:
                 L(f"  Last message           : {last_ago}m ago")
+            # Current channel presence
+            _in_chans = sorted(ch for ch, users in self.channel_users.items() if nick in users)
+            if _in_chans:
+                L(f"  Currently in           : {' '.join(_in_chans)}")
+            if nick.lower() in self.ignored_nicks:
+                L(f"  Status                 : IGNORED")
             if spark:
                 L(f"  Score history          : {spark}")
             L("")
@@ -2177,6 +2204,28 @@ class TUI:
             L(f"  Last seen in log       : {last_str}")
             if hist["channels"]:
                 L(f"  Channels               : {' '.join(hist['channels'][:6])}")
+            # Hour-of-day activity distribution (local time)
+            if len(all_ts) >= 5:
+                _hbkt = [0] * 24
+                for _t in all_ts:
+                    _hbkt[time.localtime(_t).tm_hour] += 1
+                _hpeak = max(_hbkt)
+                _hbar  = "▁▂▃▄▅▆▇█"
+                _hspark = "".join(_hbar[min(7, b * 8 // (_hpeak + 1))] for b in _hbkt)
+                _peak_h = _hbkt.index(_hpeak)
+                L(f"  Active hours (0–23h)   : {_hspark}  peak:{_peak_h:02d}h")
+            # All-time burst rate from inter-message gaps in log
+            if len(all_ts) >= 4:
+                _sts = sorted(all_ts)
+                _hgaps = [_sts[i+1] - _sts[i] for i in range(len(_sts)-1)
+                          if _sts[i+1] - _sts[i] < 3600]
+                if _hgaps:
+                    _h_min_gap   = min(_hgaps)
+                    _h_burst_n   = sum(1 for g in _hgaps if g < 2.0)
+                    _h_burst_pct = 100 * _h_burst_n // len(_hgaps)
+                    _h_gap_tag   = "suspicious" if _h_min_gap < 0.5 else ("fast" if _h_min_gap < 1.5 else "normal")
+                    L(f"  All-time min gap       : {_h_min_gap:.1f}s  ({_h_gap_tag})")
+                    L(f"  All-time burst rate    : {_h_burst_pct}%  ({_h_burst_n}/{len(_hgaps)} inter-msg gaps)")
 
             if active_sessions:
                 L("")
