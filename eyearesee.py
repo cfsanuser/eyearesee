@@ -1479,13 +1479,13 @@ class TUI:
         self.ui_queue = ui_queue
         self.client = client
         self.height, self.width = stdscr.getmaxyx()
-        self.chat_height = max(1, self.height - 3)
+        self.chat_height = max(1, self.height - 4)  # 1 extra row for tab bar
         self._content_height = max(1, self.chat_height - 1)  # row 0 is always the title bar
         self.userlist_width = 30
 
         self.chat_win = curses.newwin(self.chat_height, self.width - self.userlist_width, 0, 0)
         self.user_win = curses.newwin(self.chat_height, self.userlist_width, 0, self.width - self.userlist_width)
-        self.input_win = curses.newwin(3, self.width, self.height - 3, 0)
+        self.input_win = curses.newwin(4, self.width, self.height - 4, 0)
 
         self.windows: List[ChatWindow] = []
         self.window_by_name: Dict[str, ChatWindow] = {}
@@ -1549,6 +1549,9 @@ class TUI:
         self._tw     = max(1, self.chat_win.getmaxyx()[1] - 1)   # chat text cols
         self._uw     = max(1, self.userlist_width - 2)            # userlist interior cols
         self._input_w = max(1, self.input_win.getmaxyx()[1] - 4) # input text cols
+
+        # Unread tracking: window names that have received messages while inactive
+        self._unread_windows: set = set()
 
         stdscr.nodelay(True)
         stdscr.keypad(True)
@@ -1929,8 +1932,8 @@ class TUI:
         except curses.error:
             pass
         try:
-            self.input_win.resize(3, self.width)
-            self.input_win.mvwin(self.height - 3, 0)
+            self.input_win.resize(4, self.width)
+            self.input_win.mvwin(self.height - 4, 0)
         except curses.error:
             pass
         # Refresh cached dimension values and force full repaint
@@ -2044,10 +2047,77 @@ class TUI:
                 except curses.error:
                     break
 
+    def _draw_tabs(self) -> None:
+        """Draw the window tab strip on row 1 of input_win.
+
+        Format: [1:status] [*2:##chat] [3:##anime]
+        Active tab uses A_REVERSE|A_BOLD; windows with unread messages get A_BOLD
+        and a '*' prefix; inactive read windows are dimmed.  The strip scrolls so
+        the active tab is always visible.
+        """
+        _, w = self.input_win.getmaxyx()
+        usable = w - 2  # columns between left and right borders
+
+        # Build label strings for every window
+        labels: List[str] = []
+        for i, win in enumerate(self.windows):
+            name = win.name
+            if name == "*status*":
+                short = "status"
+            elif name == "*dashboard*":
+                short = "dash"
+            elif name.startswith("#"):
+                short = name[:14]
+            else:
+                short = f">{name[:10]}"   # DM: ">nick"
+            is_active = (i == self.current_window_index)
+            has_unread = (name in self._unread_windows and not is_active)
+            labels.append(f"[{'*' if has_unread else ''}{i + 1}:{short}]")
+
+        # Find the leftmost visible index so the active tab is always on screen
+        widths = [len(l) + 1 for l in labels]   # +1 for the space separator
+        active = self.current_window_index
+        start = 0
+        if sum(widths) > usable:
+            # Walk forward until the slice [start..active] fits
+            for j in range(active + 1):
+                if sum(widths[j:active + 1]) <= usable:
+                    start = j
+                    break
+
+        col = 1
+        for i in range(start, len(labels)):
+            label = labels[i]
+            lw = len(label)
+            if col + lw + 1 > usable:
+                break
+            is_active = (i == self.current_window_index)
+            has_unread = (self.windows[i].name in self._unread_windows and not is_active)
+            if is_active:
+                attr = curses.A_REVERSE | curses.A_BOLD
+            elif has_unread:
+                attr = curses.A_BOLD
+            else:
+                attr = curses.A_DIM
+            try:
+                self.input_win.addstr(1, col, label, attr)
+            except curses.error:
+                pass
+            col += lw + 1   # +1 space between tabs
+
     def _draw_input(self) -> None:
         self.input_win.erase()
         self.input_win.border()
-        prompt = f"{self.client.nick}> "
+
+        self._draw_tabs()
+
+        # Show current send-target in the prompt so the user always knows where
+        # text will go.  Status/dashboard windows have no chat target.
+        cur_win = self.get_current_window()
+        if cur_win.name not in ("*status*", "*dashboard*"):
+            prompt = f"[{cur_win.name}] {self.client.nick}> "
+        else:
+            prompt = f"{self.client.nick}> "
         iw     = self._input_w
 
         # All width calculations use visual column counts (not character counts)
@@ -2068,8 +2138,8 @@ class TUI:
         display    = _truncate_to_width(_skip_visual_cols(full_vis, view_start), iw)
         cursor_col = 1 + (cursor_abs - view_start)
         try:
-            self.input_win.addstr(1, 1, display)
-            self.input_win.move(1, max(1, min(cursor_col, iw)))
+            self.input_win.addstr(2, 1, display)
+            self.input_win.move(2, max(1, min(cursor_col, iw)))
         except curses.error:
             pass
 
@@ -2081,7 +2151,7 @@ class TUI:
         new_h, new_w = self.stdscr.getmaxyx()
         if new_h != self.height or new_w != self.width:
             self.height, self.width = new_h, new_w
-            self.chat_height = max(1, self.height - 3)
+            self.chat_height = max(1, self.height - 4)
             self._resize_windows()  # sets all three pane-dirty flags + updates _tw/_uw/_input_w
 
         refreshed = []
@@ -2112,7 +2182,8 @@ class TUI:
         win = self.get_current_window()
         if win.name not in ("*status*", "*dashboard*"):
             self.current_channel = win.name
-        self._userlist_dirty = True
+        self._unread_windows.discard(win.name)
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
 
     def do_nick_complete(self) -> None:
@@ -2159,22 +2230,35 @@ class TUI:
             _, nick, target, msg, u_score, m_score, a_score, rolling_ai, is_action = event
             if nick.lower() in self.ignored_nicks:
                 return
-            win = self.ensure_window(target, is_channel=target.startswith("#"))
+            # Route to the right window.  Channel messages go to the channel
+            # window; DMs (target == self.nick) go to the sender's window so
+            # that typing a reply goes to the correct person.
+            if target.startswith("#"):
+                win_name  = target
+                is_chan   = True
+            else:
+                win_name  = nick   # DM: window is named after the sender
+                is_chan   = False
+            win = self.ensure_window(win_name, is_channel=is_chan)
             prefix = f"* {nick} " if is_action else f"<{nick}> "
             win.add_line(f"{prefix}{msg}")
             if self.auto_translate and _has_cjk(irc_strip_formatting(msg)):
                 asyncio.create_task(self._post_translation(win, msg))
             self.user_scores[nick] = u_score
             self.user_ai_scores[nick] = rolling_ai
+            # Mark unread when the message lands in a background window
+            if win is not self.get_current_window():
+                self._unread_windows.add(win_name)
+                self._input_dirty = True
             # Maintain suspect set incrementally
             if rolling_ai >= self.ai_suspect_threshold:
                 self._suspect_nicks.add(nick)
                 self._dashboard_dirty = True
             else:
                 self._suspect_nicks.discard(nick)
-            if target in self.channel_users:
-                self.channel_users[target].add(nick)
-                self._sorted_users.pop(target, None)
+            if win_name in self.channel_users:
+                self.channel_users[win_name].add(nick)
+                self._sorted_users.pop(win_name, None)
                 self._userlist_dirty = True
             self._chat_dirty = True
             self.dirty = True
@@ -2196,6 +2280,9 @@ class TUI:
                 return
             win = self.ensure_window(target, is_channel=target.startswith("#"))
             win.add_line(f"-{sender}- {text}")
+            if win is not self.get_current_window():
+                self._unread_windows.add(target)
+                self._input_dirty = True
             self._chat_dirty = True
             self.dirty = True
 
@@ -2273,15 +2360,38 @@ class TUI:
             win.add_line(f"* You have joined {channel}")
             self.current_channel = channel
             self.current_window_index = self.windows.index(win)
+            self._unread_windows.discard(channel)
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            self.dirty = True
+
+        elif etype == "part":
+            _, nick, channel = event
+            if channel in self.channel_users:
+                self.channel_users[channel].discard(nick)
+                self._sorted_users.pop(channel, None)
+            self._suspect_nicks.discard(nick)
+            ch_win = self.window_by_name.get(channel)
+            if ch_win:
+                ch_win.add_line(f"* {nick} has left {channel}")
+                if ch_win is not self.get_current_window():
+                    self._unread_windows.add(channel)
+                    self._input_dirty = True
             self._chat_dirty = self._userlist_dirty = True
             self.dirty = True
 
-        elif etype in ("part", "quit"):
-            _, nick, *_ = event
+        elif etype == "quit":
+            _, nick, reason = event
+            quit_msg = f"* {nick} has quit" + (f" ({reason})" if reason else "")
             for ch, users in self.channel_users.items():
                 if nick in users:
                     users.discard(nick)
                     self._sorted_users.pop(ch, None)
+                    ch_win = self.window_by_name.get(ch)
+                    if ch_win:
+                        ch_win.add_line(quit_msg)
+                        if ch_win is not self.get_current_window():
+                            self._unread_windows.add(ch)
+                            self._input_dirty = True
             self._suspect_nicks.discard(nick)
             self._chat_dirty = self._userlist_dirty = True
             self.dirty = True
@@ -2357,13 +2467,28 @@ class TUI:
                     self.client.cmd_msg(args, extra)
                     win = self.ensure_window(args, is_channel=False)
                     win.add_line(f"<{self.client.nick}> {extra}")
+                    # Switch to the DM window so replies land in the right place
+                    self.current_window_index = self.windows.index(win)
+                    self.current_channel = args
+                    self._unread_windows.discard(args)
+                    self._userlist_dirty = self._input_dirty = True
                 else:
                     await self.ui_queue.put(("status", "Usage: /msg <nick> <text>"))
             elif cmd == "query":
                 if args:
+                    is_new = args not in self.window_by_name
                     win = self.ensure_window(args, is_channel=False)
                     self.current_window_index = self.windows.index(win)
                     self.current_channel = args
+                    self._unread_windows.discard(args)
+                    self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                    if is_new:
+                        win.add_line(f"** Query with {args} opened **", timestamp=False)
+                    if extra:
+                        self.client.cmd_msg(args, extra)
+                        win.add_line(f"<{self.client.nick}> {extra}")
+                else:
+                    await self.ui_queue.put(("status", "Usage: /query <nick> [message]"))
             elif cmd == "notice":
                 if args and extra:
                     self.client.cmd_notice(args, extra)
@@ -2426,9 +2551,14 @@ class TUI:
             elif cmd in ("close", "wc"):
                 win = self.get_current_window()
                 if win.name not in ("*status*", "*dashboard*"):
+                    self._unread_windows.discard(win.name)
                     self.windows.remove(win)
                     del self.window_by_name[win.name]
                     self.current_window_index = max(0, self.current_window_index - 1)
+                    new_win = self.get_current_window()
+                    if new_win.name not in ("*status*", "*dashboard*"):
+                        self.current_channel = new_win.name
+                    self._userlist_dirty = self._input_dirty = True
             elif cmd in ("win", "window"):
                 if args.isdigit():
                     idx = int(args) - 1
@@ -2437,7 +2567,8 @@ class TUI:
                         win = self.windows[idx]
                         if win.name not in ("*status*", "*dashboard*"):
                             self.current_channel = win.name
-                        self._userlist_dirty = True
+                        self._unread_windows.discard(win.name)
+                        self._userlist_dirty = self._input_dirty = True
             elif cmd in ("quit", "exit"):
                 self.client.send_raw(f"QUIT :{args}" if args else "QUIT :Client exiting")
                 raise SystemExit
@@ -2566,7 +2697,7 @@ class TUI:
                 _C("")
                 _H("Messaging")
                 _E("/msg <nick> <text>",          "Send a private message to nick")
-                _E("/query <nick>",               "Open a private chat window with nick")
+                _E("/query <nick> [message]",      "Open a DM window; optionally send a first message")
                 _E("/notice <nick> <text>",        "Send a notice (not shown in chat)")
                 _E("/me <text>",                  "Send an action (e.g. /me waves)")
                 _C("")
