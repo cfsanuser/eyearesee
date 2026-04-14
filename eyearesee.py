@@ -57,7 +57,7 @@ DEFAULT_NICK = "cfuser"
 DEFAULT_CHANNEL = "##anime"
 NICKSERV_PASSWORD = os.environ.get("IRC_NICKSERV_PASSWORD", "")
 
-MAX_MESSAGES = 500
+MAX_MESSAGES = 100
 USER_HISTORY_WINDOW = 200
 AI_LOG_PATH = "ai_scores.log"
 AI_SUSPECT_THRESHOLD = 70
@@ -65,7 +65,7 @@ AI_SUSPECT_THRESHOLD = 70
 INPUT_HISTORY_PATH = "irc_input_history.txt"
 INPUT_HISTORY_MAX  = 500
 CHAT_LOG_DIR       = "chat_logs"
-CHAT_LOG_LOAD      = 150
+CHAT_LOG_LOAD      = 100
 
 # Claude API
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -2273,10 +2273,13 @@ class TUI:
             # window; DMs (target == self.nick) go to the sender's window so
             # that typing a reply goes to the correct person.
             if target.startswith("#"):
-                win_name  = target
+                win_name  = target                 # channel message
                 is_chan   = True
+            elif nick == self.client.nick:
+                win_name  = target                 # own outgoing DM → recipient's window
+                is_chan   = False
             else:
-                win_name  = nick   # DM: window is named after the sender
+                win_name  = nick                   # incoming DM → sender's window
                 is_chan   = False
             win = self.ensure_window(win_name, is_channel=is_chan)
             prefix = f"* {nick} " if is_action else f"<{nick}> "
@@ -3123,7 +3126,13 @@ class TUI:
             try:
                 while n < 64:
                     event = self.ui_queue.get_nowait()
-                    await self.handle_event(event)
+                    try:
+                        await self.handle_event(event)
+                    except Exception as _ev_exc:
+                        self.window_by_name["*status*"].add_line(
+                            f"[err] event handler crashed: {_ev_exc}")
+                        self._chat_dirty = True
+                        self.dirty = True
                     n += 1
             except asyncio.QueueEmpty:
                 pass
