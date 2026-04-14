@@ -98,7 +98,7 @@ _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _ACTION_LINE_RE     = re.compile(r'^\[\d{2}:\d{2}\] \* \S')  # "[HH:MM] * nick …"
 
 # Frozensets for O(1) IRC numeric-reply membership tests in process_line
-_WHOIS_REPLIES = frozenset({"311", "312", "317", "319"})
+_WHOIS_REPLIES = frozenset({"307", "311", "312", "313", "317", "318", "319", "330", "671"})
 _WHO_REPLIES   = frozenset({"352", "314"})
 _SERVER_INFO   = frozenset({"002", "003", "004", "005", "372", "375", "376"})
 # Channel-join error replies — shown as status messages
@@ -1256,7 +1256,46 @@ class IRCClient:
             await self.ui_queue.put(("mode", nick, params))
 
         elif cmd in _WHOIS_REPLIES:
-            await self.ui_queue.put(("whois", cmd, " ".join(params[1:])))
+            # params[0] = our nick, params[1] = target nick, rest = data
+            w = params[1] if len(params) > 1 else "?"
+            if cmd == "311" and len(params) >= 5:   # RPL_WHOISUSER
+                user, host = params[2], params[3]
+                real = params[5] if len(params) > 5 else ""
+                text = f"[whois] {w}  ({user}@{host})  \"{real}\""
+            elif cmd == "312" and len(params) >= 3:  # RPL_WHOISSERVER
+                srv  = params[2]
+                info = params[3] if len(params) > 3 else ""
+                text = f"[whois] {w}  server: {srv}" + (f" — {info}" if info else "")
+            elif cmd == "313":                        # RPL_WHOISOPERATOR
+                text = f"[whois] {w}  is an IRC operator"
+            elif cmd == "317" and len(params) >= 3:  # RPL_WHOISIDLE
+                try:
+                    secs  = int(params[2])
+                    parts_idle = []
+                    if secs >= 3600:
+                        parts_idle.append(f"{secs // 3600}h")
+                    parts_idle.append(f"{(secs % 3600) // 60}m {secs % 60}s")
+                    idle_str = " ".join(parts_idle)
+                except ValueError:
+                    idle_str = params[2]
+                sign_str = ""
+                if len(params) > 3 and params[3].isdigit():
+                    sign_str = "  signed on: " + time.strftime(
+                        "%Y-%m-%d %H:%M", time.localtime(int(params[3])))
+                text = f"[whois] {w}  idle: {idle_str}{sign_str}"
+            elif cmd == "318":                        # RPL_ENDOFWHOIS
+                text = f"[whois] ── end of whois for {w} ──"
+            elif cmd == "319" and len(params) >= 3:  # RPL_WHOISCHANNELS
+                text = f"[whois] {w}  channels: {params[2]}"
+            elif cmd == "307":                        # RPL_WHOISREGNICK
+                text = f"[whois] {w}  is a registered nick"
+            elif cmd == "330" and len(params) >= 3:  # RPL_WHOISACCOUNT
+                text = f"[whois] {w}  logged in as: {params[2]}"
+            elif cmd == "671":                        # RPL_WHOISSECURE
+                text = f"[whois] {w}  is using a secure connection (SSL/TLS)"
+            else:
+                text = f"[whois] {' '.join(params[1:])}"
+            await self.ui_queue.put(("whois", text))
 
         elif cmd == "PRIVMSG":
             if len(params) < 2: return
