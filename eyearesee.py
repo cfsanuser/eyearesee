@@ -2464,7 +2464,11 @@ class TUI:
                 slash_end = line.index(" ") + 1 if " " in line else len(line)
                 action_text = line[slash_end:].strip()
                 if action_text:
-                    target = self.current_channel or DEFAULT_CHANNEL
+                    cur_win = self.get_current_window()
+                    if cur_win.name not in ("*status*", "*dashboard*"):
+                        target = cur_win.name
+                    else:
+                        target = self.current_channel or DEFAULT_CHANNEL
                     result = self.client.cmd_msg(target, action_text, is_action=True)
                     if result:
                         await self.ui_queue.put(result)
@@ -2864,7 +2868,11 @@ class TUI:
             else:
                 self.client.send_raw(line[1:])
         else:
-            target = self.current_channel or DEFAULT_CHANNEL
+            cur_win = self.get_current_window()
+            if cur_win.name not in ("*status*", "*dashboard*"):
+                target = cur_win.name
+            else:
+                target = self.current_channel or DEFAULT_CHANNEL
             result = self.client.cmd_msg(target, line)
             if result:
                 await self.ui_queue.put(result)
