@@ -2400,11 +2400,15 @@ class TUI:
         elif etype == "join":
             _, nick, channel = event
             win = self.ensure_window(channel)
-            if channel in self.channel_users:
-                self.channel_users[channel].add(nick)
+            if nick == self.client.nick:
+                # Reset user list so stale nicks from a previous join don't linger;
+                # the NAMES reply (353) will repopulate it from scratch.
+                self.channel_users[channel] = set()
                 self._sorted_users.pop(channel, None)
-            # Show join notice for other users (our own join is handled by self_join)
-            if nick != self.client.nick:
+            else:
+                if channel in self.channel_users:
+                    self.channel_users[channel].add(nick)
+                    self._sorted_users.pop(channel, None)
                 win.add_line(f"* {nick} has joined {channel}")
             self._chat_dirty = self._userlist_dirty = True
             self.dirty = True
@@ -2530,7 +2534,8 @@ class TUI:
                     self.current_window_index = self.windows.index(win)
                     self.current_channel = args
                     self._unread_windows.discard(args)
-                    self._userlist_dirty = self._input_dirty = True
+                    self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                    self.dirty = True
                 else:
                     await self.ui_queue.put(("status", "Usage: /msg <nick> <text>"))
             elif cmd == "query":
@@ -2617,7 +2622,8 @@ class TUI:
                     new_win = self.get_current_window()
                     if new_win.name not in ("*status*", "*dashboard*"):
                         self.current_channel = new_win.name
-                    self._userlist_dirty = self._input_dirty = True
+                    self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                    self.dirty = True
             elif cmd in ("win", "window"):
                 if args.isdigit():
                     idx = int(args) - 1
@@ -2627,7 +2633,8 @@ class TUI:
                         if win.name not in ("*status*", "*dashboard*"):
                             self.current_channel = win.name
                         self._unread_windows.discard(win.name)
-                        self._userlist_dirty = self._input_dirty = True
+                        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                        self.dirty = True
             elif cmd in ("quit", "exit"):
                 self.client.send_raw(f"QUIT :{args}" if args else "QUIT :Client exiting")
                 raise SystemExit
@@ -2831,6 +2838,7 @@ class TUI:
                 _C("")
                 self.current_window_index = 0
                 self._chat_dirty = True
+                self.dirty = True
             elif cmd == "help":
                 for l in [
                     "── Messaging ──────────────────────────────────────────",
@@ -2865,6 +2873,8 @@ class TUI:
                 ]:
                     self.window_by_name["*status*"].add_line(l)
                 self.current_window_index = 0
+                self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                self.dirty = True
             else:
                 self.client.send_raw(line[1:])
         else:
