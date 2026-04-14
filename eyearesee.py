@@ -4,6 +4,7 @@ import atexit
 import base64
 import getpass
 import importlib.util
+import socket
 import subprocess
 import sys
 import unicodedata
@@ -39,14 +40,33 @@ except ImportError:
 try:
     import curses
 except ModuleNotFoundError:
-    if os.name == "nt" or platform.system().lower().startswith("win"):
-        try:
-            import windows_curses  # type: ignore
-        except ImportError:
-            raise SystemExit("windows-curses is required on Windows. Install with: pip install windows-curses")
-        import curses
-    else:
-        raise
+    # _curses is missing — typical on Windows builds that ship without it.
+    # windows_curses may be installed in a site-packages directory not yet on
+    # sys.path (user-site, a parallel Python install, etc.).  Widen the search
+    # before giving up.
+    import pathlib, site as _site
+    _extra: list = []
+    try:
+        _extra.append(_site.getusersitepackages())
+    except Exception:
+        pass
+    try:
+        _extra.extend(_site.getsitepackages())
+    except Exception:
+        pass
+    # Also scan sibling Lib/site-packages of the running interpreter
+    _extra.append(str(pathlib.Path(sys.executable).parent / "Lib" / "site-packages"))
+    _extra.append(str(pathlib.Path(sys.executable).parent.parent / "Lib" / "site-packages"))
+    for _p in _extra:
+        if _p and _p not in sys.path:
+            sys.path.insert(0, _p)
+    try:
+        import windows_curses  # type: ignore
+    except ImportError:
+        print("windows-curses not found — installing...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "windows-curses"])
+        import windows_curses  # type: ignore
+    import curses
 
 # =========================
 # Config
@@ -104,7 +124,7 @@ _SERVER_INFO   = frozenset({"002", "003", "004", "005", "372", "375", "376"})
 # Channel-join error replies — routed to the channel window with the error
 _ERROR_REPLIES = frozenset({"471", "473", "474", "475", "477", "489"})
 # Numeric replies that are safely discarded (end-of-list markers, stats, etc.)
-_SILENT_NUMERICS = frozenset({"333", "366", "265", "266"})
+_SILENT_NUMERICS = frozenset({"315", "333", "366", "265", "266"})
 
 def _chat_log_path(window_name: str) -> str:
     safe = _UNSAFE_FILENAME_RE.sub("_", window_name) or "_"
@@ -993,6 +1013,10 @@ class ChatWindow:
         if self._persist:
             append_chat_line(self.name, text)
 
+# Reuse one SSL context across all connections (parsing the CA bundle is expensive).
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.minimum_version = ssl.TLSVersion.TLSv1_2
+
 # =========================
 # IRCClient - FULL + CTCP
 # =========================
@@ -1009,62 +1033,166 @@ class IRCClient:
         self.users: Dict[str, UserState] = {}
         self.running = True
         self._identified = False
-        self._drain_pending = False
         self.joined_channels: set = {DEFAULT_CHANNEL} if DEFAULT_CHANNEL else set()
         self._ctcp_times: Dict[str, deque] = {}  # rate-limit CTCP replies
         self._cap_ls_caps: set = set()           # accumulated caps across multiline CAP LS
+        # Send queue — all outbound data goes here; _run_writer flushes it with
+        # flood-control rate limiting so the server never disconnects us for flooding.
+        self._send_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+        # Monotonic timestamp of the last PONG received from the server.
+        # Updated by _irc_pong; checked by keepalive to detect dead connections.
+        self._last_pong: float = 0.0
+        # The nick the user actually wants.  When a 433 collision forces us to
+        # use nick_ we remember the original and periodically try to reclaim it.
+        self._desired_nick: str = nick
+        # Background task that retries _desired_nick after a 433 collision.
+        self._nick_reclaim_task: Optional[asyncio.Task] = None
+        # IRCv3 message tags from the current line being dispatched.
+        # Set in process_line before calling each handler; read by handlers
+        # that need tag data (e.g. server-time).
+        self._current_msg_tags: dict = {}
+        # Tokens from ISUPPORT (005 numeric): e.g. NETWORK, PREFIX, CHANTYPES.
+        self._isupport: dict = {}
         self._irc_handlers: dict = {}
         self._build_irc_handlers()
 
     async def connect(self) -> None:
         await self.ui_queue.put(("status", f"Connecting to {self.server}:{self.port}..."))
         try:
-            ctx = ssl.create_default_context()
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            self.reader, self.writer = await asyncio.open_connection(self.server, self.port, ssl=ctx)
-            await self.ui_queue.put(("status", "SSL connection established"))
-            # CAP LS must come before NICK/USER so the server holds registration
-            # open until we send CAP END (or complete SASL).
-            self.send_raw("CAP LS 302")
-            self.send_raw(f"NICK {self.nick}")
-            self.send_raw(f"USER {self.nick} 0 * :{self.nick}")
-            await self.ui_queue.put(("status", "Sent NICK and USER commands"))
+            # 30-second connect timeout prevents hangs on unreachable hosts.
+            # limit=2^20 (1 MiB) sets the StreamReader internal buffer; the default
+            # 64 KB can stall on fast servers that send large NAMES / MOTD bursts.
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    self.server, self.port, ssl=_SSL_CTX, limit=2 ** 20),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            raise ConnectionError(
+                f"Connection to {self.server}:{self.port} timed out after 30 s")
         except Exception as e:
             await self.ui_queue.put(("status", f"Connection failed: {e}"))
             raise
+        # TCP_NODELAY: disable Nagle's algorithm so IRC commands are sent immediately
+        # rather than waiting to coalesce with future data (Nagle adds ~40-200 ms).
+        # SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT: OS-level dead-connection detection
+        # as a second line of defence behind our PING/PONG keepalive.
+        raw_sock = self.writer.get_extra_info("socket")
+        if raw_sock is not None:
+            try:
+                raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                raw_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                if hasattr(socket, "TCP_KEEPIDLE"):
+                    raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                if hasattr(socket, "TCP_KEEPINTVL"):
+                    raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                if hasattr(socket, "TCP_KEEPCNT"):
+                    raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+            except Exception:
+                pass  # socket options are best-effort
+        await self.ui_queue.put(("status", "SSL connection established"))
+        # Flush any stale messages queued from a previous (failed) connection
+        # so they are not replayed on the new session.
+        while not self._send_queue.empty():
+            try:
+                self._send_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._last_pong = time.monotonic()
+        # CAP LS must come before NICK/USER so the server holds registration
+        # open until we send CAP END (or complete SASL).
+        self.send_raw("CAP LS 302")
+        self.send_raw(f"NICK {self.nick}")
+        self.send_raw(f"USER {self.nick} 0 * :{self.nick}")
+        await self.ui_queue.put(("status", "Sent NICK and USER commands"))
 
     def send_raw(self, line: str) -> None:
+        """Enqueue a raw IRC line for delivery by the rate-limited writer task.
+
+        Synchronous so it can be called from anywhere.  Drops lines when the queue
+        is full (512 items = a multi-second burst) to avoid unbounded memory growth
+        under pathological conditions.
+        """
         # Strip CRLF and null bytes to prevent IRC command injection
         line = line.replace("\r", "").replace("\n", "").replace("\x00", "")
-        if not line or not self.writer:
+        if not line:
             return
         # IRC protocol maximum is 512 bytes including CRLF (RFC 1459 §2.3).
-        # Encode first so multi-byte UTF-8 chars are truncated on byte boundary.
-        encoded = line.encode("utf-8", "replace")
-        if len(encoded) > 510:
-            encoded = encoded[:510]
+        # Encode first so multi-byte UTF-8 chars are truncated on a byte boundary.
+        encoded = line.encode("utf-8", "replace")[:510]
         try:
-            self.writer.write(encoded + b"\r\n")
-            if not self._drain_pending:
-                self._drain_pending = True
-                asyncio.create_task(self._safe_drain())
-        except Exception:
-            pass
+            self._send_queue.put_nowait(encoded + b"\r\n")
+        except asyncio.QueueFull:
+            pass  # drop; flood-protection is better than memory exhaustion
 
-    async def _safe_drain(self):
-        try:
-            if self.writer:
-                await self.writer.drain()
-        except Exception as e:
-            # Write failure means the connection is dead — close the writer so
-            # reader.readline() gets EOF and handle_incoming triggers a reconnect.
-            await self.ui_queue.put(("status", f"Write error: {e}"))
+    async def _run_writer(self) -> None:
+        """Consume the send queue, forwarding data to the server with flood control.
+
+        Token-bucket: steady rate of 4 lines/second, burst capacity of 10.
+        IRC servers typically kick clients that exceed ~10 lines/second; this
+        keeps us well under that limit even on /join floods or mass-kicks.
+
+        Batching: after the first token is consumed we drain all immediately
+        available messages (up to remaining token budget) and send them in a
+        single writelines() + drain() call.  This reduces kernel round-trips
+        dramatically during connect bursts (NAMES, MOTD, JOIN floods, etc.).
+
+        The wait_for timeout is intentionally absent: the task is cancelled by
+        run_connection's finally block, so CancelledError is the exit path.
+        """
+        RATE  = 4.0   # tokens replenished per second
+        BURST = 10.0  # maximum token bucket size
+        tokens = BURST
+        last_refill = time.monotonic()
+
+        while self.running:
             try:
-                self.writer.close()
-            except Exception:
-                pass
-        finally:
-            self._drain_pending = False
+                data = await self._send_queue.get()
+            except asyncio.CancelledError:
+                break
+
+            # Refill the bucket for time elapsed since last send
+            now = time.monotonic()
+            tokens = min(BURST, tokens + (now - last_refill) * RATE)
+            last_refill = now
+
+            # If the bucket is empty, sleep until we have a token
+            if tokens < 1.0:
+                wait = (1.0 - tokens) / RATE
+                try:
+                    await asyncio.sleep(wait)
+                except asyncio.CancelledError:
+                    break
+                now = time.monotonic()
+                tokens = min(BURST, tokens + (now - last_refill) * RATE)
+                last_refill = now
+
+            tokens -= 1.0
+
+            # Batch: absorb all messages that are already queued (up to token
+            # budget) so they share a single drain() syscall.
+            batch = [data]
+            while tokens >= 1.0:
+                try:
+                    batch.append(self._send_queue.get_nowait())
+                    tokens -= 1.0
+                except asyncio.QueueEmpty:
+                    break
+
+            try:
+                if self.writer and not self.writer.is_closing():
+                    self.writer.writelines(batch)
+                    await self.writer.drain()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self.ui_queue.put(("status", f"Write error: {e}"))
+                try:
+                    if self.writer:
+                        self.writer.close()
+                except Exception:
+                    pass
+                break
 
     def _ctcp_allowed(self, nick: str) -> bool:
         """Allow at most 3 CTCP replies per nick per 30 s."""
@@ -1087,10 +1215,27 @@ class IRCClient:
         return True
 
     async def keepalive(self) -> None:
+        """Send PING every 45 s and disconnect if no PONG arrives within 120 s.
+
+        Dead TCP connections (e.g. NAT timeout, Wi-Fi handoff) do not always
+        produce a RST/FIN; without this check the client would sit silently
+        disconnected until the 300 s readline timeout fires.
+        """
+        PING_INTERVAL = 45.0
+        PONG_TIMEOUT  = 120.0
         while self.running and self.writer:
             try:
                 self.send_raw(f"PING :keepalive-{int(time.time())}")
-                await asyncio.sleep(45)
+                await asyncio.sleep(PING_INTERVAL)
+                if time.monotonic() - self._last_pong > PONG_TIMEOUT:
+                    await self.ui_queue.put(("status", "Ping timeout — reconnecting"))
+                    try:
+                        self.writer.close()
+                    except Exception:
+                        pass
+                    break
+            except asyncio.CancelledError:
+                break
             except Exception:
                 break
 
@@ -1108,25 +1253,43 @@ class IRCClient:
         attempt = 0
         while self.running:
             self._identified = False
-            self._drain_pending = False
             self._cap_ls_caps.clear()
-            keepalive_task = None
+            keepalive_task: Optional[asyncio.Task] = None
+            writer_task:    Optional[asyncio.Task] = None
             try:
                 await self.connect()
                 attempt = 0
                 keepalive_task = asyncio.create_task(self.keepalive())
+                writer_task    = asyncio.create_task(self._run_writer())
                 await self.handle_incoming()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 await self.ui_queue.put(("status", f"Connection error: {e}"))
             finally:
-                if keepalive_task and not keepalive_task.done():
-                    keepalive_task.cancel()
+                # Cancel background tasks and drain any leftover sends
+                for task in (keepalive_task, writer_task):
+                    if task and not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                while not self._send_queue.empty():
                     try:
-                        await keepalive_task
-                    except asyncio.CancelledError:
+                        self._send_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                # Ensure the writer is closed so the OS releases the socket fd
+                if self.writer:
+                    try:
+                        if not self.writer.is_closing():
+                            self.writer.close()
+                        await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
+                    except Exception:
                         pass
+                    self.writer = None
+                    self.reader = None
 
             if not self.running:
                 break
@@ -1140,13 +1303,13 @@ class IRCClient:
                 break
 
     async def handle_incoming(self) -> None:
+        # No per-readline wait_for: keepalive() detects dead TCP connections within
+        # PONG_TIMEOUT (120 s) and calls writer.close(), which feeds EOF to the reader
+        # and unblocks readline().  Removing wait_for eliminates one Task allocation
+        # per received line — measurable on busy channels with hundreds of messages/min.
         try:
             while self.running:
-                try:
-                    line = await asyncio.wait_for(self.reader.readline(), timeout=300)
-                except asyncio.TimeoutError:
-                    await self.ui_queue.put(("status", "Read timeout — reconnecting"))
-                    break
+                line = await self.reader.readline()
                 if not line:
                     await self.ui_queue.put(("status", "Server closed the connection"))
                     break
@@ -1165,17 +1328,43 @@ class IRCClient:
 
     @staticmethod
     def _parse_irc_line(raw: str):
-        """Parse a raw IRC line.
+        """Parse a raw IRC line (including IRCv3 message-tag prefix).
 
-        Returns (cmd, nick, params, prefix) where:
+        Returns (cmd, nick, params, prefix, tags) where:
           cmd    – upper-cased command string
           nick   – nick extracted from prefix (or server name if no '!')
           params – list of parameters; trailing (after ' :') is the last element
           prefix – raw prefix string (needed for NOTICE '!' check)
+          tags   – dict of IRCv3 message tags (empty dict if none present)
         Returns None if the line cannot be parsed.
+
+        IRCv3 tagged lines look like:
+          @time=2024-01-01T12:00:00.000Z;msgid=abc :nick!u@h PRIVMSG #ch :text
+        Without this handling, any server that sends server-time would have ALL
+        its messages silently dropped since the '@' breaks the ':' prefix check.
         """
         if not raw:
             return None
+        # --- IRCv3 message tags (RFC; section 3.3) ---
+        tags: dict = {}
+        if raw.startswith("@"):
+            try:
+                tag_str, raw = raw[1:].split(" ", 1)
+            except ValueError:
+                return None
+            for t in tag_str.split(";"):
+                if not t:
+                    continue
+                if "=" in t:
+                    k, v = t.split("=", 1)
+                    # Unescape IRCv3 tag escape sequences
+                    v = (v.replace("\\:", ";").replace("\\s", " ")
+                          .replace("\\\\", "\\").replace("\\r", "\r")
+                          .replace("\\n", "\n"))
+                    tags[k] = v
+                else:
+                    tags[t] = ""
+        # --- standard prefix / command / params ---
         prefix = ""
         trailing = None
         if raw.startswith(":"):
@@ -1195,13 +1384,14 @@ class IRCClient:
         if trailing is not None:
             params.append(trailing)
         nick = prefix.split("!")[0] if "!" in prefix else prefix
-        return cmd, nick, params, prefix
+        return cmd, nick, params, prefix, tags
 
     async def process_line(self, line: str) -> None:
         parsed = self._parse_irc_line(line)
         if parsed is None:
             return
-        cmd, nick, params, prefix = parsed
+        cmd, nick, params, prefix, tags = parsed
+        self._current_msg_tags = tags
         handler = self._irc_handlers.get(cmd)
         if handler:
             await handler(nick, params, prefix)
@@ -1213,6 +1403,9 @@ class IRCClient:
 
     async def _irc_ping(self, nick, params, prefix):
         self.send_raw(f"PONG :{params[0] if params else 'keepalive'}")
+
+    async def _irc_pong(self, nick, params, prefix):
+        self._last_pong = time.monotonic()
 
     async def _irc_cap(self, nick, params, prefix):
         subcmd = params[1].upper() if len(params) > 1 else ""
@@ -1226,6 +1419,7 @@ class IRCClient:
                 _OPTIONAL_CAPS = (
                     "away-notify", "multi-prefix", "account-notify",
                     "extended-join", "chghost", "server-time",
+                    "echo-message", "userhost-in-names",
                 )
                 want = [c for c in _OPTIONAL_CAPS if c in self._cap_ls_caps]
                 if "sasl" in self._cap_ls_caps and NICKSERV_PASSWORD:
@@ -1393,6 +1587,11 @@ class IRCClient:
         new_nick = params[0] if params else ""
         if nick == self.nick:
             self.nick = new_nick
+            # If we reclaimed our desired nick, stop the recovery loop.
+            if new_nick == self._desired_nick:
+                if self._nick_reclaim_task and not self._nick_reclaim_task.done():
+                    self._nick_reclaim_task.cancel()
+                    await self.ui_queue.put(("status", f"Reclaimed nick {new_nick}"))
         await self.ui_queue.put(("nick_change", nick, new_nick))
 
     async def _irc_notice(self, nick, params, prefix):
@@ -1414,8 +1613,20 @@ class IRCClient:
         await self.ui_queue.put(("quit", nick, reason))
 
     async def _irc_names(self, nick, params, prefix):  # 353 RPL_NAMREPLY
-        if len(params) >= 4:
-            await self.ui_queue.put(("names", params[2], params[3]))
+        if len(params) < 4:
+            return
+        channel = params[2]
+        # When userhost-in-names CAP is active entries look like "@nick!user@host";
+        # strip mode-prefix chars and drop the !user@host suffix so the user list
+        # only contains bare nicks (matching how JOIN/PART/QUIT events work).
+        cleaned = []
+        for entry in params[3].split():
+            entry = entry.lstrip("@+%&~!")   # strip mode prefix
+            if "!" in entry:                  # userhost-in-names
+                entry = entry.split("!", 1)[0]
+            if entry:
+                cleaned.append(entry)
+        await self.ui_queue.put(("names", channel, " ".join(cleaned)))
 
     async def _irc_who_reply(self, nick, params, prefix):  # 352/314
         await self.ui_queue.put(("status", f"{params[0] if params else ''} {' '.join(params[1:])}"))
@@ -1433,9 +1644,20 @@ class IRCClient:
         await self.ui_queue.put(("status", f"No topic set for {channel}"))
 
     async def _irc_nick_in_use(self, nick, params, prefix):  # 433
-        self.nick = (self.nick + "_")[:30]
-        self.send_raw(f"NICK {self.nick}")
-        await self.ui_queue.put(("status", f"Nickname in use — retrying as {self.nick}"))
+        # During registration: append underscore and retry.
+        # After registration: server rejected a NICK change — just report it.
+        if not self._identified:
+            self.nick = (self.nick + "_")[:30]
+            self.send_raw(f"NICK {self.nick}")
+            await self.ui_queue.put(("status", f"Nickname in use — trying {self.nick}"))
+            # Start a background loop that periodically tries to reclaim the
+            # original nick.  Only start one; cancel any stale previous one.
+            if self._nick_reclaim_task and not self._nick_reclaim_task.done():
+                self._nick_reclaim_task.cancel()
+            self._nick_reclaim_task = asyncio.create_task(self._nick_reclaim_loop())
+        else:
+            wanted = params[1] if len(params) > 1 else "?"
+            await self.ui_queue.put(("status", f"Nickname {wanted} is already in use"))
 
     async def _irc_bad_nick(self, nick, params, prefix):  # 432
         bad = params[1] if len(params) > 1 else "?"
@@ -1465,10 +1687,48 @@ class IRCClient:
         else:
             await self.ui_queue.put(("status", f"* {nick} is identified as {account}"))
 
+    async def _irc_isupport(self, nick, params, prefix):  # 005 RPL_ISUPPORT
+        """Parse ISUPPORT tokens and extract useful server capabilities."""
+        # params = [yournick, TOKEN, TOKEN=value, ..., "are supported by this server"]
+        for token in params[1:-1]:
+            if not token:
+                continue
+            if token.startswith("-"):
+                self._isupport.pop(token[1:], None)
+            elif "=" in token:
+                k, v = token.split("=", 1)
+                self._isupport[k] = v
+            else:
+                self._isupport[token] = True
+        # Announce the network name the first time we see it
+        if "NETWORK" in self._isupport and "_network_announced" not in self._isupport:
+            self._isupport["_network_announced"] = True
+            await self.ui_queue.put(("status",
+                f"Network: {self._isupport['NETWORK']}"))
+
+    async def _irc_no_such_nick(self, nick, params, prefix):  # 401 ERR_NOSUCHNICK
+        target = params[1] if len(params) > 1 else params[0] if params else "?"
+        await self.ui_queue.put(("status", f"No such nick/channel: {target}"))
+
+    async def _nick_reclaim_loop(self) -> None:
+        """Periodically send NICK <desired> to reclaim the original nick.
+
+        Runs after a 433 collision forces us onto nick_.  Tries every 30 s.
+        Cancelled automatically by _irc_nick_change once we succeed.
+        """
+        try:
+            await asyncio.sleep(30)
+            while self.running and self.nick != self._desired_nick:
+                self.send_raw(f"NICK {self._desired_nick}")
+                await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            pass
+
     def _build_irc_handlers(self) -> None:
         """Populate the IRC command dispatch table."""
         h = self._irc_handlers
         h["PING"]         = self._irc_ping
+        h["PONG"]         = self._irc_pong
         h["CAP"]          = self._irc_cap
         h["AUTHENTICATE"] = self._irc_authenticate
         h["903"]          = self._irc_sasl_ok
@@ -1491,6 +1751,8 @@ class IRCClient:
         h["331"]          = self._irc_no_topic
         h["433"]          = self._irc_nick_in_use
         h["432"]          = self._irc_bad_nick
+        h["401"]          = self._irc_no_such_nick
+        h["005"]          = self._irc_isupport
         h["AWAY"]         = self._irc_away_notify
         h["CHGHOST"]      = self._irc_chghost
         h["ACCOUNT"]      = self._irc_account
@@ -1521,6 +1783,7 @@ class IRCClient:
     def cmd_nick(self, new_nick: str) -> None:
         self.send_raw(f"NICK {new_nick}")
         self.nick = new_nick
+        self._desired_nick = new_nick  # user intentionally chose this nick
 
     def cmd_whois(self, target: str) -> None:
         self.send_raw(f"WHOIS {target}")
@@ -3469,10 +3732,6 @@ def _ensure_deps() -> bool:
         ("transformers", "transformers",   "AI text detection  (HuggingFace)"),
         ("torch",        "torch",          "AI text detection  (PyTorch)"),
     ]
-    # windows-curses is only needed when the stdlib curses module is absent
-    if sys.platform == "win32" and importlib.util.find_spec("curses") is None:
-        wanted.append(("windows_curses", "windows-curses", "Terminal UI on Windows"))
-
     missing = [
         (imp, pkg, desc) for imp, pkg, desc in wanted
         if importlib.util.find_spec(imp) is None
