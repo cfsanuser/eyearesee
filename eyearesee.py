@@ -2728,95 +2728,120 @@ class TUI:
                 sw = self.window_by_name["*status*"]
                 _C = lambda line: sw.add_line(line)
                 _H = lambda title: _C(f"  ── {title} {'─' * max(0, 38 - len(title))}")
-                _E = lambda c, d: _C(f"  {c:<32} {d}")
+                _E = lambda c, d: _C(f"  {c:<34} {d}")
                 _C("")
                 _C("  ╔══════════════════════════════════════════╗")
                 _C("  ║          Available IRC Commands          ║")
                 _C("  ╚══════════════════════════════════════════╝")
                 _C("")
                 _H("Messaging")
-                _E("/msg <nick> <text>",          "Send a private message to nick")
-                _E("/query <nick> [message]",      "Open a DM window; optionally send a first message")
-                _E("/notice <nick> <text>",        "Send a notice (not shown in chat)")
-                _E("/me <text>",                  "Send an action (e.g. /me waves)")
+                _E("/msg <nick> <text>",            "Send a PM; opens and switches to the DM window")
+                _E("/query <nick> [message]",        "Open a DM window with nick; optionally send a first message")
+                _E("/notice <nick> <text>",          "Send a notice (-nick- style, not shown in chat)")
+                _E("/me <text>",                    "Send an action line  (* nick waves)")
                 _C("")
                 _H("Channels")
-                _E("/join <channel>",             "Join a channel")
-                _E("/part [channel] [msg]",       "Leave a channel")
-                _E("/topic <channel> [text]",     "View or set the channel topic")
-                _E("/names [channel]",            "List users currently in channel")
-                _E("/kick <chan> <nick> [reason]","Kick a user from the channel")
-                _E("/invite <nick> [channel]",    "Invite a user to a channel")
-                _E("/mode <target> [modes]",      "Get or set channel / user modes")
+                _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
+                _E("/part [channel] [message]",     "Leave a channel with an optional part message")
+                _E("/topic <channel> [text]",       "View or set the channel topic")
+                _E("/names [channel]",              "List users currently in the channel")
+                _E("/kick <chan> <nick> [reason]",  "Kick a user from the channel")
+                _E("/invite <nick> [channel]",      "Invite a user to a channel")
+                _E("/mode <target> [modes]",        "Get or set channel / user modes")
                 _C("")
                 _H("Operator")
-                _E("/op <nick>",                  "Grant operator status  (+o)")
-                _E("/deop <nick>",                "Remove operator status (-o)")
-                _E("/voice <nick>",               "Grant voice  (+v)")
-                _E("/devoice <nick>",             "Remove voice (-v)")
-                _E("/hop <nick>",                 "Grant half-op  (+h)")
-                _E("/dehop <nick>",               "Remove half-op (-h)")
-                _E("/ban <nick|mask>",            "Ban user; expands nick → nick!*@*")
-                _E("/unban <mask>",               "Remove a ban mask")
+                _E("/op <nick>",                    "Grant operator status  (+o)")
+                _E("/deop <nick>",                  "Remove operator status (-o)")
+                _E("/voice <nick>",                 "Grant voice  (+v)")
+                _E("/devoice <nick>",               "Remove voice (-v)")
+                _E("/hop <nick>",                   "Grant half-op  (+h)")
+                _E("/dehop <nick>",                 "Remove half-op (-h)")
+                _E("/ban <nick|mask>",              "Ban user; bare nick expands to nick!*@*")
+                _E("/unban <mask>",                 "Remove a ban mask")
                 _C("")
                 _H("Users & Status")
-                _E("/nick <newnick>",             "Change your nickname")
-                _E("/whois <nick>",               "Look up information on a user")
-                _E("/whowas <nick>",              "Info on a recently disconnected user")
-                _E("/who <target>",               "List users matching a pattern")
-                _E("/ignore <nick>",              "Suppress all messages from nick")
-                _E("/unignore <nick>",            "Stop ignoring nick")
-                _E("/away [message]",             "Set away status with optional message")
-                _E("/back",                       "Remove away status")
+                _E("/nick <newnick>",               "Change your nickname")
+                _E("/whois <nick>",                 "Look up user info — shown formatted in *status*")
+                _E("/whowas <nick>",                "Info on a recently disconnected user")
+                _E("/who <target>",                 "List users matching a pattern")
+                _E("/ignore <nick>",                "Suppress all messages from nick")
+                _E("/unignore <nick>",              "Stop ignoring nick")
+                _E("/away [message]",               "Set away status with optional message")
+                _E("/back",                         "Remove away status")
                 _C("")
-                _H("Services")
-                _E("/ns <command>",               "Send command to NickServ")
-                _E("/cs <command>",               "Send command to ChanServ")
-                _E("/ctcp <nick> <cmd> [args]",   "Send a CTCP request to nick")
+                _H("Services & CTCP")
+                _E("/ns <command>",                 "Send command to NickServ  (e.g. /ns identify pw)")
+                _E("/cs <command>",                 "Send command to ChanServ")
+                _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
                 _C("")
                 _H("AI Detection")
-                _E("/ai <nick>",                  "Show full AI-detection profile for nick")
-                _E("/aitoggle",                   "Enable or disable AI scoring")
+                _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
+                _E("/aitoggle",                     "Enable or disable AI scoring entirely")
+                _C("  AI scores are shown next to each nick in the user list.")
+                _C("  Suspected bots are highlighted bold; the dashboard lists all suspects.")
                 _C("")
                 _H("Claude Integration")
-                _E("/askai [model] <question>",   "Ask Claude a question (shown in dashboard)")
-                _E("/model <opus|sonnet|haiku>",  "Set the Claude model used by /askai")
+                _E("/askai [opus|sonnet|haiku] <q>","Ask Claude a question; answer shown in dashboard")
+                _E("/model <opus|sonnet|haiku>",    "Set the default Claude model for /askai")
+                _C(f"  Current model: {self.ai_chat_model}  ({CLAUDE_MODELS.get(self.ai_chat_model, '?')})")
                 _C("")
                 _H("Translation")
-                _E("/autotranslate",              "Toggle auto CJK → English (on by default)")
+                _E("/autotranslate",                "Toggle auto CJK → English translation (on by default)")
+                _C("  Translated lines appear indented below the original message.")
                 _C("")
                 _H("Connection")
-                _E("/server <host> [port] [nick]","Connect to an IRC server over SSL (6697)")
-                _E("/reconnect",                  "Drop and re-establish the current connection")
+                _E("/server <host> [port] [nick]",  "Connect to a new IRC server over SSL (default 6697)")
+                _E("/reconnect",                    "Drop and re-establish the current connection")
                 _C("")
-                _H("Interface")
-                _E("/theme <1-5>",               "Switch colour theme (Classic Hacker Ocean…)")
-                _E("/win <n>",                   "Switch to window number n")
-                _E("/clear",                     "Clear messages in the current window")
-                _E("/close  (or /wc)",           "Close the current chat window")
+                _H("Windows & Navigation")
+                _C("  Tab bar (above input): [1:status] [2:dash] [*3:##chat]  * = unread")
+                _C("  Prompt shows send target:  [##channel] nick>  or  [>nick] nick>")
+                _E("/win <n>",                      "Switch to window n; clears its unread marker")
+                _E("/close  (or /wc)",              "Close current window; focus moves to previous")
+                _E("/clear",                        "Clear messages in the current window")
+                _E("/theme <1-5>",                  "Switch colour theme: Classic Hacker Ocean Sunset Neon")
+                _C("  Ctrl+N  next window    Tab  nick completion    PgUp/PgDn  scroll")
+                _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
+                _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
                 _C("")
                 _H("General")
-                _E("/quit [message]",            "Disconnect from IRC and exit")
-                _E("/help",                      "Brief command reference")
-                _E("/commands",                  "This detailed command list")
+                _E("/quit [message]",               "Send quit message and exit")
+                _E("/help",                         "Brief one-line command reference")
+                _E("/commands",                     "This full command list")
                 _C("")
                 self.current_window_index = 0
                 self._chat_dirty = True
             elif cmd == "help":
                 for l in [
-                    "Commands: /msg /query /notice /me /action /away /back",
-                    "          /join /part /quit /nick /topic /kick",
-                    "          /op /deop /voice /devoice /hop /dehop",
-                    "          /ban /unban /invite /mode",
-                    "          /whois /whowas /who /names",
-                    "          /ns /cs /ctcp /ai <nick> /aitoggle",
-                    "          /askai [opus|sonnet|haiku] <question>",
-                    "          /model <opus|sonnet|haiku>",
-                    "          /autotranslate  (toggle CJK → English, on by default)",
-                    "          /theme <1-5>  (Classic Hacker Ocean Sunset Neon)",
-                    "          /ignore /unignore /clear /close /wc",
-                    "          /server <host> [port] [nick]  (SSL, port defaults to 6697)",
-                    "          /win <n> /reconnect /help",
+                    "── Messaging ──────────────────────────────────────────",
+                    "  /msg <nick> <text>       PM nick; opens & switches to DM window",
+                    "  /query <nick> [message]  Open a DM window (optional first message)",
+                    "  /notice <nick> <text>    Send a notice   /me <text>  Action line",
+                    "── Channels ────────────────────────────────────────────",
+                    "  /join <chan>  /part [chan] [msg]  /topic <chan> [text]",
+                    "  /kick <chan> <nick> [reason]  /invite <nick> [chan]",
+                    "  /names [chan]  /mode <target> [modes]",
+                    "── Operator ────────────────────────────────────────────",
+                    "  /op /deop /voice /devoice /hop /dehop  /ban /unban",
+                    "── Users ───────────────────────────────────────────────",
+                    "  /nick <new>  /whois <nick>  /whowas <nick>  /who <pat>",
+                    "  /ignore <nick>  /unignore <nick>  /away [msg]  /back",
+                    "── Services ────────────────────────────────────────────",
+                    "  /ns <cmd>  /cs <cmd>  /ctcp <nick> <cmd> [args]",
+                    "── AI Detection ────────────────────────────────────────",
+                    "  /ai <nick>  full profile    /aitoggle  enable/disable scoring",
+                    "── Claude ──────────────────────────────────────────────",
+                    "  /askai [opus|sonnet|haiku] <question>  (answer in dashboard)",
+                    "  /model <opus|sonnet|haiku>  set default model",
+                    "── Translation ─────────────────────────────────────────",
+                    "  /autotranslate  toggle CJK → English (default: on)",
+                    "── Connection ──────────────────────────────────────────",
+                    "  /server <host> [port] [nick]  /reconnect",
+                    "── Interface ───────────────────────────────────────────",
+                    "  /win <n>  /close (/wc)  /clear  /theme <1-5>",
+                    "  Ctrl+N next window  Tab nick-complete  PgUp/Dn scroll",
+                    "  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread",
+                    "  /quit [msg]  /commands  (full list)  /help  (this)",
                 ]:
                     self.window_by_name["*status*"].add_line(l)
                 self.current_window_index = 0
