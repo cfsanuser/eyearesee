@@ -1535,6 +1535,10 @@ class IRCClient:
     async def _irc_privmsg(self, nick, params, prefix):
         if len(params) < 2:
             return
+        # echo-message CAP causes the server to reflect our own sends back to us.
+        # We already display messages locally when sent, so skip the server echo.
+        if nick == self.nick:
+            return
         target = params[0]
         msg    = params[1]
 
