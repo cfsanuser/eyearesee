@@ -143,11 +143,33 @@ def save_input_history_line(line: str) -> None:
         pass
 
 def load_chat_history(window_name: str) -> List[str]:
-    """Return last CHAT_LOG_LOAD lines for the window (already formatted)."""
+    """Return last CHAT_LOG_LOAD lines for the window.
+
+    Reads backwards from EOF in 8 KB chunks so large log files are never
+    fully loaded — only enough bytes to produce CHAT_LOG_LOAD lines are read.
+    """
+    path = _chat_log_path(window_name)
     try:
-        with open(_chat_log_path(window_name), "r", encoding="utf-8") as f:
-            lines = [l.rstrip("\n") for l in f if l.strip()]
-        return lines[-CHAT_LOG_LOAD:]
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            if size == 0:
+                return []
+
+            buf  = b""
+            pos  = size
+            # +1 so a partial line at the start of the read buffer is discarded
+            need = CHAT_LOG_LOAD + 1
+
+            while pos > 0 and buf.count(b"\n") < need:
+                step = min(8192, pos)
+                pos -= step
+                f.seek(pos)
+                buf = f.read(step) + buf
+
+            lines  = buf.decode("utf-8", errors="replace").splitlines()
+            result = [l for l in lines if l.strip()]
+            return result[-CHAT_LOG_LOAD:]
     except FileNotFoundError:
         return []
     except Exception:
@@ -1601,15 +1623,6 @@ class TUI:
     def ensure_window(self, name: str, is_channel: bool = True) -> ChatWindow:
         if name not in self.window_by_name:
             win = ChatWindow(name, is_channel=is_channel)
-            # Replay persisted history without re-writing it to disk
-            win._persist = False
-            past = load_chat_history(name)
-            if past:
-                win.add_line("── restored history ──", timestamp=False)
-                for line in past:
-                    win.lines.append(line)
-                win._wrap_dirty = True
-            win._persist = True
             self.windows.append(win)
             self.window_by_name[name] = win
             if is_channel and name not in self.channel_users:
