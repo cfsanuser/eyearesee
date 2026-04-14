@@ -1013,6 +1013,8 @@ class IRCClient:
         self.joined_channels: set = {DEFAULT_CHANNEL} if DEFAULT_CHANNEL else set()
         self._ctcp_times: Dict[str, deque] = {}  # rate-limit CTCP replies
         self._cap_ls_caps: set = set()           # accumulated caps across multiline CAP LS
+        self._irc_handlers: dict = {}
+        self._build_irc_handlers()
 
     async def connect(self) -> None:
         await self.ui_queue.put(("status", f"Connecting to {self.server}:{self.port}..."))
@@ -1161,312 +1163,347 @@ class IRCClient:
                     pass
             await self.ui_queue.put(("status", "Disconnected from IRC"))
 
-    async def process_line(self, line: str) -> None:
-        if not line: return
+    @staticmethod
+    def _parse_irc_line(raw: str):
+        """Parse a raw IRC line.
+
+        Returns (cmd, nick, params, prefix) where:
+          cmd    – upper-cased command string
+          nick   – nick extracted from prefix (or server name if no '!')
+          params – list of parameters; trailing (after ' :') is the last element
+          prefix – raw prefix string (needed for NOTICE '!' check)
+        Returns None if the line cannot be parsed.
+        """
+        if not raw:
+            return None
         prefix = ""
         trailing = None
-        if line.startswith(":"):
+        if raw.startswith(":"):
             try:
-                prefix, line = line[1:].split(" ", 1)
+                prefix, raw = raw[1:].split(" ", 1)
             except ValueError:
-                return
-        if " :" in line:
-            args, trailing = line.split(" :", 1)
+                return None
+        if " :" in raw:
+            args, trailing = raw.split(" :", 1)
             parts = args.split()
         else:
-            parts = line.split()
-        if not parts: return
-
+            parts = raw.split()
+        if not parts:
+            return None
         cmd = parts[0].upper()
-        params = parts[1:]
+        params: List[str] = parts[1:]
         if trailing is not None:
             params.append(trailing)
-
         nick = prefix.split("!")[0] if "!" in prefix else prefix
+        return cmd, nick, params, prefix
 
-        if cmd == "PING":
-            self.send_raw(f"PONG :{params[0] if params else 'keepalive'}")
+    async def process_line(self, line: str) -> None:
+        parsed = self._parse_irc_line(line)
+        if parsed is None:
             return
+        cmd, nick, params, prefix = parsed
+        handler = self._irc_handlers.get(cmd)
+        if handler:
+            await handler(nick, params, prefix)
+        elif cmd not in _SILENT_NUMERICS:
+            if cmd in _SERVER_INFO:
+                await self.ui_queue.put(("status", f"{cmd} {' '.join(params)}"))
 
-        if cmd == "CAP":
-            subcmd = params[1].upper() if len(params) > 1 else ""
-            if subcmd == "LS":
-                # CAP LS 302 sends caps across multiple lines; an intermediate line
-                # has "*" as params[2].  Accumulate until the final line arrives.
-                # Cap names may carry values ("sasl=PLAIN,EXTERNAL") — strip after "=".
-                more_coming = len(params) > 2 and params[2] == "*"
-                for raw_cap in (trailing or "").lower().split():
-                    self._cap_ls_caps.add(raw_cap.split("=")[0])
-                if not more_coming:
-                    # Build a single CAP REQ with all wanted caps the server supports.
-                    # Optional IRCv3 caps improve user-list accuracy and event detail.
-                    _OPTIONAL_CAPS = (
-                        "away-notify",    # AWAY events for every user in channel
-                        "multi-prefix",   # NAMES/WHO return all mode prefixes
-                        "account-notify", # login/logout events
-                        "extended-join",  # JOIN includes account + realname
-                        "chghost",        # host-change events without quit/rejoin
-                        "server-time",    # message timestamps from the server
-                    )
-                    want = [c for c in _OPTIONAL_CAPS if c in self._cap_ls_caps]
-                    if "sasl" in self._cap_ls_caps and NICKSERV_PASSWORD:
-                        want.append("sasl")
-                    if want:
-                        self.send_raw(f"CAP REQ :{' '.join(want)}")
-                    else:
-                        self.send_raw("CAP END")
-                    self._cap_ls_caps.clear()
-            elif subcmd == "ACK":
-                acked = set((trailing or "").lower().split())
-                if "sasl" in acked:
-                    # SASL PLAIN: initiate auth; CAP END comes after 903
-                    self.send_raw("AUTHENTICATE PLAIN")
-                else:
-                    # Only optional caps were acked — capability negotiation complete
-                    self.send_raw("CAP END")
-            elif subcmd == "NAK":
-                # Server rejected the REQ — complete registration without caps
+    # ── IRC command handlers ──────────────────────────────────────────────────
+
+    async def _irc_ping(self, nick, params, prefix):
+        self.send_raw(f"PONG :{params[0] if params else 'keepalive'}")
+
+    async def _irc_cap(self, nick, params, prefix):
+        subcmd = params[1].upper() if len(params) > 1 else ""
+        if subcmd == "LS":
+            # CAP LS 302 sends caps across multiple lines; "*" in params[2] means more coming.
+            # Cap names may carry values ("sasl=PLAIN,EXTERNAL") — strip after "=".
+            more_coming = len(params) > 2 and params[2] == "*"
+            for raw_cap in (params[-1] if params else "").lower().split():
+                self._cap_ls_caps.add(raw_cap.split("=")[0])
+            if not more_coming:
+                _OPTIONAL_CAPS = (
+                    "away-notify", "multi-prefix", "account-notify",
+                    "extended-join", "chghost", "server-time",
+                )
+                want = [c for c in _OPTIONAL_CAPS if c in self._cap_ls_caps]
+                if "sasl" in self._cap_ls_caps and NICKSERV_PASSWORD:
+                    want.append("sasl")
+                self.send_raw(f"CAP REQ :{' '.join(want)}" if want else "CAP END")
+                self._cap_ls_caps.clear()
+        elif subcmd == "ACK":
+            acked = set((params[-1] if params else "").lower().split())
+            if "sasl" in acked:
+                self.send_raw("AUTHENTICATE PLAIN")
+            else:
                 self.send_raw("CAP END")
-            return
+        elif subcmd == "NAK":
+            self.send_raw("CAP END")
 
-        if cmd == "AUTHENTICATE" and params and params[0] == "+":
-            # Server is ready — send SASL PLAIN: authzid\0authcid\0password
+    async def _irc_authenticate(self, nick, params, prefix):
+        if params and params[0] == "+":
             payload = base64.b64encode(
                 f"{self.nick}\0{self.nick}\0{NICKSERV_PASSWORD}".encode()
             ).decode()
             self.send_raw(f"AUTHENTICATE {payload}")
+
+    async def _irc_sasl_ok(self, nick, params, prefix):  # 903
+        await self.ui_queue.put(("status", "SASL authentication successful — ident set"))
+        self._identified = True
+        self.send_raw("CAP END")
+
+    async def _irc_sasl_fail(self, nick, params, prefix):  # 904
+        await self.ui_queue.put(("status", "SASL authentication failed — falling back to NickServ"))
+        self.send_raw("CAP END")
+
+    async def _irc_logged_in(self, nick, params, prefix):  # 900
+        account = params[2] if len(params) > 2 else "?"
+        await self.ui_queue.put(("status", f"Logged in as {account}"))
+
+    async def _irc_welcome(self, nick, params, prefix):  # 001
+        await self.ui_queue.put(("clear_users",))
+        await self.ui_queue.put(("status", "Successfully logged in to IRC"))
+        if not self._identified and NICKSERV_PASSWORD:
+            asyncio.create_task(self._delayed_nickserv_identify())
+        for ch in sorted(self.joined_channels):
+            self.send_raw(f"JOIN {ch}")
+            await self.ui_queue.put(("status", f"Joining {ch}..."))
+        if not self.current_channel and DEFAULT_CHANNEL:
+            self.current_channel = DEFAULT_CHANNEL
+
+    async def _irc_join(self, nick, params, prefix):
+        if not params:
             return
+        channel = params[0]
+        await self.ui_queue.put(("join", nick, channel))
+        if nick == self.nick:
+            await self.ui_queue.put(("self_join", channel))
 
-        if cmd == "903":  # RPL_SASLSUCCESS
-            await self.ui_queue.put(("status", "SASL authentication successful — ident set"))
-            self._identified = True
-            self.send_raw("CAP END")
-            return
-
-        if cmd == "904":  # RPL_SASLFAIL
-            await self.ui_queue.put(("status", "SASL authentication failed — falling back to NickServ"))
-            self.send_raw("CAP END")
-            return
-
-        if cmd == "900":  # RPL_LOGGEDIN
-            account = params[2] if len(params) > 2 else "?"
-            await self.ui_queue.put(("status", f"Logged in as {account}"))
-            return
-
-        if cmd == "001":
-            await self.ui_queue.put(("clear_users",))
-            await self.ui_queue.put(("status", "Successfully logged in to IRC"))
-            if not self._identified and NICKSERV_PASSWORD:
-                # Delay NickServ IDENTIFY in a background task so we don't block
-                # the read loop — unanswered PINGs during sleep cause disconnects.
-                asyncio.create_task(self._delayed_nickserv_identify())
-            for ch in sorted(self.joined_channels):
-                self.send_raw(f"JOIN {ch}")
-                await self.ui_queue.put(("status", f"Joining {ch}..."))
-            if not self.current_channel and DEFAULT_CHANNEL:
-                self.current_channel = DEFAULT_CHANNEL
-
-        elif cmd == "JOIN":
-            if not params:
-                return
-            channel = params[0]
-            await self.ui_queue.put(("join", nick, channel))
-            if nick == self.nick:
-                # Use a dedicated event so the TUI can switch to the channel window
-                # without being immediately overridden by the generic status handler.
-                await self.ui_queue.put(("self_join", channel))
-
-        elif cmd == "PART":
-            if not params:
-                return
+    async def _irc_part(self, nick, params, prefix):
+        if params:
             await self.ui_queue.put(("part", nick, params[0]))
 
-        elif cmd == "KICK":
-            if not params:
+    async def _irc_kick(self, nick, params, prefix):
+        if params:
+            reason = params[-1] if len(params) > 2 else ""
+            await self.ui_queue.put(("kick", nick, params[0],
+                                     params[1] if len(params) > 1 else "", reason))
+
+    async def _irc_topic_cmd(self, nick, params, prefix):
+        if params:
+            await self.ui_queue.put(("topic", params[0], params[-1] if len(params) > 1 else ""))
+
+    async def _irc_mode(self, nick, params, prefix):
+        await self.ui_queue.put(("mode", nick, params))
+
+    async def _irc_whois_reply(self, cmd_key: str, nick, params, prefix):
+        w = params[1] if len(params) > 1 else "?"
+        if cmd_key == "311" and len(params) >= 5:
+            user, host = params[2], params[3]
+            real = params[5] if len(params) > 5 else ""
+            text = f"[whois] {w}  ({user}@{host})  \"{real}\""
+        elif cmd_key == "312" and len(params) >= 3:
+            srv  = params[2]
+            info = params[3] if len(params) > 3 else ""
+            text = f"[whois] {w}  server: {srv}" + (f" — {info}" if info else "")
+        elif cmd_key == "313":
+            text = f"[whois] {w}  is an IRC operator"
+        elif cmd_key == "317" and len(params) >= 3:
+            try:
+                secs = int(params[2])
+                parts_idle = []
+                if secs >= 3600:
+                    parts_idle.append(f"{secs // 3600}h")
+                parts_idle.append(f"{(secs % 3600) // 60}m {secs % 60}s")
+                idle_str = " ".join(parts_idle)
+            except ValueError:
+                idle_str = params[2]
+            sign_str = ""
+            if len(params) > 3 and params[3].isdigit():
+                sign_str = "  signed on: " + time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(int(params[3])))
+            text = f"[whois] {w}  idle: {idle_str}{sign_str}"
+        elif cmd_key == "318":
+            text = f"[whois] ── end of whois for {w} ──"
+        elif cmd_key == "319" and len(params) >= 3:
+            text = f"[whois] {w}  channels: {params[2]}"
+        elif cmd_key == "307":
+            text = f"[whois] {w}  is a registered nick"
+        elif cmd_key == "330" and len(params) >= 3:
+            text = f"[whois] {w}  logged in as: {params[2]}"
+        elif cmd_key == "671":
+            text = f"[whois] {w}  is using a secure connection (SSL/TLS)"
+        else:
+            text = f"[whois] {' '.join(params[1:])}"
+        await self.ui_queue.put(("whois", text))
+
+    async def _irc_privmsg(self, nick, params, prefix):
+        if len(params) < 2:
+            return
+        target = params[0]
+        msg    = params[1]
+
+        # ACTION must be checked before the generic CTCP block — both use \x01
+        # wrappers and falling into the CTCP branch silently drops /me lines.
+        is_action = msg.startswith("\x01ACTION ") and msg.endswith("\x01")
+        if is_action:
+            msg = msg[len("\x01ACTION "):-1]
+        elif msg.startswith("\x01") and msg.endswith("\x01"):
+            # Generic CTCP request
+            ctcp = msg[1:-1].split(" ", 1)
+            ctcp_cmd  = ctcp[0].upper()
+            ctcp_args = ctcp[1] if len(ctcp) > 1 else ""
+            if not self._ctcp_allowed(nick):
                 return
-            await self.ui_queue.put(("kick", nick, params[0], params[1] if len(params) > 1 else "", trailing or ""))
+            if ctcp_cmd == "PING":
+                safe_args = ctcp_args.replace("\x01", "")[:100]
+                self.send_raw(f"NOTICE {nick} :\x01PING {safe_args}\x01")
+            elif ctcp_cmd == "VERSION":
+                self.send_raw(f"NOTICE {nick} :\x01VERSION eyearesee IRC client v2.0\x01")
+                await self.ui_queue.put(("status", f"-!- CTCP VERSION from {nick}"))
+            elif ctcp_cmd == "TIME":
+                self.send_raw(
+                    f"NOTICE {nick} :\x01TIME "
+                    f"{time.strftime('%a, %d %b %Y %H:%M:%S %Z', time.localtime())}\x01")
+                await self.ui_queue.put(("status", f"-!- CTCP TIME from {nick}"))
+            elif ctcp_cmd == "CLIENTINFO":
+                self.send_raw(
+                    f"NOTICE {nick} :\x01CLIENTINFO "
+                    f"PING VERSION TIME CLIENTINFO USERINFO SOURCE FINGER\x01")
+            elif ctcp_cmd == "USERINFO":
+                self.send_raw(f"NOTICE {nick} :\x01USERINFO {self.nick} is using eyearesee\x01")
+            elif ctcp_cmd == "SOURCE":
+                self.send_raw(f"NOTICE {nick} :\x01SOURCE https://github.com (custom eyearesee)\x01")
+            elif ctcp_cmd == "FINGER":
+                self.send_raw(f"NOTICE {nick} :\x01FINGER No finger info\x01")
+            return  # CTCP — never treat as normal message
 
-        elif cmd == "TOPIC":
-            if not params:
-                return
-            await self.ui_queue.put(("topic", params[0], trailing or ""))
+        if nick not in self.users:
+            self.users[nick] = UserState(nick)
+        u_state = self.users[nick]
+        u_score = self.scoring.score_user(u_state)
+        m_score = self.scoring.score_message(None, u_state)
+        # Display immediately with a placeholder AI score (0); a background task
+        # scores the message and sends an "ai_score" update once ML inference finishes.
+        await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0, is_action))
+        asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
 
-        elif cmd == "MODE":
-            await self.ui_queue.put(("mode", nick, params))
+    async def _irc_nick_change(self, nick, params, prefix):
+        new_nick = params[0] if params else ""
+        if nick == self.nick:
+            self.nick = new_nick
+        await self.ui_queue.put(("nick_change", nick, new_nick))
 
-        elif cmd in _WHOIS_REPLIES:
-            # params[0] = our nick, params[1] = target nick, rest = data
-            w = params[1] if len(params) > 1 else "?"
-            if cmd == "311" and len(params) >= 5:   # RPL_WHOISUSER
-                user, host = params[2], params[3]
-                real = params[5] if len(params) > 5 else ""
-                text = f"[whois] {w}  ({user}@{host})  \"{real}\""
-            elif cmd == "312" and len(params) >= 3:  # RPL_WHOISSERVER
-                srv  = params[2]
-                info = params[3] if len(params) > 3 else ""
-                text = f"[whois] {w}  server: {srv}" + (f" — {info}" if info else "")
-            elif cmd == "313":                        # RPL_WHOISOPERATOR
-                text = f"[whois] {w}  is an IRC operator"
-            elif cmd == "317" and len(params) >= 3:  # RPL_WHOISIDLE
-                try:
-                    secs  = int(params[2])
-                    parts_idle = []
-                    if secs >= 3600:
-                        parts_idle.append(f"{secs // 3600}h")
-                    parts_idle.append(f"{(secs % 3600) // 60}m {secs % 60}s")
-                    idle_str = " ".join(parts_idle)
-                except ValueError:
-                    idle_str = params[2]
-                sign_str = ""
-                if len(params) > 3 and params[3].isdigit():
-                    sign_str = "  signed on: " + time.strftime(
-                        "%Y-%m-%d %H:%M", time.localtime(int(params[3])))
-                text = f"[whois] {w}  idle: {idle_str}{sign_str}"
-            elif cmd == "318":                        # RPL_ENDOFWHOIS
-                text = f"[whois] ── end of whois for {w} ──"
-            elif cmd == "319" and len(params) >= 3:  # RPL_WHOISCHANNELS
-                text = f"[whois] {w}  channels: {params[2]}"
-            elif cmd == "307":                        # RPL_WHOISREGNICK
-                text = f"[whois] {w}  is a registered nick"
-            elif cmd == "330" and len(params) >= 3:  # RPL_WHOISACCOUNT
-                text = f"[whois] {w}  logged in as: {params[2]}"
-            elif cmd == "671":                        # RPL_WHOISSECURE
-                text = f"[whois] {w}  is using a secure connection (SSL/TLS)"
-            else:
-                text = f"[whois] {' '.join(params[1:])}"
-            await self.ui_queue.put(("whois", text))
+    async def _irc_notice(self, nick, params, prefix):
+        text = params[-1] if params else ""
+        if "!" in prefix:  # user NOTICE (not server)
+            target = params[0] if params else self.nick
+            display_target = target if target.startswith("#") else "*status*"
+            await self.ui_queue.put(("notice", nick, display_target, text))
+        else:
+            await self.ui_queue.put(("status", f"NOTICE {text}"))
 
-        elif cmd == "PRIVMSG":
-            if len(params) < 2: return
-            target = params[0]
-            msg = params[1]
+    async def _irc_invite(self, nick, params, prefix):
+        channel = params[1] if len(params) > 1 else (params[0] if params else "")
+        await self.ui_queue.put(("status", f"*** {nick} invites you to join {channel}"))
 
-            # === CTCP HANDLING ===
-            if msg.startswith("\x01") and msg.endswith("\x01"):
-                ctcp = msg[1:-1].split(" ", 1)
-                ctcp_cmd = ctcp[0].upper()
-                ctcp_args = ctcp[1] if len(ctcp) > 1 else ""
+    async def _irc_quit(self, nick, params, prefix):
+        self.users.pop(nick, None)
+        reason = params[-1] if params else ""
+        await self.ui_queue.put(("quit", nick, reason))
 
-                if not self._ctcp_allowed(nick):
-                    return  # silently drop: rate limit exceeded
+    async def _irc_names(self, nick, params, prefix):  # 353 RPL_NAMREPLY
+        if len(params) >= 4:
+            await self.ui_queue.put(("names", params[2], params[3]))
 
-                if ctcp_cmd == "PING":
-                    # Sanitize: strip \x01 (can't escape envelope) and cap length
-                    # to prevent oversized replies from abusive clients.
-                    safe_args = ctcp_args.replace("\x01", "")[:100]
-                    self.send_raw(f"NOTICE {nick} :\x01PING {safe_args}\x01")
-                elif ctcp_cmd == "VERSION":
-                    self.send_raw(f"NOTICE {nick} :\x01VERSION eyearesee IRC client v2.0 (built with ❤️ by cfuser)\x01")
-                elif ctcp_cmd == "TIME":
-                    self.send_raw(f"NOTICE {nick} :\x01TIME {time.strftime('%a, %d %b %Y %H:%M:%S %Z', time.localtime())}\x01")
-                elif ctcp_cmd == "CLIENTINFO":
-                    self.send_raw(f"NOTICE {nick} :\x01CLIENTINFO PING VERSION TIME CLIENTINFO USERINFO SOURCE FINGER\x01")
-                elif ctcp_cmd == "USERINFO":
-                    self.send_raw(f"NOTICE {nick} :\x01USERINFO {self.nick} is using eyearesee\x01")
-                elif ctcp_cmd == "SOURCE":
-                    self.send_raw(f"NOTICE {nick} :\x01SOURCE https://github.com (custom eyearesee)\x01")
-                elif ctcp_cmd == "FINGER":
-                    self.send_raw(f"NOTICE {nick} :\x01FINGER No finger info\x01")
-                return  # Do not treat CTCP as normal message
+    async def _irc_who_reply(self, nick, params, prefix):  # 352/314
+        await self.ui_queue.put(("status", f"{params[0] if params else ''} {' '.join(params[1:])}"))
 
-            # Normal message
-            is_action = msg.startswith("\x01ACTION ") and msg.endswith("\x01")
-            if is_action:
-                msg = msg[len("\x01ACTION "):-1]
+    async def _irc_away_reply(self, nick, params, prefix):  # 301
+        await self.ui_queue.put(("status", f"Away: {' '.join(params[1:])}"))
 
-            if nick not in self.users:
-                self.users[nick] = UserState(nick)
-            u_state = self.users[nick]
-            u_score = self.scoring.score_user(u_state)
-            m_score = self.scoring.score_message(None, u_state)
+    async def _irc_topic_reply(self, nick, params, prefix):  # 332
+        channel = params[1] if len(params) > 1 else ""
+        topic   = params[-1] if len(params) > 2 else ""
+        await self.ui_queue.put(("topic", channel, topic))
 
-            # Display immediately with placeholder AI score (0) so the message
-            # appears on screen without waiting for ML inference (which can take
-            # hundreds of ms on CPU).  A background task scores it and sends an
-            # "ai_score" update event once inference finishes.
-            await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0, is_action))
-            asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
+    async def _irc_no_topic(self, nick, params, prefix):  # 331
+        channel = params[1] if len(params) > 1 else ""
+        await self.ui_queue.put(("status", f"No topic set for {channel}"))
 
-        elif cmd == "NICK":
-            new_nick = trailing or (params[0] if params else "")
-            if nick == self.nick:
-                self.nick = new_nick
-            await self.ui_queue.put(("nick_change", nick, new_nick))
+    async def _irc_nick_in_use(self, nick, params, prefix):  # 433
+        self.nick = (self.nick + "_")[:30]
+        self.send_raw(f"NICK {self.nick}")
+        await self.ui_queue.put(("status", f"Nickname in use — retrying as {self.nick}"))
 
-        elif cmd == "NOTICE":
-            text = trailing or (params[-1] if params else "")
-            if "!" in prefix:  # user NOTICE, not server
-                target = params[0] if params else self.nick
-                display_target = target if target.startswith("#") else "*status*"
-                await self.ui_queue.put(("notice", nick, display_target, text))
-            else:
-                await self.ui_queue.put(("status", f"NOTICE {text}"))
+    async def _irc_bad_nick(self, nick, params, prefix):  # 432
+        bad = params[1] if len(params) > 1 else "?"
+        await self.ui_queue.put(("status", f"Erroneous nickname rejected by server: {bad}"))
 
-        elif cmd == "INVITE":
-            channel = params[1] if len(params) > 1 else (trailing or "")
-            await self.ui_queue.put(("status", f"*** {nick} invites you to join {channel}"))
+    async def _irc_join_error(self, nick, params, prefix):  # 471/473/474/475/477/489
+        channel = params[1] if len(params) > 1 else ""
+        text    = params[-1] if len(params) > 2 else ""
+        await self.ui_queue.put(("join_error", channel, f"Cannot join {channel}: {text}"))
 
-        elif cmd == "QUIT":
-            # Free the UserState to prevent unbounded memory growth in
-            # long-running sessions on busy channels with high nick churn.
-            self.users.pop(nick, None)
-            await self.ui_queue.put(("quit", nick, trailing or (params[0] if params else "")))
+    async def _irc_away_notify(self, nick, params, prefix):  # AWAY cap
+        reason = params[-1] if params else ""
+        if reason:
+            await self.ui_queue.put(("status", f"* {nick} is away: {reason}"))
+        else:
+            await self.ui_queue.put(("status", f"* {nick} is back"))
 
-        elif cmd == "353":  # RPL_NAMREPLY
-            if len(params) >= 4:
-                await self.ui_queue.put(("names", params[2], params[3]))
+    async def _irc_chghost(self, nick, params, prefix):
+        new_user = params[0] if params else ""
+        new_host = params[1] if len(params) > 1 else ""
+        await self.ui_queue.put(("status", f"* {nick} changed host to {new_user}@{new_host}"))
 
-        elif cmd in _WHO_REPLIES:  # RPL_WHOREPLY, RPL_WHOWASUSER
-            await self.ui_queue.put(("status", f"{cmd} {' '.join(params[1:])}"))
+    async def _irc_account(self, nick, params, prefix):
+        account = params[0] if params else "*"
+        if account == "*":
+            await self.ui_queue.put(("status", f"* {nick} logged out of services"))
+        else:
+            await self.ui_queue.put(("status", f"* {nick} is identified as {account}"))
 
-        elif cmd == "301":  # RPL_AWAY
-            await self.ui_queue.put(("status", f"Away: {' '.join(params[1:])}"))
-
-        elif cmd == "332":  # RPL_TOPIC — channel topic sent on join
-            channel = params[1] if len(params) > 1 else ""
-            await self.ui_queue.put(("topic", channel, trailing or ""))
-
-        elif cmd == "331":  # RPL_NOTOPIC
-            channel = params[1] if len(params) > 1 else ""
-            await self.ui_queue.put(("status", f"No topic set for {channel}"))
-
-        elif cmd == "433":  # ERR_NICKNAMEINUSE — try appending "_"
-            self.nick = (self.nick + "_")[:30]
-            self.send_raw(f"NICK {self.nick}")
-            await self.ui_queue.put(("status", f"Nickname in use — retrying as {self.nick}"))
-
-        elif cmd == "432":  # ERR_ERRONEUSNICKNAME
-            bad = params[1] if len(params) > 1 else "?"
-            await self.ui_queue.put(("status", f"Erroneous nickname rejected by server: {bad}"))
-
-        elif cmd in _ERROR_REPLIES:  # channel join errors (full, invite-only, banned, etc.)
-            # params layout: [yournick, #channel, reason_text_or_from_trailing]
-            channel = params[1] if len(params) > 1 else ""
-            text    = trailing or (" ".join(params[2:]) if len(params) > 2 else "")
-            await self.ui_queue.put(("join_error", channel, f"Cannot join {channel}: {text}"))
-
-        elif cmd == "AWAY":  # away-notify cap: user set or cleared away status
-            reason = trailing or ""
-            if reason:
-                await self.ui_queue.put(("status", f"* {nick} is away: {reason}"))
-            else:
-                await self.ui_queue.put(("status", f"* {nick} is back"))
-
-        elif cmd == "CHGHOST":  # chghost cap: user changed username/hostname
-            new_user = params[0] if params else ""
-            new_host = params[1] if len(params) > 1 else ""
-            await self.ui_queue.put(("status", f"* {nick} changed host to {new_user}@{new_host}"))
-
-        elif cmd == "ACCOUNT":  # account-notify cap: user logged in/out of services
-            account = params[0] if params else "*"
-            if account == "*":
-                await self.ui_queue.put(("status", f"* {nick} logged out of services"))
-            else:
-                await self.ui_queue.put(("status", f"* {nick} is identified as {account}"))
-
-        elif cmd not in _SILENT_NUMERICS:
-            if cmd in _SERVER_INFO:
-                await self.ui_queue.put(("status", f"{cmd} {' '.join(params)}"))
+    def _build_irc_handlers(self) -> None:
+        """Populate the IRC command dispatch table."""
+        h = self._irc_handlers
+        h["PING"]         = self._irc_ping
+        h["CAP"]          = self._irc_cap
+        h["AUTHENTICATE"] = self._irc_authenticate
+        h["903"]          = self._irc_sasl_ok
+        h["904"]          = self._irc_sasl_fail
+        h["900"]          = self._irc_logged_in
+        h["001"]          = self._irc_welcome
+        h["JOIN"]         = self._irc_join
+        h["PART"]         = self._irc_part
+        h["KICK"]         = self._irc_kick
+        h["TOPIC"]        = self._irc_topic_cmd
+        h["MODE"]         = self._irc_mode
+        h["PRIVMSG"]      = self._irc_privmsg
+        h["NICK"]         = self._irc_nick_change
+        h["NOTICE"]       = self._irc_notice
+        h["INVITE"]       = self._irc_invite
+        h["QUIT"]         = self._irc_quit
+        h["353"]          = self._irc_names
+        h["301"]          = self._irc_away_reply
+        h["332"]          = self._irc_topic_reply
+        h["331"]          = self._irc_no_topic
+        h["433"]          = self._irc_nick_in_use
+        h["432"]          = self._irc_bad_nick
+        h["AWAY"]         = self._irc_away_notify
+        h["CHGHOST"]      = self._irc_chghost
+        h["ACCOUNT"]      = self._irc_account
+        # WHOIS numerics — bind each with its code via a closure
+        for _code in _WHOIS_REPLIES:
+            _c = _code
+            h[_c] = lambda nick, params, prefix, c=_c: self._irc_whois_reply(c, nick, params, prefix)
+        # WHO replies
+        for _code in _WHO_REPLIES:
+            h[_code] = self._irc_who_reply
+        # Channel join error numerics
+        for _code in _ERROR_REPLIES:
+            h[_code] = self._irc_join_error
 
     # ====================== Commands ======================
     def cmd_join(self, channel: str) -> None:
@@ -1646,6 +1683,11 @@ class TUI:
 
         # Unread tracking: window names that have received messages while inactive
         self._unread_windows: set = set()
+
+        self._event_handlers: dict = {}
+        self._slash_handlers: dict = {}
+        self._build_event_handlers()
+        self._build_slash_handlers()
 
         stdscr.nodelay(True)
         stdscr.keypad(True)
@@ -2269,6 +2311,8 @@ class TUI:
         win = self.get_current_window()
         if win.name not in ("*status*", "*dashboard*"):
             self.current_channel = win.name
+        if win.name in self._unread_windows:
+            win.scroll_offset = 0  # jump to bottom so the new messages are visible
         self._unread_windows.discard(win.name)
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
@@ -2309,641 +2353,736 @@ class TUI:
         self._input_dirty = True
         self.dirty = True
 
+    def _build_event_handlers(self) -> None:
+        h = self._event_handlers
+        h["msg"]         = self._ev_msg
+        h["ai_score"]    = self._ev_ai_score
+        h["notice"]      = self._ev_notice
+        h["nick_change"] = self._ev_nick_change
+        h["names"]       = self._ev_names
+        h["clear_users"] = self._ev_clear_users
+        h["topic"]       = self._ev_topic
+        h["join"]        = self._ev_join
+        h["self_join"]   = self._ev_self_join
+        h["join_error"]  = self._ev_join_error
+        h["part"]        = self._ev_part
+        h["quit"]        = self._ev_quit
+        for k in ("whois", "kick", "mode", "status"):
+            h[k] = self._ev_status_line
+
     async def handle_event(self, event: tuple) -> None:
-        if not event: return
-        etype = event[0]
+        if not event:
+            return
+        handler = self._event_handlers.get(event[0])
+        if handler:
+            await handler(event)
 
-        if etype == "msg":
-            _, nick, target, msg, u_score, m_score, a_score, rolling_ai, is_action = event
-            if nick.lower() in self.ignored_nicks:
-                return
-            # Route to the right window.  Channel messages go to the channel
-            # window; DMs (target == self.nick) go to the sender's window so
-            # that typing a reply goes to the correct person.
-            if target.startswith("#"):
-                win_name  = target                 # channel message
-                is_chan   = True
-            elif nick == self.client.nick:
-                win_name  = target                 # own outgoing DM → recipient's window
-                is_chan   = False
-            else:
-                win_name  = nick                   # incoming DM → sender's window
-                is_chan   = False
-            win = self.ensure_window(win_name, is_channel=is_chan)
-            prefix = f"* {nick} " if is_action else f"<{nick}> "
-            win.add_line(f"{prefix}{msg}")
-            if self.auto_translate and _has_cjk(irc_strip_formatting(msg)):
-                asyncio.create_task(self._post_translation(win, msg))
-            self.user_scores[nick] = u_score
-            self.user_ai_scores[nick] = rolling_ai
-            # Mark unread when the message lands in a background window
-            if win is not self.get_current_window():
-                self._unread_windows.add(win_name)
-                self._input_dirty = True
-            # Maintain suspect set incrementally
-            if rolling_ai >= self.ai_suspect_threshold:
-                self._suspect_nicks.add(nick)
-                self._dashboard_dirty = True
-            else:
-                self._suspect_nicks.discard(nick)
-            if win_name in self.channel_users:
-                self.channel_users[win_name].add(nick)
-                self._sorted_users.pop(win_name, None)
-                self._userlist_dirty = True
-            self._chat_dirty = True
-            self.dirty = True
+    # ── TUI event handlers ────────────────────────────────────────────────────
 
-        elif etype == "ai_score":
-            _, nick, rolling_ai = event
-            self.user_ai_scores[nick] = rolling_ai
-            if rolling_ai >= self.ai_suspect_threshold:
-                self._suspect_nicks.add(nick)
-                self._dashboard_dirty = True
-            else:
-                self._suspect_nicks.discard(nick)
+    async def _ev_msg(self, event):
+        _, nick, target, msg, u_score, m_score, a_score, rolling_ai, is_action = event
+        if nick.lower() in self.ignored_nicks:
+            return
+        if target.startswith("#"):
+            win_name = target
+            is_chan   = True
+        elif nick == self.client.nick:
+            win_name = target
+            is_chan   = False
+        else:
+            win_name = nick
+            is_chan   = False
+        win = self.ensure_window(win_name, is_channel=is_chan)
+        prefix_str = f"* {nick} " if is_action else f"<{nick}> "
+        win.add_line(f"{prefix_str}{msg}")
+        if self.auto_translate and _has_cjk(irc_strip_formatting(msg)):
+            asyncio.create_task(self._post_translation(win, msg))
+        self.user_scores[nick] = u_score
+        self.user_ai_scores[nick] = rolling_ai
+        if win is not self.get_current_window():
+            self._unread_windows.add(win_name)
+            self._input_dirty = True
+            if not target.startswith("#") and nick != self.client.nick:
+                preview = (msg[:40] + "...") if len(msg) > 40 else msg
+                self.get_current_window().add_line(
+                    f"-!- PM from {nick}: {preview}  [/win {self.windows.index(win) + 1}]")
+        if rolling_ai >= self.ai_suspect_threshold:
+            self._suspect_nicks.add(nick)
+            self._dashboard_dirty = True
+        else:
+            self._suspect_nicks.discard(nick)
+        if win_name in self.channel_users:
+            self.channel_users[win_name].add(nick)
+            self._sorted_users.pop(win_name, None)
             self._userlist_dirty = True
-            self.dirty = True
+        self._chat_dirty = True
+        self.dirty = True
 
-        elif etype == "notice":
-            _, sender, target, text = event
-            if sender.lower() in self.ignored_nicks:
-                return
-            win = self.ensure_window(target, is_channel=target.startswith("#"))
-            win.add_line(f"-{sender}- {text}")
-            if win is not self.get_current_window():
-                self._unread_windows.add(target)
-                self._input_dirty = True
-            self._chat_dirty = True
-            self.dirty = True
+    async def _ev_ai_score(self, event):
+        _, nick, rolling_ai = event
+        self.user_ai_scores[nick] = rolling_ai
+        if rolling_ai >= self.ai_suspect_threshold:
+            self._suspect_nicks.add(nick)
+            self._dashboard_dirty = True
+        else:
+            self._suspect_nicks.discard(nick)
+        self._userlist_dirty = True
+        self.dirty = True
 
-        elif etype == "nick_change":
-            _, old_nick, new_nick = event
-            for ch, users in self.channel_users.items():
-                if old_nick in users:
-                    users.discard(old_nick)
-                    users.add(new_nick)
-                    self._sorted_users.pop(ch, None)
-            if old_nick in self.user_scores:
-                self.user_scores[new_nick] = self.user_scores.pop(old_nick)
-            if old_nick in self.user_ai_scores:
-                score = self.user_ai_scores.pop(old_nick)
-                self.user_ai_scores[new_nick] = score
-                self._suspect_nicks.discard(old_nick)
-                if score >= self.ai_suspect_threshold:
-                    self._suspect_nicks.add(new_nick)
-            self.window_by_name["*status*"].add_line(f"* {old_nick} is now known as {new_nick}")
-            self._chat_dirty = self._userlist_dirty = True
-            self.dirty = True
+    async def _ev_notice(self, event):
+        _, sender, target, text = event
+        if sender.lower() in self.ignored_nicks:
+            return
+        win = self.ensure_window(target, is_channel=target.startswith("#"))
+        win.add_line(f"-{sender}- {text}")
+        if win is not self.get_current_window():
+            self._unread_windows.add(target)
+            self._input_dirty = True
+        self._chat_dirty = True
+        self.dirty = True
 
-        elif etype == "names":
-            _, channel, names_raw = event
-            if channel not in self.channel_users:
-                self.channel_users[channel] = set()
-            for n in names_raw.split():
-                clean = n.lstrip("@+%&~!")
-                if clean:
-                    self.channel_users[channel].add(clean)
+    async def _ev_nick_change(self, event):
+        _, old_nick, new_nick = event
+        for ch, users in self.channel_users.items():
+            if old_nick in users:
+                users.discard(old_nick)
+                users.add(new_nick)
+                self._sorted_users.pop(ch, None)
+        if old_nick in self.user_scores:
+            self.user_scores[new_nick] = self.user_scores.pop(old_nick)
+        if old_nick in self.user_ai_scores:
+            score = self.user_ai_scores.pop(old_nick)
+            self.user_ai_scores[new_nick] = score
+            self._suspect_nicks.discard(old_nick)
+            if score >= self.ai_suspect_threshold:
+                self._suspect_nicks.add(new_nick)
+        self.window_by_name["*status*"].add_line(f"* {old_nick} is now known as {new_nick}")
+        self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_names(self, event):
+        _, channel, names_raw = event
+        if channel not in self.channel_users:
+            self.channel_users[channel] = set()
+        for n in names_raw.split():
+            clean = n.lstrip("@+%&~!")
+            if clean:
+                self.channel_users[channel].add(clean)
+        self._sorted_users.pop(channel, None)
+        self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_clear_users(self, event):
+        for users in self.channel_users.values():
+            users.clear()
+        self._sorted_users.clear()
+        self._userlist_dirty = True
+        self.dirty = True
+
+    async def _ev_topic(self, event):
+        _, channel, topic_text = event
+        text = (f"* Topic for {channel}: {topic_text}"
+                if topic_text else f"* No topic set for {channel}")
+        target_win = self.window_by_name.get(channel, self.window_by_name["*status*"])
+        target_win.add_line(text)
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _ev_join(self, event):
+        _, nick, channel = event
+        win = self.ensure_window(channel)
+        if nick == self.client.nick:
+            self.channel_users[channel] = set()
             self._sorted_users.pop(channel, None)
-            self._userlist_dirty = True
-            self.dirty = True
-
-        elif etype == "clear_users":
-            for users in self.channel_users.values():
-                users.clear()
-            self._sorted_users.clear()
-            self._userlist_dirty = True
-            self.dirty = True
-
-        elif etype == "topic":
-            _, channel, topic_text = event
-            text = (f"* Topic for {channel}: {topic_text}"
-                    if topic_text else f"* No topic set for {channel}")
-            # Show in the channel window if open, otherwise status
-            target_win = self.window_by_name.get(channel, self.window_by_name["*status*"])
-            target_win.add_line(text)
-            self._chat_dirty = True
-            self.dirty = True
-
-        elif etype in ("whois", "kick", "mode", "status"):
-            msg = str(event[1]) if len(event) > 1 else str(event)
-            self.window_by_name["*status*"].add_line(msg)
-            # Do NOT switch windows — messages go to *status* silently so the
-            # user stays wherever they are.  Use /win 1 or Ctrl+N to visit status.
-            self._chat_dirty = True
-            self.dirty = True
-
-        elif etype == "join":
-            _, nick, channel = event
-            win = self.ensure_window(channel)
-            if nick == self.client.nick:
-                # Reset user list so stale nicks from a previous join don't linger;
-                # the NAMES reply (353) will repopulate it from scratch.
-                self.channel_users[channel] = set()
+        else:
+            if channel in self.channel_users:
+                self.channel_users[channel].add(nick)
                 self._sorted_users.pop(channel, None)
-            else:
-                if channel in self.channel_users:
-                    self.channel_users[channel].add(nick)
-                    self._sorted_users.pop(channel, None)
-                win.add_line(f"* {nick} has joined {channel}")
-            self._chat_dirty = self._userlist_dirty = True
-            self.dirty = True
+            win.add_line(f"* {nick} has joined {channel}")
+        self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
 
-        elif etype == "self_join":
-            _, channel = event
+    async def _ev_self_join(self, event):
+        _, channel = event
+        win = self.ensure_window(channel)
+        win.add_line(f"* You have joined {channel}")
+        self.current_channel = channel
+        self.current_window_index = self.windows.index(win)
+        self._unread_windows.discard(channel)
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
+
+    async def _ev_join_error(self, event):
+        _, channel, msg = event
+        if channel:
             win = self.ensure_window(channel)
-            win.add_line(f"* You have joined {channel}")
+            win.add_line(msg)
             self.current_channel = channel
             self.current_window_index = self.windows.index(win)
             self._unread_windows.discard(channel)
-            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
-            self.dirty = True
+        else:
+            self.window_by_name["*status*"].add_line(msg)
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
 
-        elif etype == "join_error":
-            _, channel, msg = event
-            if channel:
-                # Create the channel window so the user can see why it failed,
-                # then switch to it so the error is immediately visible.
-                win = self.ensure_window(channel)
-                win.add_line(msg)
-                self.current_channel = channel
-                self.current_window_index = self.windows.index(win)
-                self._unread_windows.discard(channel)
-            else:
-                self.window_by_name["*status*"].add_line(msg)
-            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
-            self.dirty = True
+    async def _ev_part(self, event):
+        _, nick, channel = event
+        if channel in self.channel_users:
+            self.channel_users[channel].discard(nick)
+            self._sorted_users.pop(channel, None)
+        self._suspect_nicks.discard(nick)
+        ch_win = self.window_by_name.get(channel)
+        if ch_win:
+            ch_win.add_line(f"* {nick} has left {channel}")
+            if ch_win is not self.get_current_window():
+                self._unread_windows.add(channel)
+                self._input_dirty = True
+        self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
 
-        elif etype == "part":
-            _, nick, channel = event
-            if channel in self.channel_users:
-                self.channel_users[channel].discard(nick)
-                self._sorted_users.pop(channel, None)
-            self._suspect_nicks.discard(nick)
-            ch_win = self.window_by_name.get(channel)
-            if ch_win:
-                ch_win.add_line(f"* {nick} has left {channel}")
-                if ch_win is not self.get_current_window():
-                    self._unread_windows.add(channel)
-                    self._input_dirty = True
-            self._chat_dirty = self._userlist_dirty = True
-            self.dirty = True
+    async def _ev_quit(self, event):
+        _, nick, reason = event
+        quit_msg = f"* {nick} has quit" + (f" ({reason})" if reason else "")
+        for ch, users in self.channel_users.items():
+            if nick in users:
+                users.discard(nick)
+                self._sorted_users.pop(ch, None)
+                ch_win = self.window_by_name.get(ch)
+                if ch_win:
+                    ch_win.add_line(quit_msg)
+                    if ch_win is not self.get_current_window():
+                        self._unread_windows.add(ch)
+                        self._input_dirty = True
+        self._suspect_nicks.discard(nick)
+        self.user_scores.pop(nick, None)
+        self.user_ai_scores.pop(nick, None)
+        self._chat_dirty = self._userlist_dirty = True
+        self.dirty = True
 
-        elif etype == "quit":
-            _, nick, reason = event
-            quit_msg = f"* {nick} has quit" + (f" ({reason})" if reason else "")
-            for ch, users in self.channel_users.items():
-                if nick in users:
-                    users.discard(nick)
-                    self._sorted_users.pop(ch, None)
-                    ch_win = self.window_by_name.get(ch)
-                    if ch_win:
-                        ch_win.add_line(quit_msg)
-                        if ch_win is not self.get_current_window():
-                            self._unread_windows.add(ch)
-                            self._input_dirty = True
-            self._suspect_nicks.discard(nick)
-            # Free per-nick score caches to prevent unbounded growth
-            self.user_scores.pop(nick, None)
-            self.user_ai_scores.pop(nick, None)
-            self._chat_dirty = self._userlist_dirty = True
-            self.dirty = True
+    async def _ev_status_line(self, event):
+        msg = str(event[1]) if len(event) > 1 else str(event)
+        self.window_by_name["*status*"].add_line(msg)
+        self._chat_dirty = True
+        self.dirty = True
+
+    def _build_slash_handlers(self) -> None:
+        h = self._slash_handlers
+        h["me"] = h["action"] = self._slash_me
+        h["ctcp"]       = self._slash_ctcp
+        h["whois"]      = self._slash_whois
+        h["mode"]       = self._slash_mode
+        h["topic"]      = self._slash_topic
+        h["kick"]       = self._slash_kick
+        h["ns"] = h["nickserv"] = self._slash_ns
+        h["cs"] = h["chanserv"] = self._slash_cs
+        h["ai"]         = self._slash_ai
+        h["aitoggle"]   = self._slash_aitoggle
+        h["join"]       = self._slash_join
+        h["part"]       = self._slash_part
+        h["nick"]       = self._slash_nick
+        h["msg"] = h["m"] = self._slash_msg
+        h["query"]      = self._slash_query
+        h["notice"]     = self._slash_notice
+        h["away"]       = self._slash_away
+        h["back"]       = self._slash_back
+        h["invite"]     = self._slash_invite
+        h["op"]         = self._slash_op
+        h["deop"]       = self._slash_deop
+        h["voice"]      = self._slash_voice
+        h["devoice"]    = self._slash_devoice
+        h["hop"]        = self._slash_hop
+        h["dehop"]      = self._slash_dehop
+        h["ban"]        = self._slash_ban
+        h["unban"]      = self._slash_unban
+        h["who"]        = self._slash_who
+        h["whowas"]     = self._slash_whowas
+        h["names"]      = self._slash_names
+        h["ignore"]     = self._slash_ignore
+        h["unignore"]   = self._slash_unignore
+        h["clear"]      = self._slash_clear
+        h["close"] = h["wc"] = self._slash_close
+        h["win"] = h["window"] = self._slash_win
+        h["quit"] = h["exit"] = self._slash_quit
+        h["server"]     = self._slash_server
+        h["reconnect"]  = self._slash_reconnect
+        h["theme"]      = self._slash_theme
+        h["askai"]      = self._slash_askai
+        h["model"]      = self._slash_model
+        h["autotranslate"] = self._slash_autotranslate
+        h["commands"]   = self._slash_commands
+        h["help"]       = self._slash_help
 
     async def handle_input_line(self, line: str) -> None:
-        if not line.strip(): return
+        if not line.strip():
+            return
         if line.startswith("/"):
             parts = line[1:].split(maxsplit=2)
-            cmd = parts[0].lower()
-            args = parts[1] if len(parts) > 1 else ""
+            cmd   = parts[0].lower()
+            args  = parts[1] if len(parts) > 1 else ""
             extra = parts[2] if len(parts) > 2 else ""
-
-            if cmd in ("me", "action"):
-                # Re-slice from the original line so multi-word text isn't truncated
-                slash_end = line.index(" ") + 1 if " " in line else len(line)
-                action_text = line[slash_end:].strip()
-                if action_text:
-                    cur_win = self.get_current_window()
-                    if cur_win.name not in ("*status*", "*dashboard*"):
-                        target = cur_win.name
-                    else:
-                        target = self.current_channel or DEFAULT_CHANNEL
-                    result = self.client.cmd_msg(target, action_text, is_action=True)
-                    if result:
-                        await self.ui_queue.put(result)
-            elif cmd == "ctcp":
-                if args and extra:
-                    self.client.cmd_ctcp(args, extra.upper())
-                    await self.ui_queue.put(("status", f"CTCP {extra.upper()} sent to {args}"))
-                else:
-                    await self.ui_queue.put(("status", "Usage: /ctcp <nick> <command> [args]"))
-            elif cmd == "whois":
-                if args:
-                    self.client.cmd_whois(args)
-            elif cmd == "mode":
-                if args:
-                    target, *modes = args.split(maxsplit=1)
-                    self.client.cmd_mode(target, modes[0] if modes else "")
-            elif cmd == "topic":
-                if args:
-                    if " " in args:
-                        channel, topic = args.split(maxsplit=1)
-                        self.client.cmd_topic(channel, topic)
-                    else:
-                        self.client.cmd_topic(args)
-            elif cmd == "kick":
-                if args:
-                    p = args.split(maxsplit=2)
-                    if len(p) >= 2:
-                        self.client.cmd_kick(p[0], p[1], p[2] if len(p)>2 else "")
-            elif cmd in ("ns", "nickserv"):
-                if args:
-                    self.client.cmd_service("NickServ", args)
-            elif cmd in ("cs", "chanserv"):
-                if args:
-                    self.client.cmd_service("ChanServ", args)
-            elif cmd == "ai":
-                if args:
-                    await self.show_user_ai_profile(args)
-                else:
-                    await self.ui_queue.put(("status", "Usage: /ai <nick>"))
-            elif cmd == "aitoggle":
-                self.client.scoring.ai_detector.enabled = not self.client.scoring.ai_detector.enabled
-                await self.ui_queue.put(("status", f"AI detection {'ENABLED' if self.client.scoring.ai_detector.enabled else 'DISABLED'}"))
-            elif cmd == "join":
-                if args:
-                    self.client.cmd_join(args)
-            elif cmd == "part":
-                ch = args or self.current_channel or ""
-                if ch:
-                    self.client.cmd_part(ch, extra or None)
-            elif cmd == "nick":
-                if args:
-                    self.client.cmd_nick(args)
-            elif cmd in ("msg", "m"):
-                if args and extra:
-                    self.client.cmd_msg(args, extra)
-                    win = self.ensure_window(args, is_channel=False)
-                    win.add_line(f"<{self.client.nick}> {extra}")
-                    # Switch to the DM window so replies land in the right place
-                    self.current_window_index = self.windows.index(win)
-                    self.current_channel = args
-                    self._unread_windows.discard(args)
-                    self._chat_dirty = self._userlist_dirty = self._input_dirty = True
-                    self.dirty = True
-                else:
-                    await self.ui_queue.put(("status", "Usage: /msg <nick> <text>"))
-            elif cmd == "query":
-                if args:
-                    is_new = args not in self.window_by_name
-                    win = self.ensure_window(args, is_channel=False)
-                    self.current_window_index = self.windows.index(win)
-                    self.current_channel = args
-                    self._unread_windows.discard(args)
-                    self._chat_dirty = self._userlist_dirty = self._input_dirty = True
-                    if is_new:
-                        win.add_line(f"** Query with {args} opened **", timestamp=False)
-                    if extra:
-                        self.client.cmd_msg(args, extra)
-                        win.add_line(f"<{self.client.nick}> {extra}")
-                else:
-                    await self.ui_queue.put(("status", "Usage: /query <nick> [message]"))
-            elif cmd == "notice":
-                if args and extra:
-                    self.client.cmd_notice(args, extra)
-                    await self.ui_queue.put(("status", f"-> NOTICE to {args}: {extra}"))
-                else:
-                    await self.ui_queue.put(("status", "Usage: /notice <nick> <text>"))
-            elif cmd == "away":
-                self.client.cmd_away(args)
-                await self.ui_queue.put(("status", f"You are now away: {args}" if args else "You are now away"))
-            elif cmd == "back":
-                self.client.cmd_away()
-                await self.ui_queue.put(("status", "You are no longer away"))
-            elif cmd == "invite":
-                if args:
-                    channel = extra or self.current_channel or ""
-                    if channel:
-                        self.client.cmd_invite(args, channel)
-                        await self.ui_queue.put(("status", f"Inviting {args} to {channel}"))
-                    else:
-                        await self.ui_queue.put(("status", "Usage: /invite <nick> [channel]"))
-            elif cmd == "op" and args and self.current_channel:
-                self.client.cmd_mode(self.current_channel, f"+o {args}")
-            elif cmd == "deop" and args and self.current_channel:
-                self.client.cmd_mode(self.current_channel, f"-o {args}")
-            elif cmd == "voice" and args and self.current_channel:
-                self.client.cmd_mode(self.current_channel, f"+v {args}")
-            elif cmd == "devoice" and args and self.current_channel:
-                self.client.cmd_mode(self.current_channel, f"-v {args}")
-            elif cmd == "hop" and args and self.current_channel:
-                self.client.cmd_mode(self.current_channel, f"+h {args}")
-            elif cmd == "dehop" and args and self.current_channel:
-                self.client.cmd_mode(self.current_channel, f"-h {args}")
-            elif cmd == "ban" and self.current_channel:
-                if args:
-                    mask = args if "!" in args or "@" in args else f"{args}!*@*"
-                    self.client.cmd_mode(self.current_channel, f"+b {mask}")
-            elif cmd == "unban" and self.current_channel:
-                if args:
-                    self.client.cmd_mode(self.current_channel, f"-b {args}")
-            elif cmd == "who":
-                if args:
-                    self.client.cmd_who(args)
-            elif cmd == "whowas":
-                if args:
-                    self.client.cmd_whowas(args)
-            elif cmd == "names":
-                self.client.cmd_names(args or self.current_channel or "")
-            elif cmd == "ignore":
-                if args:
-                    self.ignored_nicks.add(args.lower())
-                    await self.ui_queue.put(("status", f"Now ignoring {args}"))
-            elif cmd == "unignore":
-                if args:
-                    self.ignored_nicks.discard(args.lower())
-                    await self.ui_queue.put(("status", f"No longer ignoring {args}"))
-            elif cmd == "clear":
-                win = self.get_current_window()
-                win.lines.clear()
-                win._wrap_dirty = True
-            elif cmd in ("close", "wc"):
-                win = self.get_current_window()
-                if win.name not in ("*status*", "*dashboard*"):
-                    self._unread_windows.discard(win.name)
-                    self.windows.remove(win)
-                    del self.window_by_name[win.name]
-                    self.current_window_index = max(0, self.current_window_index - 1)
-                    new_win = self.get_current_window()
-                    if new_win.name not in ("*status*", "*dashboard*"):
-                        self.current_channel = new_win.name
-                    self._chat_dirty = self._userlist_dirty = self._input_dirty = True
-                    self.dirty = True
-            elif cmd in ("win", "window"):
-                if args.isdigit():
-                    idx = int(args) - 1
-                    if 0 <= idx < len(self.windows):
-                        self.current_window_index = idx
-                        win = self.windows[idx]
-                        if win.name not in ("*status*", "*dashboard*"):
-                            self.current_channel = win.name
-                        self._unread_windows.discard(win.name)
-                        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
-                        self.dirty = True
-            elif cmd in ("quit", "exit"):
-                self.client.send_raw(f"QUIT :{args}" if args else "QUIT :Client exiting")
-                raise SystemExit
-            elif cmd == "server":
-                # /server <host> [port] [nick]
-                # Port defaults to 6697 (standard SSL). run_connection reads
-                # self.server / self.port on every (re)connect, so updating
-                # them and closing the socket is all that is needed.
-                if not args:
-                    await self.ui_queue.put(("status",
-                        "Usage: /server <host> [port] [nick]  (port defaults to 6697 SSL)"))
-                else:
-                    srv_parts = args.split()
-                    new_server = srv_parts[0]
-                    new_port   = 6697
-                    new_nick   = self.client.nick
-
-                    if len(srv_parts) >= 2:
-                        if srv_parts[1].isdigit():
-                            new_port = int(srv_parts[1])
-                        else:
-                            await self.ui_queue.put(("status",
-                                f"/server: invalid port '{srv_parts[1]}', defaulting to 6697"))
-                    if len(srv_parts) >= 3:
-                        new_nick = srv_parts[2]
-
-                    # Redirect the client
-                    self.client.server         = new_server
-                    self.client.port           = new_port
-                    self.client.nick           = new_nick
-                    self.client.joined_channels = set()   # no auto-join on new server
-                    self.client.users.clear()
-                    self.client._identified    = False
-                    self.client._ctcp_times.clear()
-
-                    # Wipe all per-server TUI state so nothing bleeds across
-                    for users in self.channel_users.values():
-                        users.clear()
-                    self._sorted_users.clear()
-                    self.user_scores.clear()
-                    self.user_ai_scores.clear()
-                    self._suspect_nicks.clear()
-                    self._suspect_re       = None
-                    self._suspect_re_nicks = frozenset()
-                    self.current_channel   = None
-                    self._dashboard_dirty  = True
-
-                    self.window_by_name["*status*"].add_line(
-                        f"*** Connecting to {new_server}:{new_port} (SSL) as {new_nick}")
-                    self.current_window_index = 0
-
-                    # Politely QUIT the current server, then close the socket.
-                    # run_connection's reconnect loop picks up the new server/port.
-                    if self.client.writer and not self.client.writer.is_closing():
-                        try:
-                            self.client.send_raw(f"QUIT :Switching to {new_server}")
-                            await asyncio.sleep(0.3)
-                            self.client.writer.close()
-                        except Exception:
-                            pass
-                    elif self.client.writer:
-                        try:
-                            self.client.writer.close()
-                        except Exception:
-                            pass
-
-            elif cmd == "reconnect":
-                await self.ui_queue.put(("status", "Forcing reconnect..."))
-                if self.client.writer:
-                    try:
-                        self.client.writer.close()
-                    except Exception:
-                        pass
-            elif cmd == "theme":
-                if args.isdigit() and 1 <= int(args) <= len(THEMES):
-                    self.apply_theme(int(args))
-                else:
-                    names = "  ".join(f"[{i+1}] {t[0]}" for i, t in enumerate(THEMES))
-                    await self.ui_queue.put(("status",
-                        f"Usage: /theme <1-{len(THEMES)}>  {names}  "
-                        f"(current: {self.current_theme})"))
-            elif cmd == "askai":
-                # /askai [opus|sonnet|haiku] <question>
-                rest = line[len("/askai"):].strip()
-                if not rest:
-                    await self.ui_queue.put(("status",
-                        "Usage: /askai [opus|sonnet|haiku] <question>"))
-                else:
-                    first_word, *remainder = rest.split(maxsplit=1)
-                    if first_word.lower() in CLAUDE_MODELS:
-                        model_key = first_word.lower()
-                        question  = remainder[0] if remainder else ""
-                    else:
-                        model_key = self.ai_chat_model
-                        question  = rest
-                    if question:
-                        asyncio.create_task(self._do_askai(question, model_key))
-                    else:
-                        await self.ui_queue.put(("status",
-                            "Usage: /askai [opus|sonnet|haiku] <question>"))
-            elif cmd == "model":
-                if args.lower() in CLAUDE_MODELS:
-                    self.ai_chat_model = args.lower()
-                    await self.ui_queue.put(("status",
-                        f"Claude model set to {self.ai_chat_model} "
-                        f"({CLAUDE_MODELS[self.ai_chat_model]})"))
-                else:
-                    keys = "/".join(CLAUDE_MODELS)
-                    await self.ui_queue.put(("status",
-                        f"Unknown model '{args}'. Choose: {keys}  "
-                        f"(current: {self.ai_chat_model})"))
-            elif cmd == "autotranslate":
-                self.auto_translate = not self.auto_translate
-                state = "ON" if self.auto_translate else "OFF"
-                await self.ui_queue.put(("status",
-                    f"Auto-translate CJK → English: {state}"))
-            elif cmd == "commands":
-                sw = self.window_by_name["*status*"]
-                _C = lambda line: sw.add_line(line)
-                _H = lambda title: _C(f"  ── {title} {'─' * max(0, 38 - len(title))}")
-                _E = lambda c, d: _C(f"  {c:<34} {d}")
-                _C("")
-                _C("  ╔══════════════════════════════════════════╗")
-                _C("  ║          Available IRC Commands          ║")
-                _C("  ╚══════════════════════════════════════════╝")
-                _C("")
-                _H("Messaging")
-                _E("/msg <nick> <text>",            "Send a PM; opens and switches to the DM window")
-                _E("/query <nick> [message]",        "Open a DM window with nick; optionally send a first message")
-                _E("/notice <nick> <text>",          "Send a notice (-nick- style, not shown in chat)")
-                _E("/me <text>",                    "Send an action line  (* nick waves)")
-                _C("")
-                _H("Channels")
-                _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
-                _E("/part [channel] [message]",     "Leave a channel with an optional part message")
-                _E("/topic <channel> [text]",       "View or set the channel topic")
-                _E("/names [channel]",              "List users currently in the channel")
-                _E("/kick <chan> <nick> [reason]",  "Kick a user from the channel")
-                _E("/invite <nick> [channel]",      "Invite a user to a channel")
-                _E("/mode <target> [modes]",        "Get or set channel / user modes")
-                _C("")
-                _H("Operator")
-                _E("/op <nick>",                    "Grant operator status  (+o)")
-                _E("/deop <nick>",                  "Remove operator status (-o)")
-                _E("/voice <nick>",                 "Grant voice  (+v)")
-                _E("/devoice <nick>",               "Remove voice (-v)")
-                _E("/hop <nick>",                   "Grant half-op  (+h)")
-                _E("/dehop <nick>",                 "Remove half-op (-h)")
-                _E("/ban <nick|mask>",              "Ban user; bare nick expands to nick!*@*")
-                _E("/unban <mask>",                 "Remove a ban mask")
-                _C("")
-                _H("Users & Status")
-                _E("/nick <newnick>",               "Change your nickname")
-                _E("/whois <nick>",                 "Look up user info — shown formatted in *status*")
-                _E("/whowas <nick>",                "Info on a recently disconnected user")
-                _E("/who <target>",                 "List users matching a pattern")
-                _E("/ignore <nick>",                "Suppress all messages from nick")
-                _E("/unignore <nick>",              "Stop ignoring nick")
-                _E("/away [message]",               "Set away status with optional message")
-                _E("/back",                         "Remove away status")
-                _C("")
-                _H("Services & CTCP")
-                _E("/ns <command>",                 "Send command to NickServ  (e.g. /ns identify pw)")
-                _E("/cs <command>",                 "Send command to ChanServ")
-                _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
-                _C("")
-                _H("AI Detection")
-                _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
-                _E("/aitoggle",                     "Enable or disable AI scoring entirely")
-                _C("  AI scores are shown next to each nick in the user list.")
-                _C("  Suspected bots are highlighted bold; the dashboard lists all suspects.")
-                _C("")
-                _H("Claude Integration")
-                _E("/askai [opus|sonnet|haiku] <q>","Ask Claude a question; answer shown in dashboard")
-                _E("/model <opus|sonnet|haiku>",    "Set the default Claude model for /askai")
-                _C(f"  Current model: {self.ai_chat_model}  ({CLAUDE_MODELS.get(self.ai_chat_model, '?')})")
-                _C("")
-                _H("Translation")
-                _E("/autotranslate",                "Toggle auto CJK → English translation (on by default)")
-                _C("  Translated lines appear indented below the original message.")
-                _C("")
-                _H("Connection")
-                _E("/server <host> [port] [nick]",  "Connect to a new IRC server over SSL (default 6697)")
-                _E("/reconnect",                    "Drop and re-establish the current connection")
-                _C("")
-                _H("Windows & Navigation")
-                _C("  Tab bar (above input): [1:status] [2:dash] [*3:##chat]  * = unread")
-                _C("  Prompt shows send target:  [##channel] nick>  or  [>nick] nick>")
-                _E("/win <n>",                      "Switch to window n; clears its unread marker")
-                _E("/close  (or /wc)",              "Close current window; focus moves to previous")
-                _E("/clear",                        "Clear messages in the current window")
-                _E("/theme <1-5>",                  "Switch colour theme: Classic Hacker Ocean Sunset Neon")
-                _C("  Ctrl+N  next window    Tab  nick completion    PgUp/PgDn  scroll")
-                _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
-                _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
-                _C("")
-                _H("General")
-                _E("/quit [message]",               "Send quit message and exit")
-                _E("/help",                         "Brief one-line command reference")
-                _E("/commands",                     "This full command list")
-                _C("")
-                self.current_window_index = 0
-                self._chat_dirty = True
-                self.dirty = True
-            elif cmd == "help":
-                for l in [
-                    "── Messaging ──────────────────────────────────────────",
-                    "  /msg <nick> <text>       PM nick; opens & switches to DM window",
-                    "  /query <nick> [message]  Open a DM window (optional first message)",
-                    "  /notice <nick> <text>    Send a notice   /me <text>  Action line",
-                    "── Channels ────────────────────────────────────────────",
-                    "  /join <chan>  /part [chan] [msg]  /topic <chan> [text]",
-                    "  /kick <chan> <nick> [reason]  /invite <nick> [chan]",
-                    "  /names [chan]  /mode <target> [modes]",
-                    "── Operator ────────────────────────────────────────────",
-                    "  /op /deop /voice /devoice /hop /dehop  /ban /unban",
-                    "── Users ───────────────────────────────────────────────",
-                    "  /nick <new>  /whois <nick>  /whowas <nick>  /who <pat>",
-                    "  /ignore <nick>  /unignore <nick>  /away [msg]  /back",
-                    "── Services ────────────────────────────────────────────",
-                    "  /ns <cmd>  /cs <cmd>  /ctcp <nick> <cmd> [args]",
-                    "── AI Detection ────────────────────────────────────────",
-                    "  /ai <nick>  full profile    /aitoggle  enable/disable scoring",
-                    "── Claude ──────────────────────────────────────────────",
-                    "  /askai [opus|sonnet|haiku] <question>  (answer in dashboard)",
-                    "  /model <opus|sonnet|haiku>  set default model",
-                    "── Translation ─────────────────────────────────────────",
-                    "  /autotranslate  toggle CJK → English (default: on)",
-                    "── Connection ──────────────────────────────────────────",
-                    "  /server <host> [port] [nick]  /reconnect",
-                    "── Interface ───────────────────────────────────────────",
-                    "  /win <n>  /close (/wc)  /clear  /theme <1-5>",
-                    "  Ctrl+N next window  Tab nick-complete  PgUp/Dn scroll",
-                    "  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread",
-                    "  /quit [msg]  /commands  (full list)  /help  (this)",
-                ]:
-                    self.window_by_name["*status*"].add_line(l)
-                self.current_window_index = 0
-                self._chat_dirty = self._userlist_dirty = self._input_dirty = True
-                self.dirty = True
+            handler = self._slash_handlers.get(cmd)
+            if handler:
+                await handler(args, extra, line)
             else:
                 self.client.send_raw(line[1:])
         else:
-            cur_win = self.get_current_window()
-            if cur_win.name not in ("*status*", "*dashboard*"):
-                target = cur_win.name
-            else:
-                target = self.current_channel or DEFAULT_CHANNEL
-            result = self.client.cmd_msg(target, line)
-            if result:
-                await self.ui_queue.put(result)
-
+            await self._send_plain_text(line)
         self._chat_dirty = True
         self._input_dirty = True
         self.dirty = True
         self.completion_state = None
+
+    async def _send_plain_text(self, line: str) -> None:
+        cur_win = self.get_current_window()
+        if cur_win.name not in ("*status*", "*dashboard*"):
+            target = cur_win.name
+        else:
+            target = self.current_channel or DEFAULT_CHANNEL
+            if target:
+                dest = self.ensure_window(target, is_channel=target.startswith("#"))
+                self.current_channel = target
+                self.current_window_index = self.windows.index(dest)
+                self._unread_windows.discard(target)
+        result = self.client.cmd_msg(target, line)
+        if result:
+            await self.ui_queue.put(result)
+
+    async def _slash_me(self, args, extra, line):
+        slash_end = line.index(" ") + 1 if " " in line else len(line)
+        action_text = line[slash_end:].strip()
+        if not action_text:
+            return
+        cur_win = self.get_current_window()
+        target = (cur_win.name if cur_win.name not in ("*status*", "*dashboard*")
+                  else self.current_channel or DEFAULT_CHANNEL)
+        result = self.client.cmd_msg(target, action_text, is_action=True)
+        if result:
+            await self.ui_queue.put(result)
+
+    async def _slash_ctcp(self, args, extra, line):
+        if args and extra:
+            self.client.cmd_ctcp(args, extra.upper())
+            await self.ui_queue.put(("status", f"CTCP {extra.upper()} sent to {args}"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /ctcp <nick> <command> [args]"))
+
+    async def _slash_whois(self, args, extra, line):
+        if args:
+            self.client.cmd_whois(args)
+
+    async def _slash_mode(self, args, extra, line):
+        if args:
+            target, *modes = args.split(maxsplit=1)
+            self.client.cmd_mode(target, modes[0] if modes else "")
+
+    async def _slash_topic(self, args, extra, line):
+        if args:
+            if " " in args:
+                channel, topic = args.split(maxsplit=1)
+                self.client.cmd_topic(channel, topic)
+            else:
+                self.client.cmd_topic(args)
+
+    async def _slash_kick(self, args, extra, line):
+        if args:
+            p = args.split(maxsplit=2)
+            if len(p) >= 2:
+                self.client.cmd_kick(p[0], p[1], p[2] if len(p) > 2 else "")
+
+    async def _slash_ns(self, args, extra, line):
+        if args:
+            self.client.cmd_service("NickServ", args)
+
+    async def _slash_cs(self, args, extra, line):
+        if args:
+            self.client.cmd_service("ChanServ", args)
+
+    async def _slash_ai(self, args, extra, line):
+        if args:
+            await self.show_user_ai_profile(args)
+        else:
+            await self.ui_queue.put(("status", "Usage: /ai <nick>"))
+
+    async def _slash_aitoggle(self, args, extra, line):
+        self.client.scoring.ai_detector.enabled = not self.client.scoring.ai_detector.enabled
+        state = "ENABLED" if self.client.scoring.ai_detector.enabled else "DISABLED"
+        await self.ui_queue.put(("status", f"AI detection {state}"))
+
+    async def _slash_join(self, args, extra, line):
+        if args:
+            self.client.cmd_join(args)
+
+    async def _slash_part(self, args, extra, line):
+        ch = args or self.current_channel or ""
+        if ch:
+            self.client.cmd_part(ch, extra or None)
+
+    async def _slash_nick(self, args, extra, line):
+        if args:
+            self.client.cmd_nick(args)
+
+    async def _slash_msg(self, args, extra, line):
+        if args and extra:
+            self.client.cmd_msg(args, extra)
+            win = self.ensure_window(args, is_channel=False)
+            win.add_line(f"<{self.client.nick}> {extra}")
+            self.current_window_index = self.windows.index(win)
+            self.current_channel = args
+            self._unread_windows.discard(args)
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            self.dirty = True
+        else:
+            await self.ui_queue.put(("status", "Usage: /msg <nick> <text>"))
+
+    async def _slash_query(self, args, extra, line):
+        if args:
+            is_new = args not in self.window_by_name
+            win = self.ensure_window(args, is_channel=False)
+            self.current_window_index = self.windows.index(win)
+            self.current_channel = args
+            self._unread_windows.discard(args)
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            if is_new:
+                win.add_line(f"** Query with {args} opened **", timestamp=False)
+            if extra:
+                self.client.cmd_msg(args, extra)
+                win.add_line(f"<{self.client.nick}> {extra}")
+        else:
+            await self.ui_queue.put(("status", "Usage: /query <nick> [message]"))
+
+    async def _slash_notice(self, args, extra, line):
+        if args and extra:
+            self.client.cmd_notice(args, extra)
+            await self.ui_queue.put(("status", f"-> NOTICE to {args}: {extra}"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /notice <nick> <text>"))
+
+    async def _slash_away(self, args, extra, line):
+        self.client.cmd_away(args)
+        await self.ui_queue.put(("status", f"You are now away: {args}" if args else "You are now away"))
+
+    async def _slash_back(self, args, extra, line):
+        self.client.cmd_away()
+        await self.ui_queue.put(("status", "You are no longer away"))
+
+    async def _slash_invite(self, args, extra, line):
+        if args:
+            channel = extra or self.current_channel or ""
+            if channel:
+                self.client.cmd_invite(args, channel)
+                await self.ui_queue.put(("status", f"Inviting {args} to {channel}"))
+            else:
+                await self.ui_queue.put(("status", "Usage: /invite <nick> [channel]"))
+
+    async def _slash_op(self, args, extra, line):
+        if args and self.current_channel:
+            self.client.cmd_mode(self.current_channel, f"+o {args}")
+
+    async def _slash_deop(self, args, extra, line):
+        if args and self.current_channel:
+            self.client.cmd_mode(self.current_channel, f"-o {args}")
+
+    async def _slash_voice(self, args, extra, line):
+        if args and self.current_channel:
+            self.client.cmd_mode(self.current_channel, f"+v {args}")
+
+    async def _slash_devoice(self, args, extra, line):
+        if args and self.current_channel:
+            self.client.cmd_mode(self.current_channel, f"-v {args}")
+
+    async def _slash_hop(self, args, extra, line):
+        if args and self.current_channel:
+            self.client.cmd_mode(self.current_channel, f"+h {args}")
+
+    async def _slash_dehop(self, args, extra, line):
+        if args and self.current_channel:
+            self.client.cmd_mode(self.current_channel, f"-h {args}")
+
+    async def _slash_ban(self, args, extra, line):
+        if args and self.current_channel:
+            mask = args if "!" in args or "@" in args else f"{args}!*@*"
+            self.client.cmd_mode(self.current_channel, f"+b {mask}")
+
+    async def _slash_unban(self, args, extra, line):
+        if args and self.current_channel:
+            self.client.cmd_mode(self.current_channel, f"-b {args}")
+
+    async def _slash_who(self, args, extra, line):
+        if args:
+            self.client.cmd_who(args)
+
+    async def _slash_whowas(self, args, extra, line):
+        if args:
+            self.client.cmd_whowas(args)
+
+    async def _slash_names(self, args, extra, line):
+        self.client.cmd_names(args or self.current_channel or "")
+
+    async def _slash_ignore(self, args, extra, line):
+        if args:
+            self.ignored_nicks.add(args.lower())
+            await self.ui_queue.put(("status", f"Now ignoring {args}"))
+
+    async def _slash_unignore(self, args, extra, line):
+        if args:
+            self.ignored_nicks.discard(args.lower())
+            await self.ui_queue.put(("status", f"No longer ignoring {args}"))
+
+    async def _slash_clear(self, args, extra, line):
+        win = self.get_current_window()
+        win.lines.clear()
+        win._wrap_dirty = True
+
+    async def _slash_close(self, args, extra, line):
+        win = self.get_current_window()
+        if win.name not in ("*status*", "*dashboard*"):
+            self._unread_windows.discard(win.name)
+            self.windows.remove(win)
+            del self.window_by_name[win.name]
+            self.current_window_index = max(0, self.current_window_index - 1)
+            new_win = self.get_current_window()
+            if new_win.name not in ("*status*", "*dashboard*"):
+                self.current_channel = new_win.name
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            self.dirty = True
+
+    async def _slash_win(self, args, extra, line):
+        if args.isdigit():
+            idx = int(args) - 1
+            if 0 <= idx < len(self.windows):
+                self.current_window_index = idx
+                win = self.windows[idx]
+                if win.name not in ("*status*", "*dashboard*"):
+                    self.current_channel = win.name
+                if win.name in self._unread_windows:
+                    win.scroll_offset = 0
+                self._unread_windows.discard(win.name)
+                self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                self.dirty = True
+
+    async def _slash_quit(self, args, extra, line):
+        self.client.send_raw(f"QUIT :{args}" if args else "QUIT :Client exiting")
+        raise SystemExit
+
+    async def _slash_server(self, args, extra, line):
+        if not args:
+            await self.ui_queue.put(("status",
+                "Usage: /server <host> [port] [nick]  (port defaults to 6697 SSL)"))
+            return
+        srv_parts = args.split()
+        new_server = srv_parts[0]
+        new_port   = 6697
+        new_nick   = self.client.nick
+        if len(srv_parts) >= 2:
+            if srv_parts[1].isdigit():
+                new_port = int(srv_parts[1])
+            else:
+                await self.ui_queue.put(("status",
+                    f"/server: invalid port '{srv_parts[1]}', defaulting to 6697"))
+        if len(srv_parts) >= 3:
+            new_nick = srv_parts[2]
+        self.client.server          = new_server
+        self.client.port            = new_port
+        self.client.nick            = new_nick
+        self.client.joined_channels = set()
+        self.client.users.clear()
+        self.client._identified     = False
+        self.client._ctcp_times.clear()
+        for users in self.channel_users.values():
+            users.clear()
+        self._sorted_users.clear()
+        self.user_scores.clear()
+        self.user_ai_scores.clear()
+        self._suspect_nicks.clear()
+        self._suspect_re        = None
+        self._suspect_re_nicks  = frozenset()
+        self.current_channel    = None
+        self._dashboard_dirty   = True
+        self.window_by_name["*status*"].add_line(
+            f"*** Connecting to {new_server}:{new_port} (SSL) as {new_nick}")
+        self.current_window_index = 0
+        if self.client.writer and not self.client.writer.is_closing():
+            try:
+                self.client.send_raw(f"QUIT :Switching to {new_server}")
+                await asyncio.sleep(0.3)
+                self.client.writer.close()
+            except Exception:
+                pass
+        elif self.client.writer:
+            try:
+                self.client.writer.close()
+            except Exception:
+                pass
+
+    async def _slash_reconnect(self, args, extra, line):
+        await self.ui_queue.put(("status", "Forcing reconnect..."))
+        if self.client.writer:
+            try:
+                self.client.writer.close()
+            except Exception:
+                pass
+
+    async def _slash_theme(self, args, extra, line):
+        if args.isdigit() and 1 <= int(args) <= len(THEMES):
+            self.apply_theme(int(args))
+        else:
+            names = "  ".join(f"[{i+1}] {t[0]}" for i, t in enumerate(THEMES))
+            await self.ui_queue.put(("status",
+                f"Usage: /theme <1-{len(THEMES)}>  {names}  (current: {self.current_theme})"))
+
+    async def _slash_askai(self, args, extra, line):
+        rest = line[len("/askai"):].strip()
+        if not rest:
+            await self.ui_queue.put(("status", "Usage: /askai [opus|sonnet|haiku] <question>"))
+            return
+        first_word, *remainder = rest.split(maxsplit=1)
+        if first_word.lower() in CLAUDE_MODELS:
+            model_key = first_word.lower()
+            question  = remainder[0] if remainder else ""
+        else:
+            model_key = self.ai_chat_model
+            question  = rest
+        if question:
+            asyncio.create_task(self._do_askai(question, model_key))
+        else:
+            await self.ui_queue.put(("status", "Usage: /askai [opus|sonnet|haiku] <question>"))
+
+    async def _slash_model(self, args, extra, line):
+        if args.lower() in CLAUDE_MODELS:
+            self.ai_chat_model = args.lower()
+            await self.ui_queue.put(("status",
+                f"Claude model set to {self.ai_chat_model} ({CLAUDE_MODELS[self.ai_chat_model]})"))
+        else:
+            keys = "/".join(CLAUDE_MODELS)
+            await self.ui_queue.put(("status",
+                f"Unknown model '{args}'. Choose: {keys}  (current: {self.ai_chat_model})"))
+
+    async def _slash_autotranslate(self, args, extra, line):
+        self.auto_translate = not self.auto_translate
+        state = "ON" if self.auto_translate else "OFF"
+        await self.ui_queue.put(("status", f"Auto-translate CJK → English: {state}"))
+
+    async def _slash_commands(self, args, extra, line):
+        sw = self.window_by_name["*status*"]
+        _C = lambda t: sw.add_line(t)
+        _H = lambda title: _C(f"  ── {title} " + "─" * max(0, 38 - len(title)))
+        _E = lambda c, d: _C(f"  {c:<34} {d}")
+        _C("")
+        _C("  ╔" + "═" * 44 + "╗")
+        _C("  ║          Available IRC Commands          ║")
+        _C("  ╚" + "═" * 44 + "╝")
+        _C("")
+        _H("Messaging")
+        _E("/msg <nick> <text>",            "Send a PM; opens and switches to the DM window")
+        _E("/query <nick> [message]",       "Open a DM window with nick; optionally send a first message")
+        _E("/notice <nick> <text>",         "Send a notice (-nick- style, not shown in chat)")
+        _E("/me <text>",                    "Send an action line  (* nick waves)")
+        _C("")
+        _H("Channels")
+        _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
+        _E("/part [channel] [message]",     "Leave a channel with an optional part message")
+        _E("/topic <channel> [text]",       "View or set the channel topic")
+        _E("/names [channel]",              "List users currently in the channel")
+        _E("/kick <chan> <nick> [reason]",  "Kick a user from the channel")
+        _E("/invite <nick> [channel]",      "Invite a user to a channel")
+        _E("/mode <target> [modes]",        "Get or set channel / user modes")
+        _C("")
+        _H("Operator")
+        _E("/op <nick>",    "Grant operator status  (+o)")
+        _E("/deop <nick>",  "Remove operator status (-o)")
+        _E("/voice <nick>", "Grant voice  (+v)")
+        _E("/devoice <nick>","Remove voice (-v)")
+        _E("/hop <nick>",   "Grant half-op  (+h)")
+        _E("/dehop <nick>", "Remove half-op (-h)")
+        _E("/ban <nick|mask>","Ban user; bare nick expands to nick!*@*")
+        _E("/unban <mask>", "Remove a ban mask")
+        _C("")
+        _H("Users & Status")
+        _E("/nick <newnick>",               "Change your nickname")
+        _E("/whois <nick>",                 "Look up user info — shown formatted in *status*")
+        _E("/whowas <nick>",                "Info on a recently disconnected user")
+        _E("/who <target>",                 "List users matching a pattern")
+        _E("/ignore <nick>",                "Suppress all messages from nick")
+        _E("/unignore <nick>",              "Stop ignoring nick")
+        _E("/away [message]",               "Set away status with optional message")
+        _E("/back",                         "Remove away status")
+        _C("")
+        _H("Services & CTCP")
+        _E("/ns <command>",                 "Send command to NickServ  (e.g. /ns identify pw)")
+        _E("/cs <command>",                 "Send command to ChanServ")
+        _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
+        _C("")
+        _H("AI Detection")
+        _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
+        _E("/aitoggle",                     "Enable or disable AI scoring entirely")
+        _C("")
+        _H("Claude Integration")
+        _E("/askai [opus|sonnet|haiku] <q>","Ask Claude a question; answer shown in dashboard")
+        _E("/model <opus|sonnet|haiku>",    "Set the default Claude model for /askai")
+        _C(f"  Current model: {self.ai_chat_model}  ({CLAUDE_MODELS.get(self.ai_chat_model, '?')})")
+        _C("")
+        _H("Translation")
+        _E("/autotranslate",               "Toggle auto CJK → English translation (on by default)")
+        _C("")
+        _H("Connection")
+        _E("/server <host> [port] [nick]", "Connect to a new IRC server over SSL (default 6697)")
+        _E("/reconnect",                   "Drop and re-establish the current connection")
+        _C("")
+        _H("Windows & Navigation")
+        _C("  Tab bar (above input): [1:status] [2:dash] [*3:##chat]  * = unread")
+        _E("/win <n>",    "Switch to window n; clears its unread marker")
+        _E("/close  (or /wc)", "Close current window; focus moves to previous")
+        _E("/clear",     "Clear messages in the current window")
+        _E("/theme <1-5>","Switch colour theme: Classic Hacker Ocean Sunset Neon")
+        _C("  Ctrl+N  next window    Tab  nick completion    PgUp/PgDn  scroll")
+        _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
+        _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
+        _C("")
+        _H("General")
+        _E("/quit [message]", "Send quit message and exit")
+        _E("/help",           "Brief one-line command reference")
+        _E("/commands",       "This full command list")
+        _C("")
+        self.current_window_index = 0
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_help(self, args, extra, line):
+        for l in [
+            "── Messaging ──────────────────────────────────────────────",
+            "  /msg <nick> <text>       PM nick; opens & switches to DM window",
+            "  /query <nick> [message]  Open a DM window (optional first message)",
+            "  /notice <nick> <text>    Send a notice   /me <text>  Action line",
+            "── Channels ──────────────────────────────────────────────",
+            "  /join <chan>  /part [chan] [msg]  /topic <chan> [text]",
+            "  /kick <chan> <nick> [reason]  /invite <nick> [chan]",
+            "  /names [chan]  /mode <target> [modes]",
+            "── Operator ──────────────────────────────────────────────",
+            "  /op /deop /voice /devoice /hop /dehop  /ban /unban",
+            "── Users ─────────────────────────────────────────────────",
+            "  /nick <new>  /whois <nick>  /whowas <nick>  /who <pat>",
+            "  /ignore <nick>  /unignore <nick>  /away [msg]  /back",
+            "── Services ──────────────────────────────────────────────",
+            "  /ns <cmd>  /cs <cmd>  /ctcp <nick> <cmd> [args]",
+            "── AI Detection ──────────────────────────────────────────",
+            "  /ai <nick>  full profile    /aitoggle  enable/disable scoring",
+            "── Claude ────────────────────────────────────────────────",
+            "  /askai [opus|sonnet|haiku] <question>  (answer in dashboard)",
+            "  /model <opus|sonnet|haiku>  set default model",
+            "── Translation ───────────────────────────────────────────",
+            "  /autotranslate  toggle CJK → English (default: on)",
+            "── Connection ─────────────────────────────────────────────",
+            "  /server <host> [port] [nick]  /reconnect",
+            "── Interface ──────────────────────────────────────────────",
+            "  /win <n>  /close (/wc)  /clear  /theme <1-5>",
+            "  Ctrl+N next window  Tab nick-complete  PgUp/Dn scroll",
+            "  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread",
+            "  /quit [msg]  /commands  (full list)  /help  (this)",
+        ]:
+            self.window_by_name["*status*"].add_line(l)
+        self.current_window_index = 0
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
 
     def _handle_key(self, ch: int) -> bool:
         """Process a single keycode synchronously.  Returns True if the key was
@@ -3251,7 +3390,7 @@ class TUI:
             # asyncio.sleep(0) hands control back to the event loop for one cycle
             # (lets IRC reads and translation tasks progress) then returns
             # immediately — keeping the loop hot during active typing or floods.
-            await asyncio.sleep(0 if (had_key or n > 0) else 0.016)
+            await asyncio.sleep(0.001 if (had_key or n > 0) else 0.016)
 
 # =========================
 # Main
