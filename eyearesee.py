@@ -101,8 +101,8 @@ _ACTION_LINE_RE     = re.compile(r'^\[\d{2}:\d{2}\] \* \S')  # "[HH:MM] * nick �
 _WHOIS_REPLIES = frozenset({"307", "311", "312", "313", "317", "318", "319", "330", "671"})
 _WHO_REPLIES   = frozenset({"352", "314"})
 _SERVER_INFO   = frozenset({"002", "003", "004", "005", "372", "375", "376"})
-# Channel-join error replies — shown as status messages
-_ERROR_REPLIES = frozenset({"471", "473", "474", "475", "477"})
+# Channel-join error replies — routed to the channel window with the error
+_ERROR_REPLIES = frozenset({"471", "473", "474", "475", "477", "489"})
 # Numeric replies that are safely discarded (end-of-list markers, stats, etc.)
 _SILENT_NUMERICS = frozenset({"333", "366", "265", "266"})
 
@@ -1440,8 +1440,10 @@ class IRCClient:
             await self.ui_queue.put(("status", f"Erroneous nickname rejected by server: {bad}"))
 
         elif cmd in _ERROR_REPLIES:  # channel join errors (full, invite-only, banned, etc.)
-            text = trailing or " ".join(params[1:])
-            await self.ui_queue.put(("status", f"Cannot join: {text}"))
+            # params layout: [yournick, #channel, reason_text_or_from_trailing]
+            channel = params[1] if len(params) > 1 else ""
+            text    = trailing or (" ".join(params[2:]) if len(params) > 2 else "")
+            await self.ui_queue.put(("join_error", channel, f"Cannot join {channel}: {text}"))
 
         elif cmd == "AWAY":  # away-notify cap: user set or cleared away status
             reason = trailing or ""
@@ -1578,9 +1580,17 @@ class TUI:
             self.windows.append(win)
             self.window_by_name[name] = win
 
+        # Pre-create the default channel window so its tab is always visible and
+        # join errors / join success messages land there immediately.
+        self.channel_users: Dict[str, set] = {}
+        if DEFAULT_CHANNEL:
+            _dcw = ChatWindow(DEFAULT_CHANNEL, is_channel=True)
+            self.windows.append(_dcw)
+            self.window_by_name[DEFAULT_CHANNEL] = _dcw
+            self.channel_users[DEFAULT_CHANNEL] = set()
+
         self.current_window_index = 0
         self.current_channel: Optional[str] = DEFAULT_CHANNEL
-        self.channel_users: Dict[str, set] = {}
         self.user_scores: Dict[str, int] = {}
         self.user_ai_scores: Dict[str, int] = {}
         self.ai_suspect_threshold = AI_SUSPECT_THRESHOLD
@@ -2445,6 +2455,21 @@ class TUI:
             self.current_channel = channel
             self.current_window_index = self.windows.index(win)
             self._unread_windows.discard(channel)
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            self.dirty = True
+
+        elif etype == "join_error":
+            _, channel, msg = event
+            if channel:
+                # Create the channel window so the user can see why it failed,
+                # then switch to it so the error is immediately visible.
+                win = self.ensure_window(channel)
+                win.add_line(msg)
+                self.current_channel = channel
+                self.current_window_index = self.windows.index(win)
+                self._unread_windows.discard(channel)
+            else:
+                self.window_by_name["*status*"].add_line(msg)
             self._chat_dirty = self._userlist_dirty = self._input_dirty = True
             self.dirty = True
 
