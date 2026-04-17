@@ -1920,6 +1920,10 @@ class TUI:
         self._dashboard_dirty = False             # needs rebuild?
         self._dashboard_last_update = 0.0         # last rebuild timestamp
         self._dashboard_ota_interval = 5.0        # auto-refresh interval while dashboard is visible
+        # "suspects" = normal auto-refreshing suspects view
+        # "profile"  = /ai output; suppresses auto-refresh until user navigates away and back
+        self._dashboard_mode = "suspects"
+        self._prev_on_dashboard = False           # edge-detect navigate-back-to-dashboard
 
         # Claude API state
         self.ai_chat_model: str = CLAUDE_DEFAULT_MODEL   # key into CLAUDE_MODELS
@@ -2263,9 +2267,12 @@ class TUI:
         L("  ── Verdict ──────────────────────────────────")
         L(f"  {verdict}")
 
-        self.current_window_index = 1
-        self._chat_dirty = True
-        self.dirty = True
+        self._dashboard_mode        = "profile"
+        self._dashboard_dirty       = False
+        self._dashboard_last_update = time.time()
+        self.current_window_index   = 1
+        self._chat_dirty            = True
+        self.dirty                  = True
 
     async def _do_askai(self, question: str, model_key: str) -> None:
         """Call the Claude API and post the Q+A to the *dashboard* window."""
@@ -3685,18 +3692,26 @@ class TUI:
             # ── 4. Dashboard auto-refresh ─────────────────────────────────────────
             now = time.time()
             on_dashboard = (self.get_current_window().name == "*dashboard*")
-            if on_dashboard and now - self._dashboard_last_update >= self._dashboard_ota_interval:
-                await self.update_dashboard()
-                self._dashboard_dirty = False
-                self._dashboard_last_update = now
-                self._chat_dirty = True
-                self.dirty = True
-            elif self._dashboard_dirty and now - self._dashboard_last_update >= 1.0:
-                await self.update_dashboard()
-                self._dashboard_dirty = False
-                self._dashboard_last_update = now
-                if on_dashboard:
+            # When the user navigates back to the dashboard from another window,
+            # drop the profile view so the suspects list auto-refreshes normally.
+            if on_dashboard and not self._prev_on_dashboard and self._dashboard_mode == "profile":
+                self._dashboard_mode = "suspects"
+            self._prev_on_dashboard = on_dashboard
+            # Auto-refresh is suppressed while showing a profile (/ai output) so
+            # the suspects rebuild doesn't overwrite it mid-read.
+            if self._dashboard_mode == "suspects":
+                if on_dashboard and now - self._dashboard_last_update >= self._dashboard_ota_interval:
+                    await self.update_dashboard()
+                    self._dashboard_dirty = False
+                    self._dashboard_last_update = now
                     self._chat_dirty = True
+                    self.dirty = True
+                elif self._dashboard_dirty and now - self._dashboard_last_update >= 1.0:
+                    await self.update_dashboard()
+                    self._dashboard_dirty = False
+                    self._dashboard_last_update = now
+                    if on_dashboard:
+                        self._chat_dirty = True
 
             # ── 5. Full redraw (chat + userlist; throttled to ~30fps) ─────────────
             if self.dirty and self.redraw():
