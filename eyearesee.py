@@ -515,6 +515,12 @@ _ai_log_handle:     Optional[io.TextIOWrapper] = None
 _chat_log_handles:  Dict[str, io.TextIOWrapper] = {}
 _input_hist_handle: Optional[io.TextIOWrapper] = None
 
+# Time-gated flush: ai_score.log is flushed at most once per interval rather
+# than on every write.  This amortises syscall cost across message bursts while
+# still ensuring data lands on disk within a few seconds of being written.
+_AI_LOG_FLUSH_INTERVAL: float = 2.0   # seconds between forced flushes
+_ai_log_last_flush:     float = 0.0   # monotonic timestamp of last flush
+
 
 def _open_append(path: str, buffering: int = 8192) -> io.TextIOWrapper:
     return open(path, "a", encoding="utf-8", buffering=buffering)  # type: ignore[return-value]
@@ -533,11 +539,20 @@ def _flush_log_handles() -> None:
 
 
 def _ai_log_write(payload: str) -> None:
-    global _ai_log_handle
+    """Append *payload* to ai_score.log and flush at most once per
+    _AI_LOG_FLUSH_INTERVAL seconds.  The 8 KB write buffer absorbs message
+    bursts without a syscall per record; the time gate ensures data lands on
+    disk within a few seconds even during quiet periods.  The atexit handler
+    performs a final flush on clean shutdown."""
+    global _ai_log_handle, _ai_log_last_flush
     try:
         if _ai_log_handle is None or _ai_log_handle.closed:
             _ai_log_handle = _open_append(AI_LOG_PATH)
         _ai_log_handle.write(payload)
+        now = time.monotonic()
+        if now - _ai_log_last_flush >= _AI_LOG_FLUSH_INTERVAL:
+            _ai_log_handle.flush()
+            _ai_log_last_flush = now
     except Exception:
         pass
 
