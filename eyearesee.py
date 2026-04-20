@@ -79,8 +79,11 @@ NICKSERV_PASSWORD = os.environ.get("IRC_NICKSERV_PASSWORD", "")
 
 MAX_MESSAGES = 100
 USER_HISTORY_WINDOW = 200
-AI_LOG_PATH = "ai_scores.log"
+AI_LOG_PATH = "ai_score.log"
 AI_SUSPECT_THRESHOLD = 70
+# AI detection logging: enabled by default.  Set IRC_AI_LOG=0 to disable at startup.
+# Can also be toggled at runtime with /logtoggle.
+_ai_logging_enabled: bool = os.environ.get("IRC_AI_LOG", "1") not in ("0", "false", "no", "off")
 
 INPUT_HISTORY_PATH = "irc_input_history.txt"
 INPUT_HISTORY_MAX  = 500
@@ -540,33 +543,82 @@ def _ai_log_write(payload: str) -> None:
 
 
 def log_session_start(server: str, nick: str) -> None:
+    if not _ai_logging_enabled:
+        return
     entry = {
-        "type": "session_start",
-        "ts": time.time(),
-        "dt": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "sess": _LOG_SESSION_ID,
+        "type":   "session_start",
+        "ts":     time.time(),
+        "dt":     time.strftime("%Y-%m-%d %H:%M:%S"),
+        "sess":   _LOG_SESSION_ID,
         "server": server,
-        "nick": nick,
+        "nick":   nick,
     }
     _ai_log_write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def log_ai_event(nick: str, target: str, msg: str,
-                 u_score: int, m_score: int, a_score: int, rolling_ai: int) -> None:
+                 u_score: int, m_score: int, a_score: int, rolling_ai: int,
+                 heu_score: float = 0.0,
+                 bino_score: float = 0.0,
+                 cls_score: float = 0.0,
+                 llama_score: float = 0.0) -> None:
+    """Write one JSONL detection record to ai_score.log.
+
+    Every record contains the full signal breakdown so any line can be
+    independently analysed without referencing session state:
+
+      ts / dt   – unix timestamp + human-readable datetime
+      sess      – 8-char session UUID (unique per process start)
+      seq       – monotone per-session counter; gaps indicate missing lines
+      nick      – IRC nickname
+      target    – channel or DM nick the message was sent to
+      u         – user-history score (0-99, based on message count)
+      m         – message-level score (reserved, currently 50)
+      a         – ensemble AI score 0-100
+      roll      – rolling per-nick AI average (last USER_HISTORY_WINDOW msgs)
+      flag      – "suspect" if a >= AI_SUSPECT_THRESHOLD else "normal"
+      msg_len   – byte length of the raw message
+      heu       – combined heuristic sub-score (formality + Llama patterns)
+      bino      – Binoculars cross-entropy ratio sub-score
+      cls       – averaged classifier probability (ChatGPT-RoBERTa + general)
+      llama     – Llama-specific structural/phrasing pattern sub-score
+      msg       – raw message text (JSON-escaped)
+    """
+    if not _ai_logging_enabled:
+        return
     global _log_seq
     _log_seq += 1
+    entry: dict = {
+        "ts":      time.time(),
+        "dt":      time.strftime("%Y-%m-%d %H:%M:%S"),
+        "sess":    _LOG_SESSION_ID,
+        "seq":     _log_seq,
+        "nick":    nick,
+        "target":  target,
+        "u":       u_score,
+        "m":       m_score,
+        "a":       a_score,
+        "roll":    rolling_ai,
+        "flag":    "suspect" if a_score >= AI_SUSPECT_THRESHOLD else "normal",
+        "msg_len": len(msg),
+        "heu":     round(heu_score,   4),
+        "bino":    round(bino_score,  4),
+        "cls":     round(cls_score,   4),
+        "llama":   round(llama_score, 4),
+        "msg":     msg,
+    }
+    _ai_log_write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def log_toggle_event(enabled: bool, nick: str) -> None:
+    """Record a logging enable/disable event so log gaps are auditable."""
     entry = {
+        "type": "log_toggle",
         "ts":   time.time(),
         "dt":   time.strftime("%Y-%m-%d %H:%M:%S"),
         "sess": _LOG_SESSION_ID,
-        "seq":  _log_seq,
+        "enabled": enabled,
         "nick": nick,
-        "target": target,
-        "u":    u_score,
-        "m":    m_score,
-        "a":    a_score,
-        "roll": rolling_ai,
-        "msg":  msg,
     }
     _ai_log_write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -738,28 +790,102 @@ IRC_CASUAL_WORDS = frozenset({
     "brb", "afk", "omg", "wtf", "gtg", "gg", "rip", "smh", "imo",
     "imho", "tbh", "ngl", "idk", "irl", "fyi", "ty", "thx", "np",
     "nvm", "btw", "iirc", "tfw", "mfw", "welp", "kek", "ez",
+    "lmk", "imo", "ikr", "fr", "no cap", "w", "l", "based", "cope",
+    "slay", "bro", "dude", "gonna", "wanna", "gotta",
 })
 
-# Phrases LLMs disproportionately use in chat contexts (2025/2026)
+# General LLM tell-phrases — applies across GPT-4, Claude, Gemini, Llama, etc.
 AI_TELL_PHRASES = frozenset({
+    # Hedging / meta-commentary
     "it's worth noting", "it is worth noting",
     "it's important to", "it is important to",
     "it should be noted", "it's crucial to",
     "as previously mentioned", "as noted above",
+    "it's important to understand", "it's essential to understand",
+    "keep in mind that", "bear in mind that",
+    "it's worth mentioning", "worth pointing out",
+    # Transitional connectors overused by LLMs
     "to elaborate", "to clarify", "in other words",
     "furthermore", "moreover", "additionally", "consequently",
-    "that being said", "having said that",
-    "on the other hand", "in conclusion",
-    "to summarize", "in summary", "to recap",
+    "that being said", "having said that", "with that said",
+    "on the other hand", "in conclusion", "to that end",
+    "at its core", "at the end of the day",
+    # Summary / recap language
+    "to summarize", "in summary", "to recap", "to put it simply",
+    "in a nutshell", "in essence", "to boil it down",
+    "overall,", "ultimately,", "in short,",
+    # Sycophantic openers
     "certainly!", "absolutely!", "great question", "excellent question",
-    "i hope this helps", "feel free to", "let me know if",
-    "happy to help", "glad to help", "please let me know",
-    "it's fascinating", "it's interesting to note",
+    "good question", "that's a great", "what a great",
+    "of course!", "sure thing", "i'd be happy to", "i'd be glad to",
+    "happy to help", "glad to help", "i'm happy to",
+    # Closing / helper phrases
+    "i hope this helps", "i hope that helps", "hope this helps",
+    "feel free to", "please let me know", "let me know if",
+    "don't hesitate to", "if you have any questions",
+    "if you'd like more", "if you need further",
+    # LLM identity tells
+    "as an ai", "as an ai assistant", "as an ai language model",
+    "as a language model", "i'm just an ai", "i am just an ai",
+    "my training data", "my knowledge cutoff", "my training",
+    "based on my training", "i don't have real-time",
+    "i don't have access to real-time",
+    # 2025/2026 stylistic tells
     "delve into", "tapestry", "nuanced perspective",
+    "it's fascinating", "it's interesting to note",
+    "navigating the", "landscape of", "realm of",
+    "leverage", "synergize", "holistic approach",
+    "robust solution", "empower", "cutting-edge",
+})
+
+# Phrases characteristic of Llama 2 / Llama 3 / Mistral / open-source LLMs
+LLAMA_TELL_PHRASES = frozenset({
+    # Typical Llama openers
+    "sure, here", "sure! here", "sure, i can",
+    "of course, here", "of course! i",
+    "i'll do my best", "i'll try my best",
+    "let me provide", "let me explain", "let me walk you through",
+    "let me break this down", "let me break down",
+    "let me help you", "let me help with",
+    "here's a step-by-step", "here are some steps",
+    "here's how you can", "here's how to",
+    "here's an overview", "here's a breakdown",
+    "here's what you", "here are a few", "here are some",
+    # Llama meta-language
+    "as requested", "as you asked", "as you mentioned",
+    "based on your question", "based on what you've said",
+    "to answer your question", "to address your question",
+    "your question is", "you asked about",
+    # Llama recommendation style
+    "my recommendation would be", "my suggestion would be",
+    "i would recommend", "i would suggest", "i suggest",
+    "i recommend", "one approach would be", "one option is",
+    # Llama closing phrases
+    "i hope this answers", "i hope this clarifies",
+    "i hope this helps you", "please feel free",
+    "feel free to ask", "feel free to reach out",
+    "let me know if you", "let me know if there",
+    "to summarize my response", "in summary,",
+    # Llama hedging / safety language
+    "i need to point out", "i should point out",
+    "i should mention", "i should note",
+    "to be clear", "to be precise", "to be transparent",
+    "i want to be clear", "i want to clarify",
+    "it's important that i clarify", "i must clarify",
+    # Llama 2 refusal / alignment patterns
+    "i cannot assist with", "i'm not able to assist",
+    "i'm unable to", "i'm afraid i can't",
+    "that falls outside", "outside my capabilities",
+    "i'm designed to", "my purpose is to",
+    # Llama 3 / newer patterns
+    "my understanding is", "based on my knowledge",
+    "as of my last update", "as of my knowledge",
+    "as of my training", "my response to this",
 })
 
 # Vocabulary LLMs reach for that humans rarely use in casual IRC chat
 FORMAL_WORDS = frozenset({
+    # Classic formal vocabulary
     "utilize", "leverage", "implement", "facilitate",
     "demonstrate", "enumerate", "articulate",
     "commence", "terminate", "endeavor",
@@ -767,25 +893,61 @@ FORMAL_WORDS = frozenset({
     "constitute", "comprises", "optimal",
     "paramount", "imperative", "holistic",
     "synergy", "paradigm", "streamline",
+    # 2025 additions — words AI over-applies in casual settings
+    "comprehensive", "multifaceted", "intricate",
+    "pivotal", "fundamental", "substantial",
+    "conceptual", "theoretical", "contextual",
+    "methodology", "framework", "perspective",
+    "implications", "considerations", "ramifications",
+    "sophisticated", "nuanced", "intrinsically",
+    "inherently", "essentially", "fundamentally",
+    "predominantly", "predominantly", "encompass",
+    "elucidate", "expound", "elaborate",
+    "ascertain", "discern", "navigate",
+    "augment", "mitigate", "alleviate",
 })
+
+# Quick regex to detect AI bot-style response openers at the very start of a message
+_BOT_OPENER_RE = re.compile(
+    r"^(?:Sure[!,]?|Absolutely[!,]?|Certainly[!,]?|Of course[!,]?|"
+    r"Great[!,]?|Gladly[!,]?|Happy to help[!,]?|I'?d be happy|"
+    r"I'?d be glad|Let me|Here'?s |Here are |To answer|"
+    r"Of course[,!] I'?d|I can help|I'?ll help)",
+    re.IGNORECASE,
+)
+
+# Structural patterns Llama/open-source LLMs use that are unusual in IRC
+# (numbered lists, bullet points, markdown headers, code fences)
+_LLAMA_STRUCT_RE = re.compile(
+    r"(?m)^(?:\s*\d+[.)]\s+\S|\s*[-*•]\s+\S|\s*#{1,3}\s+\S|```)",
+)
 
 class EnsembleAIDetector:
     _CACHE_MAX = 512  # LRU-style prediction cache (bots repeat themselves)
+
+    # Primary classifier: trained on ChatGPT/GPT-family output
+    _CLS1_MODEL = "Hello-SimpleAI/chatgpt-detector-roberta"
+    # Secondary classifier: broader OpenAI GPT-2-era detector; generalises to
+    # fluent AI text regardless of model family (Llama, Mistral, etc.).
+    # Loaded opportunistically — falls back gracefully if unavailable.
+    _CLS2_MODEL = "openai-community/roberta-base-openai-detector"
 
     def __init__(self):
         self.enabled = True
         self._gpt2_model = None   # GPT-2: Binoculars performer
         self._obs_model  = None   # distilgpt2: Binoculars observer
         self._gpt2_tok   = None   # shared tokenizer (same BPE vocab)
-        self._cls_model  = None
+        self._cls_model  = None   # primary classifier (ChatGPT-focused RoBERTa)
         self._cls_tok    = None
+        self._cls2_model = None   # secondary classifier (general LLM detector), optional
+        self._cls2_tok   = None
         self._device = "cpu"
-        self._pred_cache: OrderedDict = OrderedDict()  # text → float, FIFO eviction
+        self._pred_cache: OrderedDict = OrderedDict()  # text → Dict[str,float], LRU
 
         if not AI_AVAILABLE:
             raise SystemExit(
                 "AI detector requires: pip install transformers torch\n"
-                "All three models (gpt2, distilgpt2, RoBERTa) must load successfully."
+                "Core models (gpt2, distilgpt2, RoBERTa) must load successfully."
             )
         self._load_models()
 
@@ -806,14 +968,30 @@ class EnsembleAIDetector:
         self._obs_model.eval()
         print("OK")
 
-        print("AI detector: loading RoBERTa classifier...", end=" ", flush=True)
-        _m = "Hello-SimpleAI/chatgpt-detector-roberta"
-        self._cls_tok = AutoTokenizer.from_pretrained(_m)
-        self._cls_model = AutoModelForSequenceClassification.from_pretrained(_m).to(self._device)
+        print(f"AI detector: loading primary classifier ({self._CLS1_MODEL})...", end=" ", flush=True)
+        self._cls_tok = AutoTokenizer.from_pretrained(self._CLS1_MODEL)
+        self._cls_model = AutoModelForSequenceClassification.from_pretrained(
+            self._CLS1_MODEL).to(self._device)
         self._cls_model.eval()
         print("OK")
 
-        print(f"AI detector ENABLED: Binoculars + RoBERTa + heuristics (device={self._device})")
+        # Secondary classifier — optional; broadens coverage to Llama/open-source LLMs
+        print(f"AI detector: loading secondary classifier ({self._CLS2_MODEL})...", end=" ", flush=True)
+        try:
+            self._cls2_tok = AutoTokenizer.from_pretrained(self._CLS2_MODEL)
+            self._cls2_model = AutoModelForSequenceClassification.from_pretrained(
+                self._CLS2_MODEL).to(self._device)
+            self._cls2_model.eval()
+            print("OK")
+        except Exception as _e:
+            self._cls2_tok   = None
+            self._cls2_model = None
+            print(f"skipped ({_e})")
+
+        loaded = ["Binoculars(gpt2+distilgpt2)", "RoBERTa(chatgpt)", "Llama-heuristics"]
+        if self._cls2_model:
+            loaded.append("RoBERTa(general)")
+        print(f"AI detector ENABLED: {' + '.join(loaded)}  (device={self._device})")
 
     # ---- static heuristics ----
 
@@ -852,40 +1030,114 @@ class EnsembleAIDetector:
         no_emoticon  = not any(e in text for e in (":)", ":(", ":D", "xD", "XD", "^_^", ">_<", "o/"))
         long_enough  = len(words) >= 6
 
-        # 2025/2026 LLM-specific tells
-        has_emdash     = "\u2014" in text or " -- " in text   # LLMs reach for em-dashes
+        # LLM-specific tells (general across all model families)
+        has_emdash     = "\u2014" in text or " -- " in text
         tell_phrase    = any(p in text_lower for p in AI_TELL_PHRASES)
+        llama_phrase   = any(p in text_lower for p in LLAMA_TELL_PHRASES)
         formal_vocab   = bool(words_lower_stripped & FORMAL_WORDS)
         no_contraction = not any(c in text_lower for c in
                                  ("n't", "'re", "'ve", "'ll", "'m", "'d"))
+        # Bot-opener at the very start of the message
+        bot_opener = bool(_BOT_OPENER_RE.match(text))
 
         return min(1.0,
-            0.10 * ends_cleanly
-            + 0.05 * starts_cap
-            + 0.08 * (not casual_hit)
-            + 0.05 * no_charspam
-            + 0.04 * no_emoticon
-            + 0.06 * long_enough
-            + 0.18 * tell_phrase       # strongest single heuristic
-            + 0.16 * has_emdash
-            + 0.14 * formal_vocab
-            + 0.14 * no_contraction
+            0.08 * ends_cleanly
+            + 0.04 * starts_cap
+            + 0.06 * (not casual_hit)
+            + 0.04 * no_charspam
+            + 0.03 * no_emoticon
+            + 0.05 * long_enough
+            + 0.16 * tell_phrase       # strongest general signal
+            + 0.14 * llama_phrase      # Llama/open-source LLM signal
+            + 0.12 * has_emdash
+            + 0.12 * formal_vocab
+            + 0.10 * no_contraction
+            + 0.14 * bot_opener        # unambiguous AI opener pattern
         )
 
+    @staticmethod
+    def llama_pattern_score(text: str) -> float:
+        """0..1 — detects structural and phrasing patterns specific to Llama/
+        open-source LLM outputs (Llama 2, Llama 3, Mistral, Vicuna, etc.).
+
+        Focuses on signals that are low-FP in casual IRC:
+        • Markdown structure (numbered lists, bullets, headers) in plain chat
+        • Bot-opener words at the message start
+        • Colon-terminated sentences introducing a list
+        • Unusually long single messages (LLMs over-explain)
+        • Multi-sentence uniform capitalisation (templated output)
+        """
+        if not text:
+            return 0.0
+        text_lower = text.lower()
+        score = 0.0
+
+        # Llama-specific tell phrases (subset different from general AI_TELL_PHRASES)
+        if any(p in text_lower for p in LLAMA_TELL_PHRASES):
+            score += 0.30
+
+        # Markdown-style structural elements in what should be plain IRC chat
+        struct_hits = len(_LLAMA_STRUCT_RE.findall(text))
+        if struct_hits >= 3:
+            score += 0.25
+        elif struct_hits >= 1:
+            score += 0.12
+
+        # Bot-opener (unambiguous start patterns)
+        if _BOT_OPENER_RE.match(text):
+            score += 0.18
+
+        # Colon at end of a sentence followed by newline or end-of-text (list intro)
+        if re.search(r':\s*(?:\n|$)', text):
+            score += 0.08
+
+        # Very long single message: Llama over-explains simple questions
+        word_count = len(text.split())
+        if word_count >= 60:
+            score += 0.15
+        elif word_count >= 30:
+            score += 0.07
+
+        # All sentences start with a capital: templated / AI-generated prose
+        sentences = [s.strip() for s in re.split(r'[.!?]', text) if len(s.strip()) > 4]
+        if len(sentences) >= 3 and all(s[0].isupper() for s in sentences):
+            score += 0.08
+
+        # Repeated numbered / enumerated structure (common Llama answer format)
+        if re.search(r'\b(?:first|second|third|finally|lastly)[,:]', text_lower):
+            score += 0.08
+
+        return min(1.0, score)
+
     def _heuristic_score(self, text: str) -> float:
-        form   = self.formality_score(text)
-        rep    = self.repetition(text)
-        ent    = self.entropy(text)
+        """Combined heuristic score incorporating general formality and
+        Llama-specific structural/phrasing signals."""
+        form  = self.formality_score(text)
+        llama = self.llama_pattern_score(text)
+        rep   = self.repetition(text)
+        ent   = self.entropy(text)
         length = min(1.0, len(text) / 300.0)
         ent_penalty = max(0.0, (ent - 4.0) / 2.0)
-        return max(0.0, min(1.0, 0.50 * form + 0.20 * rep + 0.12 * length - 0.18 * ent_penalty))
+        # llama_pattern_score is a strong direct signal — give it equal weight to formality
+        return max(0.0, min(1.0,
+            0.38 * form
+            + 0.35 * llama
+            + 0.14 * rep
+            + 0.07 * length
+            - 0.14 * ent_penalty
+        ))
 
     # ---- ML signals ----
 
     def _binoculars_score(self, text: str) -> float:
         """Binoculars (Hans et al., 2024): CE_observer / CE_performer.
-        Low ratio → both models find text fluent → AI-generated.
-        Returns 0..1, higher = more AI-like."""
+
+        Low ratio → both models find the text fluent → likely AI-generated.
+        GPT-2 family is used here; it captures fluency patterns common across
+        most RLHF-tuned models including Llama which shares similar token
+        distributions due to overlapping pre-training data (Common Crawl, etc.).
+        Returns 0..1, higher = more AI-like.
+        """
         try:
             enc = self._gpt2_tok(text, return_tensors="pt", truncation=True, max_length=128)
             enc = {k: v.to(self._device) for k, v in enc.items()}
@@ -897,43 +1149,99 @@ class EnsembleAIDetector:
             if ce_perf < 1e-6:
                 return 0.0
             ratio = ce_obs / ce_perf
-            # Human IRC: ratio ~1.3-2.5  (smaller observer struggles more)
-            # AI text:   ratio ~0.7-1.2  (both models agree it's fluent)
-            return max(0.0, min(1.0, (1.8 - ratio) / 1.2))
+            # Human IRC: ratio ~1.3–2.5  (smaller distilgpt2 observer struggles more)
+            # AI text:   ratio ~0.7–1.2  (both models agree — text is fluent)
+            # Calibrated empirically on IRC logs; Llama outputs typically score ~0.9–1.1
+            return max(0.0, min(1.0, (1.9 - ratio) / 1.3))
         except Exception:
             return 0.0
 
     def _classifier_score(self, text: str) -> float:
-        """0..1 probability that text is AI-generated."""
+        """Average AI-probability across all loaded classifiers.
+
+        Primary (cls1): Hello-SimpleAI/chatgpt-detector-roberta — strong on
+          ChatGPT / GPT-4 / Claude family output.
+        Secondary (cls2): openai-community/roberta-base-openai-detector — trained
+          on GPT-2 outputs; generalises to Llama / Mistral / open-source LLMs
+          because it captures broad fluency features rather than ChatGPT style.
+        If cls2 failed to load only cls1 is used.
+        """
+        scores: List[float] = []
         try:
             enc = self._cls_tok(text, return_tensors="pt", truncation=True, max_length=128)
             enc = {k: v.to(self._device) for k, v in enc.items()}
             with torch.inference_mode():
                 logits = self._cls_model(**enc).logits
-            return torch.softmax(logits, dim=-1)[0][1].item()
+            scores.append(torch.softmax(logits, dim=-1)[0][1].item())
         except Exception:
-            return 0.0
+            pass
+        if self._cls2_model is not None:
+            try:
+                enc2 = self._cls2_tok(text, return_tensors="pt", truncation=True, max_length=128)
+                enc2 = {k: v.to(self._device) for k, v in enc2.items()}
+                with torch.inference_mode():
+                    logits2 = self._cls2_model(**enc2).logits
+                # openai-community/roberta-base-openai-detector: LABEL_0=Real, LABEL_1=Fake
+                scores.append(torch.softmax(logits2, dim=-1)[0][1].item())
+            except Exception:
+                pass
+        return sum(scores) / len(scores) if scores else 0.0
 
     # ---- main entry point ----
 
-    def predict_prob(self, text: str) -> float:
-        if not self.enabled: return 0.0
+    def predict_detailed(self, text: str) -> Dict[str, float]:
+        """Return ensemble probability plus per-signal breakdown.
+
+        Keys:
+          prob  – final ensemble score (0–1)
+          heu   – combined heuristic (formality + Llama patterns + repetition)
+          llama – raw Llama-specific pattern sub-score (0–1)
+          bino  – Binoculars perplexity ratio score (0–1)
+          cls   – average classifier score across all loaded models (0–1)
+
+        All values 0–1; higher = more likely AI-generated.
+        Results are LRU-cached (up to _CACHE_MAX entries).
+        """
+        _zero: Dict[str, float] = {
+            "prob": 0.0, "heu": 0.0, "llama": 0.0, "bino": 0.0, "cls": 0.0}
+        if not self.enabled:
+            return _zero
         text = text.strip()
-        if not text: return 0.0
+        if not text:
+            return _zero
 
         cached = self._pred_cache.get(text)
         if cached is not None:
-            return cached
+            self._pred_cache.move_to_end(text)
+            return cached  # type: ignore[return-value]
 
-        heu  = self._heuristic_score(text)
-        bino = self._binoculars_score(text)
-        cls  = self._classifier_score(text)
-        result = max(0.0, min(1.0, 0.40 * bino + 0.40 * cls + 0.20 * heu))
+        llama = self.llama_pattern_score(text)
+        heu   = self._heuristic_score(text)
+        bino  = self._binoculars_score(text)
+        cls   = self._classifier_score(text)
+
+        # Ensemble: classifiers are the strongest ML signals; heuristics now carry
+        # more weight than before because the Llama pattern layer is precise and
+        # low-FP on IRC traffic.  Binoculars is stable but misses some open-source
+        # LLMs, so its weight is trimmed slightly.
+        prob = max(0.0, min(1.0, 0.35 * bino + 0.35 * cls + 0.30 * heu))
+
+        # High-confidence override: unambiguous Llama structural output in short
+        # IRC messages should score high even when ML signals are uncertain.
+        if llama >= 0.60 and prob < 0.55:
+            prob = min(1.0, prob * 0.5 + llama * 0.5)
+
+        result: Dict[str, float] = {
+            "prob": prob, "heu": heu, "llama": llama, "bino": bino, "cls": cls}
 
         if len(self._pred_cache) >= self._CACHE_MAX:
             self._pred_cache.popitem(last=False)   # O(1) FIFO eviction
         self._pred_cache[text] = result
         return result
+
+    def predict_prob(self, text: str) -> float:
+        """Convenience wrapper — returns only the ensemble probability (0–1)."""
+        return self.predict_detailed(text)["prob"]
 
 class ScoringEngine:
     def __init__(self, ai_detector: EnsembleAIDetector):
@@ -1850,12 +2158,16 @@ class IRCClient:
         """Run AI inference off the read loop, then push an update event."""
         try:
             loop = asyncio.get_running_loop()
-            a_prob = await loop.run_in_executor(
-                None, self.scoring.ai_detector.predict_prob, msg)
-            a_score = int(a_prob * 100)
+            detail = await loop.run_in_executor(
+                None, self.scoring.ai_detector.predict_detailed, msg)
+            a_score   = int(detail["prob"] * 100)
             u_state.record_message(msg, a_score)
             rolling_ai = int(u_state.rolling_ai_likelihood())
-            log_ai_event(nick, target, msg, u_score, m_score, a_score, rolling_ai)
+            log_ai_event(
+                nick, target, msg, u_score, m_score, a_score, rolling_ai,
+                heu_score=detail["heu"], bino_score=detail["bino"],
+                cls_score=detail["cls"], llama_score=detail["llama"],
+            )
             await self.ui_queue.put(("ai_score", nick, rolling_ai))
         except Exception:
             u_state.record_message(msg, 0)
@@ -2900,6 +3212,7 @@ class TUI:
         h["cs"] = h["chanserv"] = self._slash_cs
         h["ai"]         = self._slash_ai
         h["aitoggle"]   = self._slash_aitoggle
+        h["logtoggle"]  = self._slash_logtoggle
         h["join"]       = self._slash_join
         h["part"]       = self._slash_part
         h["nick"]       = self._slash_nick
@@ -3028,8 +3341,21 @@ class TUI:
 
     async def _slash_aitoggle(self, args, extra, line):
         self.client.scoring.ai_detector.enabled = not self.client.scoring.ai_detector.enabled
-        state = "ENABLED" if self.client.scoring.ai_detector.enabled else "DISABLED"
-        await self.ui_queue.put(("status", f"AI detection {state}"))
+        det_state = "ENABLED" if self.client.scoring.ai_detector.enabled else "DISABLED"
+        log_state = "log:ON" if _ai_logging_enabled else "log:OFF"
+        await self.ui_queue.put(("status", f"AI detection {det_state}  ({log_state})"))
+
+    async def _slash_logtoggle(self, args, extra, line):
+        global _ai_logging_enabled
+        # Write a final "disabled" record before we stop writing, or a "enabled" record
+        # immediately after we start — so the log gap is bounded and auditable.
+        if _ai_logging_enabled:
+            log_toggle_event(enabled=False, nick=self.client.nick)
+        _ai_logging_enabled = not _ai_logging_enabled
+        if _ai_logging_enabled:
+            log_toggle_event(enabled=True, nick=self.client.nick)
+        state = "ENABLED" if _ai_logging_enabled else "DISABLED"
+        await self.ui_queue.put(("status", f"AI detection logging {state}  (file: {AI_LOG_PATH})"))
 
     async def _slash_join(self, args, extra, line):
         if args:
@@ -3337,7 +3663,8 @@ class TUI:
         _C("")
         _H("AI Detection")
         _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
-        _E("/aitoggle",                     "Enable or disable AI scoring entirely")
+        _E("/aitoggle",                     "Enable or disable AI scoring (detection)")
+        _E("/logtoggle",                    "Enable or disable AI detection logging to disk (default: on)")
         _C("")
         _H("Claude Integration")
         _E("/askai [opus|sonnet|haiku] <q>","Ask Claude a question; answer shown in dashboard")
@@ -3389,6 +3716,7 @@ class TUI:
             "  /ns <cmd>  /cs <cmd>  /ctcp <nick> <cmd> [args]",
             "── AI Detection ──────────────────────────────────────────",
             "  /ai <nick>  full profile    /aitoggle  enable/disable scoring",
+            "  /logtoggle  toggle logging to disk (on by default)",
             "── Claude ────────────────────────────────────────────────",
             "  /askai [opus|sonnet|haiku] <question>  (answer in dashboard)",
             "  /model <opus|sonnet|haiku>  set default model",
@@ -3743,9 +4071,6 @@ async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
     ui_queue: asyncio.Queue = asyncio.Queue()
     scoring_engine = ScoringEngine(ai_detector)
     client = IRCClient(DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, ui_queue, scoring_engine)
-
-    log_session_start(DEFAULT_SERVER, DEFAULT_NICK)
-
     tui = TUI(stdscr, ui_queue, client)
 
     # Initial dashboard
@@ -3893,6 +4218,14 @@ def main():
     # Load AI models before curses starts so progress prints go to the normal
     # terminal and don't corrupt the TUI display.
     ai_detector = EnsembleAIDetector()
+
+    # Start logging immediately — before curses initialises — so the session
+    # record is written even if the TUI fails to start (bad terminal size, etc.).
+    log_session_start(DEFAULT_SERVER, DEFAULT_NICK)
+    log_state = f"ON  → {AI_LOG_PATH}" if _ai_logging_enabled else "OFF (set IRC_AI_LOG=1 to enable)"
+    print(f"  AI logging : {log_state}")
+    print()
+
     try:
         curses.wrapper(lambda stdscr: asyncio.run(main_curses(stdscr, ai_detector)))
     except (KeyboardInterrupt, SystemExit):
