@@ -1,177 +1,53 @@
- eyearesee.py is a ~3,100-line Python IRC client with a curses TUI. Here's a summary
-  of its architecture:
+This Python script, named eyearesee.py, is a highly advanced, feature-rich IRC client that integrates sophisticated AI-powered moderation and analysis into the standard IRC experience.
 
-  Core components:
-  - IRCClient — async IRC connection with SSL/TLS, IRCv3 caps (SASL, away-notify, server-time, etc.), CTCP,               exponential-backoff reconnect
-  - TUI — curses-based UI with multiple chat windows, userlist panel, 5 color themes, CJK-aware text wrapping             - EnsembleAIDetector — three-signal AI text detector: Binoculars (GPT-2/distilGPT-2 perplexity ratio) + RoBERTa
-  classifier + heuristics (formality, AI tell-phrases, em-dashes)
-  - ScoringEngine — wraps the detector for per-message and per-user rolling scores
-  - ChatWindow / UserState — window buffers and per-nick state with O(1) incremental stats
+It uses asyncio for non-blocking network operations and curses for a dynamic, terminal-based user interface (TUI).
 
-  Key features:
-  - /askai [opus|sonnet|haiku] <question> — queries Claude API, displays in *dashboard*
-  - Auto-translate CJK messages via Google Translate free endpoint (LRU-cached, semaphore-limited)
-  - Persistent JSONL AI score log + per-channel chat logs, with session/gap tracking
-  - /ai <nick> — full AI profiling dashboard with per-session breakdown and sparklines
-  - Tab nick completion, input history, Emacs-style editing keys (Ctrl+A/E/K/U/W/B/F)
-  - Auto-installs missing pip packages on first run
- ---
-  /commands Reference
+Here is a summary of its core components and functionalities:
 
-  Messaging
+🌐 Core Architecture
+Networking: Built on Python's asyncio to handle concurrent connections, reading IRC traffic, and sending commands without blocking the user interface. It includes robust flood control mechanisms (a token-bucket system) to prevent the client from being kicked by IRC servers due to excessive sending.
+User State Management: Maintains detailed state for every connected user (UserState), tracking message counts, message lengths, message intervals, and a rolling AI score.
+Persistence: Logs all messages, user activity, and AI detection results to a JSONL file (ai_score.log) for historical analysis.
+UI: Uses the curses library to render a multi-window, color-themed interface, providing a chat area, a user list, a status dashboard, and an input prompt.
+🤖 AI Detection and Scoring (The "Eyearesee" Feature)
+The central innovation of this client is its ability to detect and score AI-generated text in real-time.
 
-  ┌─────────────────────────┬────────────────────────────────────────────────────────────────┐
-  │         Command         │                          What it does                          │
-  ├─────────────────────────┼────────────────────────────────────────────────────────────────┤
-  │ /msg <nick> <text>      │ Send a private message; opens and switches to the DM window    │
-  ├─────────────────────────┼────────────────────────────────────────────────────────────────┤
-  │ /query <nick> [message] │ Open a DM window with nick; optionally send a first message    │
-  ├─────────────────────────┼────────────────────────────────────────────────────────────────┤
-  │ /notice <nick> <text>   │ Send a notice (appears as -nick- in their client, not in chat) │
-  ├─────────────────────────┼────────────────────────────────────────────────────────────────┤
-  │ /me <text>              │ Send an action line (* nick waves)                             │
-  └─────────────────────────┴────────────────────────────────────────────────────────────────┘
+Ensemble Detection: It employs a multi-model approach:
+Primary Classifier: A RoBERTa model trained on ChatGPT/GPT-4 output (Hello-SimpleAI/chatgpt-detector-roberta).
+Secondary Classifier: A general RoBERTa model trained on GPT-2 outputs, which helps detect fluency across various open-source LLMs (Llama, Mistral, etc.).
+Heuristics: It combines machine learning results with traditional text analysis (e.g., checking for formal vocabulary, repetition, bot-opener phrases, and structural patterns like numbered lists).
+Detailed Scoring: For every message, it calculates a detailed breakdown:
+prob: The final ensemble score (0–1), indicating the likelihood of the text being AI-generated.
+heu, llama, bino, cls: Sub-scores showing how much the text aligns with specific AI detection patterns.
+AI Profile (/ai command): Allows users to view a detailed profile for any nick, showing:
+Rolling AI likelihood (trend and standard deviation).
+Message statistics (total count, average length, messages per minute).
+Session trend analysis.
+Historical performance (all-time scores, peak/low scores).
+Logging Toggle: Users can enable or disable AI detection logging to the disk.
+💬 Translation and Text Handling
+Auto-Translation: Automatically detects CJK (Chinese/Japanese, etc.) messages and attempts to translate them to English using the Google Translate API.
+Caching: The translation feature uses an LRU cache to prevent repeated network calls for common phrases.
+Formatting: It correctly handles and strips IRC inline formatting codes (\x03, \x02, etc.) before processing text, ensuring the AI models receive clean input.
+🖥️ User Interface (TUI) Features
+The TUI is highly functional and customizable:
 
-  Channels
-
-  ┌──────────────────────────────┬─────────────────────────────────────────────────────────────┐
-  │           Command            │                        What it does                         │
-  ├──────────────────────────────┼─────────────────────────────────────────────────────────────┤
-  │ /join <channel>              │ Join a channel (prefix # is added automatically if omitted) │
-  ├──────────────────────────────┼─────────────────────────────────────────────────────────────┤
-  │ /part [channel] [msg]        │ Leave a channel with an optional part message               │
-  ├──────────────────────────────┼─────────────────────────────────────────────────────────────┤
-  │ /topic <channel> [text]      │ View or set the channel topic                               │
-  ├──────────────────────────────┼─────────────────────────────────────────────────────────────┤
-  │ /names [channel]             │ List users currently in the channel                         │
-  ├──────────────────────────────┼─────────────────────────────────────────────────────────────┤
-  │ /kick <chan> <nick> [reason] │ Kick a user from the channel                                │
-  ├──────────────────────────────┼─────────────────────────────────────────────────────────────┤
-  │ /invite <nick> [channel]     │ Invite a user to a channel                                  │
-  ├──────────────────────────────┼─────────────────────────────────────────────────────────────┤
-  │ /mode <target> [modes]       │ Get or set channel/user modes                               │
-  └──────────────────────────────┴─────────────────────────────────────────────────────────────┘
-
-  Operator
-
-  ┌──────────────────┬──────────────────────────────────────────────────┐
-  │     Command      │                   What it does                   │
-  ├──────────────────┼──────────────────────────────────────────────────┤
-  │ /op <nick>       │ Grant operator status (+o)                       │
-  ├──────────────────┼──────────────────────────────────────────────────┤
-  │ /deop <nick>     │ Remove operator status (-o)                      │
-  ├──────────────────┼──────────────────────────────────────────────────┤
-  │ /voice <nick>    │ Grant voice (+v)                                 │
-  ├──────────────────┼──────────────────────────────────────────────────┤
-  │ /devoice <nick>  │ Remove voice (-v)                                │
-  ├──────────────────┼──────────────────────────────────────────────────┤
-  │ /hop <nick>      │ Grant half-op (+h)                               │
-  ├──────────────────┼──────────────────────────────────────────────────┤
-  │ /dehop <nick>    │ Remove half-op (-h)                              │
-  ├──────────────────┼──────────────────────────────────────────────────┤
-  │ /ban <nick|mask> │ Ban; bare nick expands to nick!*@* automatically │
-  ├──────────────────┼──────────────────────────────────────────────────┤
-  │ /unban <mask>    │ Remove a ban mask                                │
-  └──────────────────┴──────────────────────────────────────────────────┘
-
-  Users & Status
-
-  ┌──────────────────┬───────────────────────────────────────┐
-  │     Command      │             What it does              │
-  ├──────────────────┼───────────────────────────────────────┤
-  │ /nick <newnick>  │ Change your nickname                  │
-  ├──────────────────┼───────────────────────────────────────┤
-  │ /whois <nick>    │ Look up information on a user         │
-  ├──────────────────┼───────────────────────────────────────┤
-  │ /whowas <nick>   │ Info on a recently disconnected user  │
-  ├──────────────────┼───────────────────────────────────────┤
-  │ /who <target>    │ List users matching a pattern         │
-  ├──────────────────┼───────────────────────────────────────┤
-  │ /ignore <nick>   │ Suppress all messages from nick       │
-  ├──────────────────┼───────────────────────────────────────┤
-  │ /unignore <nick> │ Stop ignoring nick                    │
-  ├──────────────────┼───────────────────────────────────────┤
-  │ /away [message]  │ Set away status with optional message │
-  ├──────────────────┼───────────────────────────────────────┤
-  │ /back            │ Remove away status                    │
-  └──────────────────┴───────────────────────────────────────┘
-
-  Services & CTCP
-
-  ┌───────────────────────────┬───────────────────────────────────────────────────┐
-  │          Command          │                   What it does                    │
-  ├───────────────────────────┼───────────────────────────────────────────────────┤
-  │ /ns <command>             │ Send command to NickServ (e.g. /ns identify pass) │
-  ├───────────────────────────┼───────────────────────────────────────────────────┤
-  │ /cs <command>             │ Send command to ChanServ                          │
-  ├───────────────────────────┼───────────────────────────────────────────────────┤
-  │ /ctcp <nick> <cmd> [args] │ Send a CTCP request (PING, VERSION, TIME, etc.)   │
-  └───────────────────────────┴───────────────────────────────────────────────────┘
-
-  AI Detection
-
-  ┌────────────┬───────────────────────────────────────────────────────────────────────────────────────────────┐
-  │  Command   │                                         What it does                                          │
-  ├────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
-  │ /ai <nick> │ Full AI-detection profile: rolling score, peak/low, per-session breakdown, sparkline, verdict │
-  ├────────────┼───────────────────────────────────────────────────────────────────────────────────────────────┤
-  │ /aitoggle  │ Enable or disable AI scoring entirely                                                         │
-  └────────────┴───────────────────────────────────────────────────────────────────────────────────────────────┘
-
-  Claude Integration
-
-  ┌───────────────────────────────────────┬─────────────────────────────────────────────────────────────┐
-  │                Command                │                        What it does                         │
-  ├───────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
-  │ /askai [opus|sonnet|haiku] <question> │ Ask Claude a question; answer shown in the dashboard window │
-  ├───────────────────────────────────────┼─────────────────────────────────────────────────────────────┤
-  │ /model <opus|sonnet|haiku>            │ Set the default Claude model used by /askai                 │
-  └───────────────────────────────────────┴─────────────────────────────────────────────────────────────┘
-
-  Translation
-
-  ┌────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │    Command     │                                               What it does                                               │
-  ├────────────────┼──────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-  │ /autotranslate │ Toggle auto CJK→English translation (on by default); translated lines appear indented below the original │
-  └────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-  Connection
-
-  ┌──────────────────────────────┬────────────────────────────────────────────────────────────────────┐
-  │           Command            │                            What it does                            │
-  ├──────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-  │ /server <host> [port] [nick] │ Connect to a different IRC server over SSL (port defaults to 6697) │
-  ├──────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-  │ /reconnect                   │ Drop and re-establish the current connection                       │
-  └──────────────────────────────┴────────────────────────────────────────────────────────────────────┘
-
-  Interface
-
-  ┌─────────────────┬─────────────────────────────────────────────────────────────────────┐
-  │     Command     │                            What it does                             │
-  ├─────────────────┼─────────────────────────────────────────────────────────────────────┤
-  │ /theme <1-5>    │ Switch colour theme: 1 Classic, 2 Hacker, 3 Ocean, 4 Sunset, 5 Neon │
-  ├─────────────────┼─────────────────────────────────────────────────────────────────────┤
-  │ /win <n>        │ Switch to window number n (also shown in the tab bar)               │
-  ├─────────────────┼─────────────────────────────────────────────────────────────────────┤
-  │ /clear          │ Clear messages in the current window                                │
-  ├─────────────────┼─────────────────────────────────────────────────────────────────────┤
-  │ /close (or /wc) │ Close the current chat window and return to the previous one        │
-  └─────────────────┴─────────────────────────────────────────────────────────────────────┘
-
-  General
-
-  ┌─────────────────┬──────────────────────────────────────┐
-  │     Command     │             What it does             │
-  ├─────────────────┼──────────────────────────────────────┤
-  │ /quit [message] │ Send quit message to server and exit │
-  ├─────────────────┼──────────────────────────────────────┤
-  │ /help           │ Brief one-line command reference     │
-  ├─────────────────┼──────────────────────────────────────┤
-  │ /commands       │ Full command list (this output)      │
-  └─────────────────┴──────────────────────────────────────┘
-
-  ---
-  Keyboard shortcuts: Ctrl+N next window · Tab nick completion · ↑/↓ scroll history · PgUp/PgDn scroll chat · Ctrl+A/E line start/end · Ctrl+K kill to end · Ctrl+U clear line · Ctrl+W delete word · Ctrl+B/]/_
-  bold/italic/underline · Ctrl+O reset formatting
+Multi-Window Support: Features dedicated windows for:
+Chat messages (the main view).
+User list (with AI suspect badges).
+Status/Dashboard (for AI profiles and system messages).
+Input line (with advanced editing).
+Dynamic Theming: Supports 5 built-in color themes (e.g., Classic, Hacker, Ocean) that change the terminal appearance instantly.
+Input Editing: Implements advanced terminal controls (via curses key bindings):
+Word Completion: Suggests matching nicknames as the user types.
+History Navigation: Allows moving up/down through recent input lines.
+Formatting: Supports bold, italic, underline, and reset formatting using standard terminal shortcuts (Ctrl+B/Ctrl+O, etc.).
+Command Palette: Provides a comprehensive command list (/help) for all IRC functions, including user management, channel operations, services, and AI features.
+🛠️ IRC Client Features
+Connection Management: Supports connecting to servers via SSL/TLS (default port 6697).
+Authentication: Implements standard IRC authentication methods (NICK, USER, CAP, AUTHENTICATE PLAIN).
+Channel Management: Handles JOIN, PART, KICK, INVITE, and topic settings.
+Control Replies (CTCP): Supports sending control commands like PING, VERSION, TIME, and CLIENTINFO.
+Nickname Collision Handling: Includes logic to handle 433 errors by automatically appending an underscore and attempting to reclaim the desired nickname.
+Summary in a Nutshell
+The eyearesee.py client is a premium, feature-packed IRC client designed not just for communication but also for community moderation and analysis. It provides a highly interactive terminal experience while offering cutting-edge AI detection to flag potentially automated or suspicious behavior, all within a clean, multi-pane interface.
