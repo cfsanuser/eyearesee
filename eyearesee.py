@@ -36,6 +36,16 @@ except ImportError:
     ANTHROPIC_AVAILABLE = False
 
 # =========================
+# OpenAI (optional)
+# =========================
+try:
+    import openai as _openai_mod
+    OPENAI_AVAILABLE = True
+except ImportError:
+    _openai_mod = None  # type: ignore
+    OPENAI_AVAILABLE = False
+
+# =========================
 # Curses (Windows-aware)
 # =========================
 try:
@@ -91,14 +101,34 @@ INPUT_HISTORY_MAX  = 500
 CHAT_LOG_DIR       = "chat_logs"
 CHAT_LOG_LOAD      = 100
 
-# Claude API
-ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_MODELS: Dict[str, str] = {
-    "opus":    "claude-opus-4-6",
-    "sonnet":  "claude-sonnet-4-6",
-    "haiku":   "claude-haiku-4-5-20251001",
+# AI provider keys
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
+# Ollama: local/offline LLM server.  Override with OLLAMA_URL env var if running elsewhere.
+OLLAMA_URL: str   = os.environ.get("OLLAMA_URL", "http://127.0.0.1:8033")
+
+# Unified model registry — key is the short name used in /askai, /summarize, /model.
+# Each entry: provider ("claude"|"openai"|"ollama"), api model id, human label.
+# Ollama models require `ollama serve` running locally; no API key needed.
+# Pull models with e.g.:  ollama pull gemma3:4b   or   ollama pull llama3.2
+AI_MODELS: Dict[str, Dict[str, str]] = {
+    # ── Cloud: Anthropic Claude ───────────────────────────────────────────
+    "opus":    {"provider": "claude", "id": "claude-opus-4-6",            "label": "Claude Opus 4"},
+    "sonnet":  {"provider": "claude", "id": "claude-sonnet-4-6",          "label": "Claude Sonnet 4"},
+    "haiku":   {"provider": "claude", "id": "claude-haiku-4-5-20251001",  "label": "Claude Haiku 4"},
+    # ── Cloud: OpenAI GPT ─────────────────────────────────────────────────
+    "gpt4o":   {"provider": "openai", "id": "gpt-4o",                     "label": "GPT-4o"},
+    "gpt4":    {"provider": "openai", "id": "gpt-4-turbo",                "label": "GPT-4 Turbo"},
+    "gpt35":   {"provider": "openai", "id": "gpt-3.5-turbo",              "label": "GPT-3.5 Turbo"},
+    # ── Local/offline: Ollama ─────────────────────────────────────────────
+    "gemma":   {"provider": "ollama", "id": "gemma3:4b",   "label": "Gemma 3 4B   (Ollama/offline)"},
+    "llama3":  {"provider": "ollama", "id": "llama3.2",    "label": "Llama 3.2    (Ollama/offline)"},
 }
-CLAUDE_DEFAULT_MODEL = "sonnet"   # key into CLAUDE_MODELS
+# Keep CLAUDE_MODELS as a filtered view so existing internal references still work.
+CLAUDE_MODELS: Dict[str, str] = {
+    k: v["id"] for k, v in AI_MODELS.items() if v["provider"] == "claude"
+}
+CLAUDE_DEFAULT_MODEL = "sonnet"   # default model key
 
 # 5 built-in UI colour themes
 # Each row: (name, pair1_fg, pair1_bg, pair2_fg, pair2_bg, pair3_fg, pair3_bg, pair8_fg, pair8_bg)
@@ -937,6 +967,46 @@ _BOT_OPENER_RE = re.compile(
 _LLAMA_STRUCT_RE = re.compile(
     r"(?m)^(?:\s*\d+[.)]\s+\S|\s*[-*•]\s+\S|\s*#{1,3}\s+\S|```)",
 )
+
+# =========================
+# Ollama local-model helper
+# =========================
+def _ollama_blocking_call(model_id: str, prompt: str, max_tokens: int) -> Tuple[str, str]:
+    """Synchronous HTTP call to a local Ollama server (run via asyncio executor).
+
+    Uses only stdlib urllib so no extra package is required.
+    Requires `ollama serve` running at OLLAMA_URL (default http://localhost:11434).
+    Pull models first with e.g.: ollama pull gemma3:4b
+    """
+    body = json.dumps({
+        "model":   model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream":  False,
+        "options": {"num_predict": max_tokens},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        answer = data.get("message", {}).get("content", "(empty response)")
+        eval_c   = data.get("eval_count")
+        prompt_c = data.get("prompt_eval_count", 0)
+        tokens   = str(eval_c + prompt_c) if isinstance(eval_c, int) else "?"
+        return answer, tokens
+    except urllib.error.URLError as exc:
+        return (
+            f"[error] Ollama unreachable at {OLLAMA_URL} — "
+            f"start it with: ollama serve  (then: ollama pull {model_id})\n"
+            f"Detail: {exc}"
+        ), "?"
+    except Exception as exc:
+        return f"[error] Ollama call failed: {exc}", "?"
+
 
 class EnsembleAIDetector:
     _CACHE_MAX = 512  # LRU-style prediction cache (bots repeat themselves)
@@ -2715,37 +2785,101 @@ class TUI:
         self._chat_dirty            = True
         self.dirty                  = True
 
+    async def _call_ai(self, prompt: str, model_key: str,
+                       max_tokens: int = 1024) -> Tuple[str, str]:
+        """Send *prompt* to the AI provider for *model_key*.
+
+        Returns (answer_text, tokens_str).  On any error the answer starts
+        with "[error]" so the caller can display it as-is.
+
+        model_key may be:
+          • a key from AI_MODELS ("gemma", "sonnet", "gpt4o", …)
+          • "ollama:<model-id>" for any Ollama model not pre-registered
+            e.g. "ollama:gemma3:4b", "ollama:llama3.2", "ollama:mistral"
+        """
+        # Dynamic Ollama syntax: "ollama:<modelname>"
+        if model_key.startswith("ollama:"):
+            provider = "ollama"
+            model_id = model_key[len("ollama:"):]
+        else:
+            spec = AI_MODELS.get(model_key)
+            if not spec:
+                return f"[error] unknown model key '{model_key}'", "?"
+            provider = spec["provider"]
+            model_id = spec["id"]
+
+        if provider == "claude":
+            if not ANTHROPIC_AVAILABLE:
+                return ("[error] anthropic package not installed — "
+                        "run: pip install anthropic"), "?"
+            if not ANTHROPIC_API_KEY:
+                return ("[error] ANTHROPIC_API_KEY not set — "
+                        "set the environment variable and restart"), "?"
+            try:
+                ac  = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+                msg = await ac.messages.create(
+                    model=model_id, max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                answer = msg.content[0].text if msg.content else "(empty response)"
+                usage  = getattr(msg, "usage", None)
+                tokens = str(usage.input_tokens + usage.output_tokens) if usage else "?"
+                return answer, tokens
+            except Exception as exc:
+                return f"[error] {exc}", "?"
+
+        if provider == "openai":
+            if not OPENAI_AVAILABLE:
+                return ("[error] openai package not installed — "
+                        "run: pip install openai"), "?"
+            if not OPENAI_API_KEY:
+                return ("[error] OPENAI_API_KEY not set — "
+                        "set the environment variable and restart"), "?"
+            try:
+                oc   = _openai_mod.AsyncOpenAI(api_key=OPENAI_API_KEY)
+                resp = await oc.chat.completions.create(
+                    model=model_id, max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                answer = (resp.choices[0].message.content
+                          if resp.choices else "(empty response)")
+                usage  = getattr(resp, "usage", None)
+                tokens = str(usage.total_tokens) if usage else "?"
+                return answer, tokens
+            except Exception as exc:
+                return f"[error] {exc}", "?"
+
+        if provider == "ollama":
+            # Ollama is local/offline — no API key, just needs `ollama serve` running.
+            # The HTTP call is synchronous so we offload it to a thread executor.
+            loop   = asyncio.get_event_loop()
+            answer, tokens = await loop.run_in_executor(
+                None, _ollama_blocking_call, model_id, prompt, max_tokens
+            )
+            return answer, tokens
+
+        return f"[error] unknown provider '{provider}'", "?"
+
     async def _do_askai(self, question: str, model_key: str) -> None:
-        """Call the Claude API and post the Q+A to the *dashboard* window."""
-        if not ANTHROPIC_AVAILABLE:
-            await self.ui_queue.put(("status",
-                "anthropic package not installed — run: pip install anthropic"))
-            return
-        if not ANTHROPIC_API_KEY:
-            await self.ui_queue.put(("status",
-                "ANTHROPIC_API_KEY not set — set the environment variable and restart"))
-            return
+        """Call the configured AI and post the Q+A to the *dashboard* window."""
         if self._askai_pending:
             await self.ui_queue.put(("status", "/askai already in progress, please wait…"))
             return
 
-        model_id = CLAUDE_MODELS.get(model_key, CLAUDE_MODELS[CLAUDE_DEFAULT_MODEL])
+        if model_key.startswith("ollama:"):
+            model_id = model_key[len("ollama:"):]
+            label    = f"Ollama/{model_id}"
+        else:
+            spec     = AI_MODELS.get(model_key) or AI_MODELS[CLAUDE_DEFAULT_MODEL]
+            model_id = spec["id"]
+            label    = spec["label"]
         self._askai_pending = True
         await self.ui_queue.put(("status",
             f"[askai] querying {model_key} ({model_id})…"))
 
-        msg    = None   # must be initialised before the try so the finally block
-        answer = ""     # and the render block below can always reference both
+        answer, tokens = "", "?"
         try:
-            client = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-            msg = await client.messages.create(
-                model=model_id,
-                max_tokens=1024,
-                messages=[{"role": "user", "content": question}],
-            )
-            answer = msg.content[0].text if msg.content else "(empty response)"
-        except Exception as exc:
-            answer = f"[error] {exc}"
+            answer, tokens = await self._call_ai(question, model_key, max_tokens=1024)
         finally:
             self._askai_pending = False
 
@@ -2754,7 +2888,7 @@ class TUI:
         dash._wrap_dirty = True
         L = lambda t: dash.add_line(t, timestamp=False)
 
-        L(f"=== /askai [{model_key}] ===")
+        L(f"=== /askai [{model_key}  {label}] ===")
         L("")
         L(f"Q: {question}")
         L("")
@@ -2762,9 +2896,7 @@ class TUI:
         for raw_line in answer.splitlines():
             L(f"  {raw_line}" if raw_line.strip() else "")
         L("")
-        _usage  = getattr(msg, "usage", None)
-        _tokens = (_usage.input_tokens + _usage.output_tokens) if _usage else "?"
-        L(f"  model: {model_id}  tokens used: {_tokens}")
+        L(f"  model: {model_id}  tokens used: {tokens}")
 
         self.current_window_index = 1   # switch to *dashboard*
         self._chat_dirty = True
@@ -3395,7 +3527,9 @@ class TUI:
         h["reconnect"]  = self._slash_reconnect
         h["theme"]      = self._slash_theme
         h["askai"]      = self._slash_askai
+        h["summarize"] = h["summarise"] = h["summerize"] = self._slash_summarize
         h["model"]      = self._slash_model
+        h["api"]        = self._slash_api
         h["autotranslate"] = self._slash_autotranslate
         h["commands"]   = self._slash_commands
         h["help"]       = self._slash_help
@@ -3772,11 +3906,14 @@ class TUI:
     async def _slash_askai(self, args, extra, line):
         rest = line[len("/askai"):].strip()
         if not rest:
-            await self.ui_queue.put(("status", "Usage: /askai [opus|sonnet|haiku] <question>"))
+            keys = " | ".join(AI_MODELS)
+            await self.ui_queue.put(("status",
+                f"Usage: /askai [model] <question>   models: {keys}"))
             return
         first_word, *remainder = rest.split(maxsplit=1)
-        if first_word.lower() in CLAUDE_MODELS:
-            model_key = first_word.lower()
+        fw = first_word.lower()
+        if fw in AI_MODELS or fw.startswith("ollama:"):
+            model_key = fw
             question  = remainder[0] if remainder else ""
         else:
             model_key = self.ai_chat_model
@@ -3784,17 +3921,178 @@ class TUI:
         if question:
             asyncio.create_task(self._do_askai(question, model_key))
         else:
-            await self.ui_queue.put(("status", "Usage: /askai [opus|sonnet|haiku] <question>"))
+            keys = " | ".join(AI_MODELS)
+            await self.ui_queue.put(("status",
+                f"Usage: /askai [model] <question>   models: {keys}"
+                f"   or ollama:<model-name> for any local Ollama model"))
+
+    async def _slash_summarize(self, args, extra, line) -> None:
+        """Summarize recent messages in the current window using any configured AI.
+
+        Usage: /summarize [n] [model]
+          n      – number of most-recent messages to include (default 50, max 200)
+          model  – any key from /model  (e.g. sonnet, gpt4o)
+        """
+        if self._askai_pending:
+            await self.ui_queue.put(("status", "/summarize already in progress, please wait…"))
+            return
+
+        # Parse positional args: integer → n, known model key or ollama:* → model
+        n_msgs    = 50
+        model_key = self.ai_chat_model
+        for token in args.split():
+            if token.isdigit():
+                n_msgs = max(5, min(200, int(token)))
+            elif token.lower() in AI_MODELS or token.lower().startswith("ollama:"):
+                model_key = token.lower()
+
+        win = self.get_current_window()
+        if win.name in ("*status*", "*dashboard*"):
+            await self.ui_queue.put(("status",
+                "/summarize: switch to a channel or DM window first"))
+            return
+
+        raw_lines = list(win.lines)[-n_msgs:]
+        if not raw_lines:
+            await self.ui_queue.put(("status", "/summarize: no messages in this window"))
+            return
+
+        _TS_RE     = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+        transcript = "\n".join(
+            irc_strip_formatting(_TS_RE.sub("", ln)) for ln in raw_lines
+        )
+
+        if model_key.startswith("ollama:"):
+            model_id = model_key[len("ollama:"):]
+            label    = f"Ollama/{model_id}"
+        else:
+            spec     = AI_MODELS.get(model_key) or AI_MODELS[CLAUDE_DEFAULT_MODEL]
+            model_id = spec["id"]
+            label    = spec["label"]
+
+        prompt = (
+            f"The following is a transcript of an IRC chat in \"{win.name}\" "
+            f"(last {len(raw_lines)} messages).\n\n"
+            f"Please provide a concise summary: main topics, key points, any decisions "
+            f"or conclusions, and notable participants. Keep it under 200 words.\n\n"
+            f"Transcript:\n{transcript}"
+        )
+
+        self._askai_pending = True
+        await self.ui_queue.put(("status",
+            f"[summarize] {len(raw_lines)} msgs from {win.name} via "
+            f"{model_key} ({label})…"))
+
+        answer, tokens = "", "?"
+        try:
+            answer, tokens = await self._call_ai(prompt, model_key, max_tokens=512)
+        finally:
+            self._askai_pending = False
+
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+
+        L(f"=== /summarize  [{win.name}]  last {len(raw_lines)} msgs"
+          f"  [{model_key}  {spec['label']}] ===")
+        L("")
+        for raw_line in answer.splitlines():
+            L(f"  {raw_line}" if raw_line.strip() else "")
+        L("")
+        L(f"  model: {model_id}  tokens used: {tokens}")
+
+        self.current_window_index = 1
+        self._chat_dirty = True
+        self._dashboard_dirty = False
+        self._dashboard_last_update = time.time()
+        self._dashboard_mode = "profile"
+        self.dirty = True
 
     async def _slash_model(self, args, extra, line):
-        if args.lower() in CLAUDE_MODELS:
-            self.ai_chat_model = args.lower()
+        key = args.strip().lower()
+        if not key:
+            # List every available model with its provider
+            sw = self._status_win()
+            sw.add_line("Available AI models for /askai and /summarize:")
+            for k, spec in AI_MODELS.items():
+                marker = "→" if k == self.ai_chat_model else " "
+                avail  = ""
+                if spec["provider"] == "claude" and not ANTHROPIC_API_KEY:
+                    avail = "  (ANTHROPIC_API_KEY not set)"
+                elif spec["provider"] == "openai" and not OPENAI_API_KEY:
+                    avail = "  (OPENAI_API_KEY not set)"
+                sw.add_line(f"  {marker} {k:<8} {spec['label']:<22} [{spec['provider']}]{avail}")
+            sw.add_line(f"  Usage: /model <key>   current: {self.ai_chat_model}")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+        if key in AI_MODELS:
+            self.ai_chat_model = key
+            spec = AI_MODELS[key]
             await self.ui_queue.put(("status",
-                f"Claude model set to {self.ai_chat_model} ({CLAUDE_MODELS[self.ai_chat_model]})"))
+                f"AI model set to {key}  ({spec['label']}  {spec['id']})  [{spec['provider']}]"))
         else:
-            keys = "/".join(CLAUDE_MODELS)
+            keys = "  ".join(AI_MODELS)
             await self.ui_queue.put(("status",
-                f"Unknown model '{args}'. Choose: {keys}  (current: {self.ai_chat_model})"))
+                f"Unknown model '{key}'. Available: {keys}  (current: {self.ai_chat_model})"))
+
+    async def _slash_api(self, args, extra, line):
+        global ANTHROPIC_API_KEY, OPENAI_API_KEY, OLLAMA_URL
+        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OLLAMA_URL"}
+
+        if not args:
+            sw = self._status_win()
+            sw.add_line("")
+            sw.add_line("  ── AI Provider Keys " + "─" * 44)
+
+            def _mask(val: str) -> str:
+                if not val:
+                    return "NOT SET"
+                if len(val) <= 8:
+                    return val[:2] + "****"
+                return val[:8] + "\u2026" + val[-4:]
+
+            rows = [
+                ("Claude", "ANTHROPIC_API_KEY", ANTHROPIC_API_KEY, "console.anthropic.com"),
+                ("OpenAI", "OPENAI_API_KEY",    OPENAI_API_KEY,    "platform.openai.com"),
+                ("Ollama", "OLLAMA_URL",         OLLAMA_URL,        "local server — no key needed"),
+            ]
+            for provider, varname, val, note in rows:
+                sw.add_line(f"  {provider:<8}  {varname:<22}  {_mask(val):<32}  ({note})")
+
+            sw.add_line("")
+            sw.add_line("  Set a key:  /api <VAR_NAME> <value>")
+            sw.add_line("    /api ANTHROPIC_API_KEY  sk-ant-api03-...")
+            sw.add_line("    /api OPENAI_API_KEY     sk-proj-...")
+            sw.add_line("    /api OLLAMA_URL         http://192.168.1.10:11434")
+            sw.add_line("")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if args.upper() in _KNOWN:
+            var_name = args.upper()
+            value = extra.strip()
+            if not value:
+                await self.ui_queue.put(("status", f"Usage: /api {var_name} <value>"))
+                return
+            os.environ[var_name] = value
+            if var_name == "ANTHROPIC_API_KEY":
+                ANTHROPIC_API_KEY = value
+            elif var_name == "OPENAI_API_KEY":
+                OPENAI_API_KEY = value
+                if _openai_mod is not None:
+                    _openai_mod.api_key = value
+            elif var_name == "OLLAMA_URL":
+                OLLAMA_URL = value
+            masked = (value[:8] + "\u2026" + value[-4:]) if len(value) > 12 else (value[:4] + "****")
+            await self.ui_queue.put(("status",
+                f"Set {var_name} = {masked}  (active immediately)"))
+            return
+
+        await self.ui_queue.put(("status",
+            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  OLLAMA_URL"))
 
     async def _slash_autotranslate(self, args, extra, line):
         self.auto_translate = not self.auto_translate
@@ -3856,10 +4154,14 @@ class TUI:
         _E("/aitoggle",                     "Enable or disable AI scoring (detection)")
         _E("/logtoggle",                    "Enable or disable AI detection logging to disk (default: on)")
         _C("")
-        _H("Claude Integration")
-        _E("/askai [opus|sonnet|haiku] <q>","Ask Claude a question; answer shown in dashboard")
-        _E("/model <opus|sonnet|haiku>",    "Set the default Claude model for /askai")
-        _C(f"  Current model: {self.ai_chat_model}  ({CLAUDE_MODELS.get(self.ai_chat_model, '?')})")
+        _H("AI Integration  (Claude + OpenAI + Ollama)")
+        _E("/askai [model] <question>",   "Ask AI a question; answer shown in dashboard")
+        _E("/summarize [n] [model]",      "Summarize last n msgs in current window (default 50)")
+        _E("/model [key]",                "Set/list AI models: opus sonnet haiku gpt4o gpt4 gpt35")
+        _E("/api",                        "Show AI provider key status (Claude/OpenAI/Ollama)")
+        _E("/api <VAR_NAME> <value>",     "Set an API key in environment: ANTHROPIC_API_KEY OPENAI_API_KEY OLLAMA_URL")
+        _spec = AI_MODELS.get(self.ai_chat_model, {})
+        _C(f"  Current model: {self.ai_chat_model}  ({_spec.get('label','?')}  [{_spec.get('provider','?')}])")
         _C("")
         _H("Translation")
         _E("/autotranslate",               "Toggle auto CJK → English translation (on by default)")
@@ -3907,9 +4209,10 @@ class TUI:
             "── AI Detection ──────────────────────────────────────────",
             "  /ai <nick>  full profile    /aitoggle  enable/disable scoring",
             "  /logtoggle  toggle logging to disk (on by default)",
-            "── Claude ────────────────────────────────────────────────",
-            "  /askai [opus|sonnet|haiku] <question>  (answer in dashboard)",
-            "  /model <opus|sonnet|haiku>  set default model",
+            "── AI  (Claude / OpenAI) ─────────────────────────────────",
+            "  /askai [model] <question>  (answer in dashboard)",
+            "  /summarize [n] [model]  summarize last n msgs (default 50)",
+            "  /model [key]  set/list model  (opus sonnet haiku gpt4o gpt4 gpt35)",
             "── Translation ───────────────────────────────────────────",
             "  /autotranslate  toggle CJK → English (default: on)",
             "── Connection ─────────────────────────────────────────────",
@@ -4312,7 +4615,8 @@ def _ensure_deps() -> bool:
 
     # (import_name, pip_package_name, description_for_display)
     wanted: List[Tuple[str, str, str]] = [
-        ("anthropic",    "anthropic",      "Claude API client  (/askai)"),
+        ("anthropic",    "anthropic",      "Claude API client  (/askai, /summarize)"),
+        ("openai",       "openai",         "OpenAI API client  (/askai, /summarize with GPT models)"),
         ("transformers", "transformers",   "AI text detection  (HuggingFace)"),
         ("torch",        "torch",          "AI text detection  (PyTorch)"),
     ]
