@@ -4,6 +4,7 @@ import atexit
 import base64
 import getpass
 import importlib.util
+import logging
 import socket
 import subprocess
 import sys
@@ -983,27 +984,48 @@ class EnsembleAIDetector:
         self._obs_model.eval()
         print("OK")
 
-        print(f"AI detector: loading primary classifier ({self._CLS1_MODEL})...", end=" ", flush=True)
-        self._cls_tok = AutoTokenizer.from_pretrained(self._CLS1_MODEL)
-        self._cls_model = AutoModelForSequenceClassification.from_pretrained(
-            self._CLS1_MODEL).to(self._device)
-        self._cls_model.eval()
-        print("OK")
+        # Silence transformers' weight-mismatch logger during from_pretrained() calls.
+        # These models have benign pooler/head key mismatches that produce "IS NOT
+        # expected" / "unexpected keys" log lines at WARNING level — not actual errors.
+        _tf_logger = logging.getLogger("transformers")
+        _prev_tf_level = _tf_logger.level
+        _tf_logger.setLevel(logging.ERROR)
 
-        # Secondary classifier — optional; broadens coverage to Llama/open-source LLMs
-        print(f"AI detector: loading secondary classifier ({self._CLS2_MODEL})...", end=" ", flush=True)
         try:
-            self._cls2_tok = AutoTokenizer.from_pretrained(self._CLS2_MODEL)
-            self._cls2_model = AutoModelForSequenceClassification.from_pretrained(
-                self._CLS2_MODEL).to(self._device)
-            self._cls2_model.eval()
-            print("OK")
-        except Exception as _e:
-            self._cls2_tok   = None
-            self._cls2_model = None
-            print(f"skipped ({_e})")
+            print(f"AI detector: loading primary classifier ({self._CLS1_MODEL})...", end=" ", flush=True)
+            try:
+                self._cls_tok = AutoTokenizer.from_pretrained(self._CLS1_MODEL)
+                self._cls_model = AutoModelForSequenceClassification.from_pretrained(
+                    self._CLS1_MODEL,
+                    ignore_mismatched_sizes=True,
+                ).to(self._device)
+                self._cls_model.eval()
+                print("OK")
+            except Exception as _e:
+                self._cls_tok   = None
+                self._cls_model = None
+                print(f"skipped ({_e})")
 
-        loaded = ["Binoculars(gpt2+distilgpt2)", "RoBERTa(chatgpt)", "Llama-heuristics"]
+            # Secondary classifier — optional; broadens coverage to Llama/open-source LLMs
+            print(f"AI detector: loading secondary classifier ({self._CLS2_MODEL})...", end=" ", flush=True)
+            try:
+                self._cls2_tok = AutoTokenizer.from_pretrained(self._CLS2_MODEL)
+                self._cls2_model = AutoModelForSequenceClassification.from_pretrained(
+                    self._CLS2_MODEL,
+                    ignore_mismatched_sizes=True,
+                ).to(self._device)
+                self._cls2_model.eval()
+                print("OK")
+            except Exception as _e:
+                self._cls2_tok   = None
+                self._cls2_model = None
+                print(f"skipped ({_e})")
+        finally:
+            _tf_logger.setLevel(_prev_tf_level)
+
+        loaded = ["Binoculars(gpt2+distilgpt2)", "Llama-heuristics"]
+        if self._cls_model:
+            loaded.append("RoBERTa(chatgpt)")
         if self._cls2_model:
             loaded.append("RoBERTa(general)")
         print(f"AI detector ENABLED: {' + '.join(loaded)}  (device={self._device})")
@@ -1321,9 +1343,10 @@ class UserState:
         return (n / self._time_sum) * 60 if n and self._time_sum > 0 else 0.0
 
 class ChatWindow:
-    def __init__(self, name: str, is_channel: bool = True):
+    def __init__(self, name: str, is_channel: bool = True, server_id: str = ""):
         self.name = name
         self.is_channel = is_channel
+        self.server_id = server_id
         self.lines: deque = deque(maxlen=MAX_MESSAGES)
         self.wrapped_cache: List[str] = []
         self._wrap_dirty = True
@@ -1347,10 +1370,12 @@ _SSL_CTX.minimum_version = ssl.TLSVersion.TLSv1_2
 # IRCClient - FULL + CTCP
 # =========================
 class IRCClient:
-    def __init__(self, server: str, port: int, nick: str, ui_queue: asyncio.Queue, scoring_engine: ScoringEngine):
+    def __init__(self, server: str, port: int, nick: str, ui_queue: asyncio.Queue,
+                 scoring_engine: ScoringEngine, use_ssl: bool = True):
         self.server = server
         self.port = port
         self.nick = nick
+        self.use_ssl = use_ssl
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
         self.ui_queue = ui_queue
@@ -1382,15 +1407,22 @@ class IRCClient:
         self._irc_handlers: dict = {}
         self._build_irc_handlers()
 
+    @property
+    def server_id(self) -> str:
+        return f"{self.server}:{self.port}"
+
     async def connect(self) -> None:
-        await self.ui_queue.put(("status", f"Connecting to {self.server}:{self.port}..."))
+        proto = "SSL" if self.use_ssl else "plain"
+        await self.ui_queue.put(("status", f"Connecting to {self.server}:{self.port} ({proto})..."))
         try:
             # 30-second connect timeout prevents hangs on unreachable hosts.
             # limit=2^20 (1 MiB) sets the StreamReader internal buffer; the default
             # 64 KB can stall on fast servers that send large NAMES / MOTD bursts.
             self.reader, self.writer = await asyncio.wait_for(
                 asyncio.open_connection(
-                    self.server, self.port, ssl=_SSL_CTX, limit=2 ** 20),
+                    self.server, self.port,
+                    ssl=_SSL_CTX if self.use_ssl else None,
+                    limit=2 ** 20),
                 timeout=30.0,
             )
         except asyncio.TimeoutError:
@@ -1416,7 +1448,8 @@ class IRCClient:
                     raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
             except Exception:
                 pass  # socket options are best-effort
-        await self.ui_queue.put(("status", "SSL connection established"))
+        conn_label = "SSL connection" if self.use_ssl else "Connection"
+        await self.ui_queue.put(("status", f"{conn_label} established to {self.server}:{self.port}"))
         # Flush any stale messages queued from a previous (failed) connection
         # so they are not replayed on the new session.
         while not self._send_queue.empty():
@@ -2188,6 +2221,23 @@ class IRCClient:
             u_state.record_message(msg, 0)
 
 # =========================
+# Per-server state container
+# =========================
+class ServerContext:
+    """Holds all state that is scoped to a single IRC server connection."""
+    __slots__ = ("server_id", "client", "channel_users", "user_scores",
+                 "user_ai_scores", "_suspect_nicks", "_sorted_users")
+
+    def __init__(self, server_id: str, client: "IRCClient") -> None:
+        self.server_id       = server_id
+        self.client          = client
+        self.channel_users:  Dict[str, set]      = {}
+        self.user_scores:    Dict[str, int]       = {}
+        self.user_ai_scores: Dict[str, int]       = {}
+        self._suspect_nicks: set                  = set()
+        self._sorted_users:  Dict[str, List[str]] = {}
+
+# =========================
 # TUI - Enhanced Dashboard
 # =========================
 class TUI:
@@ -2207,26 +2257,41 @@ class TUI:
         except curses.error as e:
             raise SystemExit(f"Terminal too small to initialise windows: {e}")
 
+        # Multi-server state: primary server is client passed to __init__
+        self._primary_server_id: str = client.server_id
+        _primary_ctx = ServerContext(self._primary_server_id, client)
+        self.servers: Dict[str, ServerContext] = {self._primary_server_id: _primary_ctx}
+        # _active_server_id is set during event dispatch; points at the server
+        # whose dicts (channel_users etc.) are currently aliased to self.*
+        self._active_server_id: str = self._primary_server_id
+
         self.windows: List[ChatWindow] = []
         self.window_by_name: Dict[str, ChatWindow] = {}
+        _psid = self._primary_server_id
         for name in ("*status*", "*dashboard*"):
-            win = ChatWindow(name, is_channel=False)
+            win = ChatWindow(name, is_channel=False, server_id=_psid)
             self.windows.append(win)
             self.window_by_name[name] = win
 
         # Pre-create the default channel window so its tab is always visible and
         # join errors / join success messages land there immediately.
-        self.channel_users: Dict[str, set] = {}
         if DEFAULT_CHANNEL:
-            _dcw = ChatWindow(DEFAULT_CHANNEL, is_channel=True)
+            _dcw = ChatWindow(DEFAULT_CHANNEL, is_channel=True, server_id=_psid)
             self.windows.append(_dcw)
             self.window_by_name[DEFAULT_CHANNEL] = _dcw
-            self.channel_users[DEFAULT_CHANNEL] = set()
+            _primary_ctx.channel_users[DEFAULT_CHANNEL] = set()
+
+        # Alias primary ctx dicts directly onto self so all existing code continues
+        # to work without changes.  _sync_ctx() swaps these aliases when a
+        # different server's event needs processing.
+        self.channel_users  = _primary_ctx.channel_users
+        self.user_scores    = _primary_ctx.user_scores
+        self.user_ai_scores = _primary_ctx.user_ai_scores
+        self._suspect_nicks = _primary_ctx._suspect_nicks
+        self._sorted_users  = _primary_ctx._sorted_users
 
         self.current_window_index = 0
         self.current_channel: Optional[str] = DEFAULT_CHANNEL
-        self.user_scores: Dict[str, int] = {}
-        self.user_ai_scores: Dict[str, int] = {}
         self.ai_suspect_threshold = AI_SUSPECT_THRESHOLD
 
         self.input_buffer = ""
@@ -2240,10 +2305,10 @@ class TUI:
         self.ignored_nicks: set = set()
 
         # Performance caches — maintained incrementally to avoid per-frame rebuilds
-        self._suspect_nicks: set = set()          # nicks at/above ai_suspect_threshold
+        # NOTE: _suspect_nicks and _sorted_users are now aliased from the active
+        # ServerContext; see _sync_ctx().
         self._suspect_re: Optional[re.Pattern] = None   # compiled regex, rebuilt on change
         self._suspect_re_nicks: frozenset = frozenset() # snapshot used to build _suspect_re
-        self._sorted_users: Dict[str, List[str]] = {}  # channel → sorted nick list
         self._dashboard_dirty = False             # needs rebuild?
         self._dashboard_last_update = 0.0         # last rebuild timestamp
         self._dashboard_ota_interval = 5.0        # auto-refresh interval while dashboard is visible
@@ -2296,14 +2361,63 @@ class TUI:
         # Auto-translate CJK (Chinese/Japanese/…) messages to English
         self.auto_translate: bool = True
 
+    # ── Multi-server helpers ─────────────────────────────────────────────────
+
+    def _wk(self, server_id: str, name: str) -> str:
+        """Compute the window_by_name key for (server_id, window_name).
+
+        Primary server windows keep their bare name so legacy code that
+        hard-codes self.window_by_name["*status*"] still works.
+        """
+        return name if server_id == self._primary_server_id else f"{server_id}/{name}"
+
+    def _sync_ctx(self, server_id: str) -> None:
+        """Alias self.channel_users / user_scores / … to the given server's dicts.
+
+        Must be called before every event-handler invocation so that existing
+        handler code (which writes to self.channel_users etc.) mutates the
+        correct per-server dict.
+        """
+        self._active_server_id = server_id
+        ctx = self.servers.get(server_id)
+        if ctx is None:
+            return
+        self.channel_users  = ctx.channel_users
+        self.user_scores    = ctx.user_scores
+        self.user_ai_scores = ctx.user_ai_scores
+        self._suspect_nicks = ctx._suspect_nicks
+        self._sorted_users  = ctx._sorted_users
+
+    def _sync_draw_ctx(self) -> None:
+        """Sync self.* aliases to the server that owns the currently visible window.
+
+        Called at the top of redraw() so drawing methods always read from the
+        right server's data regardless of which server last dispatched an event.
+        """
+        win = self.get_current_window()
+        sid = win.server_id or self._primary_server_id
+        self._sync_ctx(sid)
+
+    def _status_win(self) -> ChatWindow:
+        """Return the status window for the currently active server."""
+        wk = self._wk(self._active_server_id, "*status*")
+        return self.window_by_name.get(wk) or self.window_by_name["*status*"]
+
+    def _active_client(self) -> IRCClient:
+        """Return the IRCClient for the currently active server."""
+        ctx = self.servers.get(self._active_server_id)
+        return ctx.client if ctx else self.client
+
     def ensure_window(self, name: str, is_channel: bool = True) -> ChatWindow:
-        if name not in self.window_by_name:
-            win = ChatWindow(name, is_channel=is_channel)
+        sid = self._active_server_id
+        wk  = self._wk(sid, name)
+        if wk not in self.window_by_name:
+            win = ChatWindow(name, is_channel=is_channel, server_id=sid)
             self.windows.append(win)
-            self.window_by_name[name] = win
+            self.window_by_name[wk] = win
             if is_channel and name not in self.channel_users:
                 self.channel_users[name] = set()
-        return self.window_by_name[name]
+        return self.window_by_name[wk]
 
     def _chat_text_width(self) -> int:
         """Usable text columns in the chat window (leaves 1-col right margin)."""
@@ -2838,6 +2952,7 @@ class TUI:
         usable = w - 2  # columns between left and right borders
 
         # Build label strings for every window
+        multi_server = len(self.servers) > 1
         labels: List[str] = []
         for i, win in enumerate(self.windows):
             name = win.name
@@ -2849,6 +2964,10 @@ class TUI:
                 short = name[:14]
             else:
                 short = f">{name[:10]}"   # DM: ">nick"
+            # Prepend a short server tag when multiple servers are connected
+            if multi_server and win.server_id and win.server_id != self._primary_server_id:
+                host = win.server_id.split(":")[0]
+                short = f"{host[:8]}:{short}"
             is_active = (i == self.current_window_index)
             has_unread = (name in self._unread_windows and not is_active)
             labels.append(f"[{'*' if has_unread else ''}{i + 1}:{short}]")
@@ -2893,10 +3012,11 @@ class TUI:
         # Show current send-target in the prompt so the user always knows where
         # text will go.  Status/dashboard windows have no chat target.
         cur_win = self.get_current_window()
+        _cur_nick = self._active_client().nick
         if cur_win.name not in ("*status*", "*dashboard*"):
-            prompt = f"[{cur_win.name}] {self.client.nick}> "
+            prompt = f"[{cur_win.name}] {_cur_nick}> "
         else:
-            prompt = f"{self.client.nick}> "
+            prompt = f"{_cur_nick}> "
         iw     = self._input_w
 
         # All width calculations use visual column counts (not character counts)
@@ -2932,6 +3052,9 @@ class TUI:
             self.height, self.width = new_h, new_w
             self.chat_height = max(1, self.height - 4)
             self._resize_windows()  # sets all three pane-dirty flags + updates _tw/_uw/_input_w
+
+        # Sync aliases to the server that owns the currently visible window.
+        self._sync_draw_ctx()
 
         refreshed = []
         if self._chat_dirty:
@@ -3023,6 +3146,19 @@ class TUI:
     async def handle_event(self, event: tuple) -> None:
         if not event:
             return
+        # "_srv" events arrive from secondary servers via _mux_server_events.
+        # Unwrap, sync aliases to that server's dicts, dispatch, then restore.
+        if event[0] == "_srv":
+            _, server_id, inner = event
+            prev = self._active_server_id
+            self._sync_ctx(server_id)
+            try:
+                await self.handle_event(inner)
+            finally:
+                self._sync_ctx(prev)
+            return
+        # Untagged events come from the primary server; ensure aliases are correct.
+        self._sync_ctx(self._primary_server_id)
         handler = self._event_handlers.get(event[0])
         if handler:
             await handler(event)
@@ -3036,7 +3172,7 @@ class TUI:
         if target.startswith("#"):
             win_name = target
             is_chan   = True
-        elif nick == self.client.nick:
+        elif nick == self._active_client().nick:
             win_name = target
             is_chan   = False
         else:
@@ -3052,7 +3188,7 @@ class TUI:
         if win is not self.get_current_window():
             self._unread_windows.add(win_name)
             self._input_dirty = True
-            if not target.startswith("#") and nick != self.client.nick:
+            if not target.startswith("#") and nick != self._active_client().nick:
                 preview = (msg[:40] + "...") if len(msg) > 40 else msg
                 self.get_current_window().add_line(
                     f"-!- PM from {nick}: {preview}  [/win {self.windows.index(win) + 1}]")
@@ -3106,7 +3242,7 @@ class TUI:
             self._suspect_nicks.discard(old_nick)
             if score >= self.ai_suspect_threshold:
                 self._suspect_nicks.add(new_nick)
-        self.window_by_name["*status*"].add_line(f"* {old_nick} is now known as {new_nick}")
+        self._status_win().add_line(f"* {old_nick} is now known as {new_nick}")
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
 
@@ -3133,7 +3269,8 @@ class TUI:
         _, channel, topic_text = event
         text = (f"* Topic for {channel}: {topic_text}"
                 if topic_text else f"* No topic set for {channel}")
-        target_win = self.window_by_name.get(channel, self.window_by_name["*status*"])
+        wk = self._wk(self._active_server_id, channel)
+        target_win = self.window_by_name.get(wk) or self._status_win()
         target_win.add_line(text)
         self._chat_dirty = True
         self.dirty = True
@@ -3141,7 +3278,7 @@ class TUI:
     async def _ev_join(self, event):
         _, nick, channel = event
         win = self.ensure_window(channel)
-        if nick == self.client.nick:
+        if nick == self._active_client().nick:
             self.channel_users[channel] = set()
             self._sorted_users.pop(channel, None)
         else:
@@ -3171,7 +3308,7 @@ class TUI:
             self.current_window_index = self.windows.index(win)
             self._unread_windows.discard(channel)
         else:
-            self.window_by_name["*status*"].add_line(msg)
+            self._status_win().add_line(msg)
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
 
@@ -3181,11 +3318,11 @@ class TUI:
             self.channel_users[channel].discard(nick)
             self._sorted_users.pop(channel, None)
         self._suspect_nicks.discard(nick)
-        ch_win = self.window_by_name.get(channel)
+        ch_win = self.window_by_name.get(self._wk(self._active_server_id, channel))
         if ch_win:
             ch_win.add_line(f"* {nick} has left {channel}")
             if ch_win is not self.get_current_window():
-                self._unread_windows.add(channel)
+                self._unread_windows.add(ch_win.name)
                 self._input_dirty = True
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
@@ -3197,11 +3334,11 @@ class TUI:
             if nick in users:
                 users.discard(nick)
                 self._sorted_users.pop(ch, None)
-                ch_win = self.window_by_name.get(ch)
+                ch_win = self.window_by_name.get(self._wk(self._active_server_id, ch))
                 if ch_win:
                     ch_win.add_line(quit_msg)
                     if ch_win is not self.get_current_window():
-                        self._unread_windows.add(ch)
+                        self._unread_windows.add(ch_win.name)
                         self._input_dirty = True
         self._suspect_nicks.discard(nick)
         self.user_scores.pop(nick, None)
@@ -3211,7 +3348,7 @@ class TUI:
 
     async def _ev_status_line(self, event):
         msg = str(event[1]) if len(event) > 1 else str(event)
-        self.window_by_name["*status*"].add_line(msg)
+        self._status_win().add_line(msg)
         self._chat_dirty = True
         self.dirty = True
 
@@ -3266,6 +3403,9 @@ class TUI:
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
             return
+        # Sync context to the server owning the current window so slash commands
+        # and plain text go to the right server.
+        self._sync_draw_ctx()
         if line.startswith("/"):
             parts = line[1:].split(maxsplit=2)
             cmd   = parts[0].lower()
@@ -3275,7 +3415,7 @@ class TUI:
             if handler:
                 await handler(args, extra, line)
             else:
-                self.client.send_raw(line[1:])
+                self._active_client().send_raw(line[1:])
         else:
             await self._send_plain_text(line)
         self._chat_dirty = True
@@ -3294,7 +3434,7 @@ class TUI:
                 self.current_channel = target
                 self.current_window_index = self.windows.index(dest)
                 self._unread_windows.discard(target)
-        result = self.client.cmd_msg(target, line)
+        result = self._active_client().cmd_msg(target, line)
         if result:
             await self.ui_queue.put(result)
 
@@ -3306,47 +3446,47 @@ class TUI:
         cur_win = self.get_current_window()
         target = (cur_win.name if cur_win.name not in ("*status*", "*dashboard*")
                   else self.current_channel or DEFAULT_CHANNEL)
-        result = self.client.cmd_msg(target, action_text, is_action=True)
+        result = self._active_client().cmd_msg(target, action_text, is_action=True)
         if result:
             await self.ui_queue.put(result)
 
     async def _slash_ctcp(self, args, extra, line):
         if args and extra:
-            self.client.cmd_ctcp(args, extra.upper())
+            self._active_client().cmd_ctcp(args, extra.upper())
             await self.ui_queue.put(("status", f"CTCP {extra.upper()} sent to {args}"))
         else:
             await self.ui_queue.put(("status", "Usage: /ctcp <nick> <command> [args]"))
 
     async def _slash_whois(self, args, extra, line):
         if args:
-            self.client.cmd_whois(args)
+            self._active_client().cmd_whois(args)
 
     async def _slash_mode(self, args, extra, line):
         if args:
             target, *modes = args.split(maxsplit=1)
-            self.client.cmd_mode(target, modes[0] if modes else "")
+            self._active_client().cmd_mode(target, modes[0] if modes else "")
 
     async def _slash_topic(self, args, extra, line):
         if args:
             if " " in args:
                 channel, topic = args.split(maxsplit=1)
-                self.client.cmd_topic(channel, topic)
+                self._active_client().cmd_topic(channel, topic)
             else:
-                self.client.cmd_topic(args)
+                self._active_client().cmd_topic(args)
 
     async def _slash_kick(self, args, extra, line):
         if args:
             p = args.split(maxsplit=2)
             if len(p) >= 2:
-                self.client.cmd_kick(p[0], p[1], p[2] if len(p) > 2 else "")
+                self._active_client().cmd_kick(p[0], p[1], p[2] if len(p) > 2 else "")
 
     async def _slash_ns(self, args, extra, line):
         if args:
-            self.client.cmd_service("NickServ", args)
+            self._active_client().cmd_service("NickServ", args)
 
     async def _slash_cs(self, args, extra, line):
         if args:
-            self.client.cmd_service("ChanServ", args)
+            self._active_client().cmd_service("ChanServ", args)
 
     async def _slash_ai(self, args, extra, line):
         if args:
@@ -3355,8 +3495,9 @@ class TUI:
             await self.ui_queue.put(("status", "Usage: /ai <nick>"))
 
     async def _slash_aitoggle(self, args, extra, line):
-        self.client.scoring.ai_detector.enabled = not self.client.scoring.ai_detector.enabled
-        det_state = "ENABLED" if self.client.scoring.ai_detector.enabled else "DISABLED"
+        detector = self._active_client().scoring.ai_detector
+        detector.enabled = not detector.enabled
+        det_state = "ENABLED" if detector.enabled else "DISABLED"
         log_state = "log:ON" if _ai_logging_enabled else "log:OFF"
         await self.ui_queue.put(("status", f"AI detection {det_state}  ({log_state})"))
 
@@ -3365,31 +3506,31 @@ class TUI:
         # Write a final "disabled" record before we stop writing, or a "enabled" record
         # immediately after we start — so the log gap is bounded and auditable.
         if _ai_logging_enabled:
-            log_toggle_event(enabled=False, nick=self.client.nick)
+            log_toggle_event(enabled=False, nick=self._active_client().nick)
         _ai_logging_enabled = not _ai_logging_enabled
         if _ai_logging_enabled:
-            log_toggle_event(enabled=True, nick=self.client.nick)
+            log_toggle_event(enabled=True, nick=self._active_client().nick)
         state = "ENABLED" if _ai_logging_enabled else "DISABLED"
         await self.ui_queue.put(("status", f"AI detection logging {state}  (file: {AI_LOG_PATH})"))
 
     async def _slash_join(self, args, extra, line):
         if args:
-            self.client.cmd_join(args)
+            self._active_client().cmd_join(args)
 
     async def _slash_part(self, args, extra, line):
         ch = args or self.current_channel or ""
         if ch:
-            self.client.cmd_part(ch, extra or None)
+            self._active_client().cmd_part(ch, extra or None)
 
     async def _slash_nick(self, args, extra, line):
         if args:
-            self.client.cmd_nick(args)
+            self._active_client().cmd_nick(args)
 
     async def _slash_msg(self, args, extra, line):
         if args and extra:
-            self.client.cmd_msg(args, extra)
+            self._active_client().cmd_msg(args, extra)
             win = self.ensure_window(args, is_channel=False)
-            win.add_line(f"<{self.client.nick}> {extra}")
+            win.add_line(f"<{self._active_client().nick}> {extra}")
             self.current_window_index = self.windows.index(win)
             self.current_channel = args
             self._unread_windows.discard(args)
@@ -3400,7 +3541,8 @@ class TUI:
 
     async def _slash_query(self, args, extra, line):
         if args:
-            is_new = args not in self.window_by_name
+            wk = self._wk(self._active_server_id, args)
+            is_new = wk not in self.window_by_name
             win = self.ensure_window(args, is_channel=False)
             self.current_window_index = self.windows.index(win)
             self.current_channel = args
@@ -3409,78 +3551,78 @@ class TUI:
             if is_new:
                 win.add_line(f"** Query with {args} opened **", timestamp=False)
             if extra:
-                self.client.cmd_msg(args, extra)
-                win.add_line(f"<{self.client.nick}> {extra}")
+                self._active_client().cmd_msg(args, extra)
+                win.add_line(f"<{self._active_client().nick}> {extra}")
         else:
             await self.ui_queue.put(("status", "Usage: /query <nick> [message]"))
 
     async def _slash_notice(self, args, extra, line):
         if args and extra:
-            self.client.cmd_notice(args, extra)
+            self._active_client().cmd_notice(args, extra)
             await self.ui_queue.put(("status", f"-> NOTICE to {args}: {extra}"))
         else:
             await self.ui_queue.put(("status", "Usage: /notice <nick> <text>"))
 
     async def _slash_away(self, args, extra, line):
-        self.client.cmd_away(args)
+        self._active_client().cmd_away(args)
         await self.ui_queue.put(("status", f"You are now away: {args}" if args else "You are now away"))
 
     async def _slash_back(self, args, extra, line):
-        self.client.cmd_away()
+        self._active_client().cmd_away()
         await self.ui_queue.put(("status", "You are no longer away"))
 
     async def _slash_invite(self, args, extra, line):
         if args:
             channel = extra or self.current_channel or ""
             if channel:
-                self.client.cmd_invite(args, channel)
+                self._active_client().cmd_invite(args, channel)
                 await self.ui_queue.put(("status", f"Inviting {args} to {channel}"))
             else:
                 await self.ui_queue.put(("status", "Usage: /invite <nick> [channel]"))
 
     async def _slash_op(self, args, extra, line):
         if args and self.current_channel:
-            self.client.cmd_mode(self.current_channel, f"+o {args}")
+            self._active_client().cmd_mode(self.current_channel, f"+o {args}")
 
     async def _slash_deop(self, args, extra, line):
         if args and self.current_channel:
-            self.client.cmd_mode(self.current_channel, f"-o {args}")
+            self._active_client().cmd_mode(self.current_channel, f"-o {args}")
 
     async def _slash_voice(self, args, extra, line):
         if args and self.current_channel:
-            self.client.cmd_mode(self.current_channel, f"+v {args}")
+            self._active_client().cmd_mode(self.current_channel, f"+v {args}")
 
     async def _slash_devoice(self, args, extra, line):
         if args and self.current_channel:
-            self.client.cmd_mode(self.current_channel, f"-v {args}")
+            self._active_client().cmd_mode(self.current_channel, f"-v {args}")
 
     async def _slash_hop(self, args, extra, line):
         if args and self.current_channel:
-            self.client.cmd_mode(self.current_channel, f"+h {args}")
+            self._active_client().cmd_mode(self.current_channel, f"+h {args}")
 
     async def _slash_dehop(self, args, extra, line):
         if args and self.current_channel:
-            self.client.cmd_mode(self.current_channel, f"-h {args}")
+            self._active_client().cmd_mode(self.current_channel, f"-h {args}")
 
     async def _slash_ban(self, args, extra, line):
         if args and self.current_channel:
             mask = args if "!" in args or "@" in args else f"{args}!*@*"
-            self.client.cmd_mode(self.current_channel, f"+b {mask}")
+            self._active_client().cmd_mode(self.current_channel, f"+b {mask}")
 
     async def _slash_unban(self, args, extra, line):
         if args and self.current_channel:
-            self.client.cmd_mode(self.current_channel, f"-b {args}")
+            self._active_client().cmd_mode(self.current_channel, f"-b {args}")
 
     async def _slash_who(self, args, extra, line):
         if args:
-            self.client.cmd_who(args)
+            self._active_client().cmd_who(args)
 
     async def _slash_whowas(self, args, extra, line):
         if args:
-            self.client.cmd_whowas(args)
+            self._active_client().cmd_whowas(args)
 
     async def _slash_names(self, args, extra, line):
-        self.client.cmd_names(args or self.current_channel or "")
+        self._active_client().cmd_names(args or self.current_channel or "")
 
     async def _slash_ignore(self, args, extra, line):
         if args:
@@ -3502,7 +3644,8 @@ class TUI:
         if win.name not in ("*status*", "*dashboard*"):
             self._unread_windows.discard(win.name)
             self.windows.remove(win)
-            del self.window_by_name[win.name]
+            wk = self._wk(win.server_id or self._primary_server_id, win.name)
+            self.window_by_name.pop(wk, None)
             self.current_window_index = max(0, self.current_window_index - 1)
             new_win = self.get_current_window()
             if new_win.name not in ("*status*", "*dashboard*"):
@@ -3525,64 +3668,96 @@ class TUI:
                 self.dirty = True
 
     async def _slash_quit(self, args, extra, line):
-        self.client.send_raw(f"QUIT :{args}" if args else "QUIT :Client exiting")
+        self._active_client().send_raw(f"QUIT :{args}" if args else "QUIT :Client exiting")
         raise SystemExit
 
     async def _slash_server(self, args, extra, line):
+        """Connect to an additional IRC server (runs in parallel with existing connections).
+
+        Usage: /server [-ssl] <host> [port]
+        """
         if not args:
             await self.ui_queue.put(("status",
-                "Usage: /server <host> [port] [nick]  (port defaults to 6697 SSL)"))
+                "Usage: /server [-ssl] <host> [port]  "
+                "(omit -ssl for plain, default ports: 6697 SSL / 6667 plain)"))
             return
-        srv_parts = args.split()
-        new_server = srv_parts[0]
-        new_port   = 6697
-        new_nick   = self.client.nick
-        if len(srv_parts) >= 2:
-            if srv_parts[1].isdigit():
-                new_port = int(srv_parts[1])
+        parts   = args.split()
+        use_ssl = False
+        if parts and parts[0] == "-ssl":
+            use_ssl = True
+            parts   = parts[1:]
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /server [-ssl] <host> [port]"))
+            return
+        new_host = parts[0]
+        default_port = 6697 if use_ssl else 6667
+        new_port = default_port
+        if len(parts) >= 2:
+            if parts[1].isdigit():
+                new_port = int(parts[1])
             else:
                 await self.ui_queue.put(("status",
-                    f"/server: invalid port '{srv_parts[1]}', defaulting to 6697"))
-        if len(srv_parts) >= 3:
-            new_nick = srv_parts[2]
-        self.client.server          = new_server
-        self.client.port            = new_port
-        self.client.nick            = new_nick
-        self.client.joined_channels = set()
-        self.client.users.clear()
-        self.client._identified     = False
-        self.client._ctcp_times.clear()
-        for users in self.channel_users.values():
-            users.clear()
-        self._sorted_users.clear()
-        self.user_scores.clear()
-        self.user_ai_scores.clear()
-        self._suspect_nicks.clear()
-        self._suspect_re        = None
-        self._suspect_re_nicks  = frozenset()
-        self.current_channel    = None
-        self._dashboard_dirty   = True
-        self.window_by_name["*status*"].add_line(
-            f"*** Connecting to {new_server}:{new_port} (SSL) as {new_nick}")
-        self.current_window_index = 0
-        if self.client.writer and not self.client.writer.is_closing():
-            try:
-                self.client.send_raw(f"QUIT :Switching to {new_server}")
-                await asyncio.sleep(0.3)
-                self.client.writer.close()
-            except Exception:
-                pass
-        elif self.client.writer:
-            try:
-                self.client.writer.close()
-            except Exception:
-                pass
+                    f"/server: invalid port '{parts[1]}', using {default_port}"))
+        new_sid = f"{new_host}:{new_port}"
+
+        if new_sid in self.servers:
+            # Already connected — switch status window into view
+            sw_wk = self._wk(new_sid, "*status*")
+            sw    = self.window_by_name.get(sw_wk)
+            if sw and sw in self.windows:
+                self.current_window_index = self.windows.index(sw)
+                self._sync_draw_ctx()
+                self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                self.dirty = True
+            await self.ui_queue.put(("status",
+                f"Already connected to {new_host}:{new_port} — switched to its window"))
+            return
+
+        nick = self._active_client().nick
+        # Each extra server gets its own raw queue; a mux task wraps events
+        # with the server_id and forwards them to the shared ui_queue.
+        srv_raw_queue: asyncio.Queue = asyncio.Queue()
+        new_scoring   = ScoringEngine(self.client.scoring.ai_detector)
+        new_client    = IRCClient(new_host, new_port, nick, srv_raw_queue,
+                                  new_scoring, use_ssl=use_ssl)
+        new_ctx = ServerContext(new_sid, new_client)
+        self.servers[new_sid] = new_ctx
+
+        # Create a dedicated status window for this server.
+        sw_wk = self._wk(new_sid, "*status*")
+        sw    = ChatWindow("*status*", is_channel=False, server_id=new_sid)
+        sw._persist = False
+        self.windows.append(sw)
+        self.window_by_name[sw_wk] = sw
+        self.current_window_index = self.windows.index(sw)
+        self._sync_draw_ctx()
+
+        proto = "SSL" if use_ssl else "plain"
+        sw.add_line(f"*** Connecting to {new_host}:{new_port} ({proto}) as {nick}", timestamp=False)
+
+        asyncio.create_task(self._mux_server_events(srv_raw_queue, new_sid),
+                            name=f"mux-{new_sid}")
+        asyncio.create_task(new_client.run_connection(), name=f"irc-{new_sid}")
+
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
+
+    async def _mux_server_events(self, src: asyncio.Queue, server_id: str) -> None:
+        """Forward events from a secondary server's queue to the TUI's ui_queue.
+
+        Each event is wrapped as ("_srv", server_id, original_event) so that
+        handle_event can route it to the right ServerContext.
+        """
+        while True:
+            event = await src.get()
+            await self.ui_queue.put(("_srv", server_id, event))
 
     async def _slash_reconnect(self, args, extra, line):
-        await self.ui_queue.put(("status", "Forcing reconnect..."))
-        if self.client.writer:
+        cur = self._active_client()
+        await self.ui_queue.put(("status", f"Forcing reconnect to {cur.server}:{cur.port}..."))
+        if cur.writer:
             try:
-                self.client.writer.close()
+                cur.writer.close()
             except Exception:
                 pass
 
@@ -3690,7 +3865,7 @@ class TUI:
         _E("/autotranslate",               "Toggle auto CJK → English translation (on by default)")
         _C("")
         _H("Connection")
-        _E("/server <host> [port] [nick]", "Connect to a new IRC server over SSL (default 6697)")
+        _E("/server [-ssl] <host> [port]", "Add a parallel server connection (SSL with -ssl, else plain)")
         _E("/reconnect",                   "Drop and re-establish the current connection")
         _C("")
         _H("Windows & Navigation")
@@ -3738,7 +3913,7 @@ class TUI:
             "── Translation ───────────────────────────────────────────",
             "  /autotranslate  toggle CJK → English (default: on)",
             "── Connection ─────────────────────────────────────────────",
-            "  /server <host> [port] [nick]  /reconnect",
+            "  /server [-ssl] <host> [port]  (parallel; -ssl for TLS)  /reconnect",
             "── Interface ──────────────────────────────────────────────",
             "  /win <n>  /close (/wc)  /clear  /theme <1-5>",
             "  Ctrl+N next window  Tab nick-complete  PgUp/Dn scroll",
@@ -4109,24 +4284,25 @@ async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
         # Drain cancellations — ignore whatever they return.
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        client.running = False
-        if client.writer:
-            try:
-                client.send_raw("QUIT :Client exiting")
-                # Use a short wait that itself can't raise CancelledError
-                # (the event loop may already be winding down here).
+        # Cleanly QUIT all connected servers (primary + any added via /server).
+        for ctx in tui.servers.values():
+            c = ctx.client
+            c.running = False
+            if c.writer:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.shield(client.writer.drain()), timeout=0.4)
+                    c.send_raw("QUIT :Client exiting")
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(c.writer.drain()), timeout=0.4)
+                    except Exception:
+                        pass
+                    c.writer.close()
+                    try:
+                        await asyncio.wait_for(c.writer.wait_closed(), timeout=0.4)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-                client.writer.close()
-                try:
-                    await asyncio.wait_for(client.writer.wait_closed(), timeout=0.4)
-                except Exception:
-                    pass
-            except Exception:
-                pass
 
 def _ensure_deps() -> bool:
     """Check for every required and optional package.
