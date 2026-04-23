@@ -17,7 +17,6 @@ import json
 import re
 import ssl
 import time
-import platform
 import os
 import uuid
 import warnings
@@ -55,7 +54,8 @@ except ModuleNotFoundError:
     # windows_curses may be installed in a site-packages directory not yet on
     # sys.path (user-site, a parallel Python install, etc.).  Widen the search
     # before giving up.
-    import pathlib, site as _site
+    import pathlib
+    import site as _site
     _extra: list = []
     try:
         _extra.append(_site.getusersitepackages())
@@ -76,7 +76,6 @@ except ModuleNotFoundError:
     except ImportError:
         print("windows-curses not found — installing...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "windows-curses"])
-        import windows_curses  # type: ignore
     import curses
 
 # =========================
@@ -90,7 +89,7 @@ NICKSERV_PASSWORD = os.environ.get("IRC_NICKSERV_PASSWORD", "")
 
 MAX_MESSAGES = 100
 USER_HISTORY_WINDOW = 200
-AI_LOG_PATH = "ai_score.log"
+AI_LOG_PATH = "ai_scores.log"
 AI_SUSPECT_THRESHOLD = 70
 # AI detection logging: enabled by default.  Set IRC_AI_LOG=0 to disable at startup.
 # Can also be toggled at runtime with /logtoggle.
@@ -546,13 +545,6 @@ _ai_log_handle:     Optional[io.TextIOWrapper] = None
 _chat_log_handles:  Dict[str, io.TextIOWrapper] = {}
 _input_hist_handle: Optional[io.TextIOWrapper] = None
 
-# Time-gated flush: ai_score.log is flushed at most once per interval rather
-# than on every write.  This amortises syscall cost across message bursts while
-# still ensuring data lands on disk within a few seconds of being written.
-_AI_LOG_FLUSH_INTERVAL: float = 2.0   # seconds between forced flushes
-_ai_log_last_flush:     float = 0.0   # monotonic timestamp of last flush
-
-
 def _open_append(path: str, buffering: int = 8192) -> io.TextIOWrapper:
     return open(path, "a", encoding="utf-8", buffering=buffering)  # type: ignore[return-value]
 
@@ -570,22 +562,19 @@ def _flush_log_handles() -> None:
 
 
 def _ai_log_write(payload: str) -> None:
-    """Append *payload* to ai_score.log and flush at most once per
-    _AI_LOG_FLUSH_INTERVAL seconds.  The 8 KB write buffer absorbs message
-    bursts without a syscall per record; the time gate ensures data lands on
-    disk within a few seconds even during quiet periods.  The atexit handler
-    performs a final flush on clean shutdown."""
-    global _ai_log_handle, _ai_log_last_flush
+    """Append *payload* to ai_scores.log.
+
+    Uses line-buffered mode (buffering=1) so every record lands on disk as
+    soon as the terminating newline is written — no explicit flush() needed.
+    On any I/O error the handle is discarded so the next call attempts a
+    fresh open instead of retrying against a broken handle forever."""
+    global _ai_log_handle
     try:
         if _ai_log_handle is None or _ai_log_handle.closed:
-            _ai_log_handle = _open_append(AI_LOG_PATH)
+            _ai_log_handle = _open_append(AI_LOG_PATH, buffering=1)
         _ai_log_handle.write(payload)
-        now = time.monotonic()
-        if now - _ai_log_last_flush >= _AI_LOG_FLUSH_INTERVAL:
-            _ai_log_handle.flush()
-            _ai_log_last_flush = now
     except Exception:
-        pass
+        _ai_log_handle = None  # force reopen next call; don't retry a broken handle
 
 
 def log_session_start(server: str, nick: str) -> None:
@@ -608,7 +597,7 @@ def log_ai_event(nick: str, target: str, msg: str,
                  bino_score: float = 0.0,
                  cls_score: float = 0.0,
                  llama_score: float = 0.0) -> None:
-    """Write one JSONL detection record to ai_score.log.
+    """Write one JSONL detection record to ai_scores.log.
 
     Every record contains the full signal breakdown so any line can be
     independently analysed without referencing session state:
@@ -632,6 +621,18 @@ def log_ai_event(nick: str, target: str, msg: str,
     """
     if not _ai_logging_enabled:
         return
+    # Clamp every numeric field to its documented range so out-of-range values
+    # from upstream bugs or floating-point edge cases never corrupt the log.
+    a_score     = max(0,   min(100, int(a_score)))
+    rolling_ai  = max(0,   min(100, int(rolling_ai)))
+    u_score     = max(0,   min(99,  int(u_score)))
+    m_score     = max(0,   min(100, int(m_score)))
+    heu_score   = max(0.0, min(1.0, float(heu_score)))
+    bino_score  = max(0.0, min(1.0, float(bino_score)))
+    cls_score   = max(0.0, min(1.0, float(cls_score)))
+    llama_score = max(0.0, min(1.0, float(llama_score)))
+    # Cap the stored message at the IRC protocol line length to bound record size.
+    msg_logged  = msg[:512]
     global _log_seq
     _log_seq += 1
     entry: dict = {
@@ -651,7 +652,7 @@ def log_ai_event(nick: str, target: str, msg: str,
         "bino":    round(bino_score,  4),
         "cls":     round(cls_score,   4),
         "llama":   round(llama_score, 4),
-        "msg":     msg,
+        "msg":     msg_logged,
     }
     _ai_log_write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -1319,7 +1320,10 @@ class EnsembleAIDetector:
 
         cached = self._pred_cache.get(text)
         if cached is not None:
-            self._pred_cache.move_to_end(text)
+            try:
+                self._pred_cache.move_to_end(text)
+            except KeyError:
+                pass  # evicted by a concurrent thread between get() and move_to_end()
             return cached  # type: ignore[return-value]
 
         llama = self.llama_pattern_score(text)
@@ -1476,6 +1480,9 @@ class IRCClient:
         self._isupport: dict = {}
         self._irc_handlers: dict = {}
         self._build_irc_handlers()
+        # Strong references to fire-and-forget scoring tasks so they are not
+        # garbage-collected before they finish (asyncio only holds weak refs).
+        self._bg_tasks: set = set()
 
     @property
     def server_id(self) -> str:
@@ -2014,7 +2021,9 @@ class IRCClient:
         # Display immediately with a placeholder AI score (0); a background task
         # scores the message and sends an "ai_score" update once ML inference finishes.
         await self.ui_queue.put(("msg", nick, target, msg, u_score, m_score, 0, 0, is_action))
-        asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
+        _t = asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
+        self._bg_tasks.add(_t)
+        _t.add_done_callback(self._bg_tasks.discard)
 
     async def _irc_nick_change(self, nick, params, prefix):
         new_nick = params[0] if params else ""
@@ -2274,21 +2283,23 @@ class IRCClient:
     async def _score_msg_bg(self, nick: str, target: str, msg: str,
                             u_state: "UserState", u_score: int, m_score: int) -> None:
         """Run AI inference off the read loop, then push an update event."""
+        a_score = 0
+        detail: Dict[str, float] = {"prob": 0.0, "heu": 0.0, "bino": 0.0, "cls": 0.0, "llama": 0.0}
         try:
             loop = asyncio.get_running_loop()
             detail = await loop.run_in_executor(
                 None, self.scoring.ai_detector.predict_detailed, msg)
-            a_score   = int(detail["prob"] * 100)
-            u_state.record_message(msg, a_score)
-            rolling_ai = int(u_state.rolling_ai_likelihood())
-            log_ai_event(
-                nick, target, msg, u_score, m_score, a_score, rolling_ai,
-                heu_score=detail["heu"], bino_score=detail["bino"],
-                cls_score=detail["cls"], llama_score=detail["llama"],
-            )
-            await self.ui_queue.put(("ai_score", nick, rolling_ai))
+            a_score = int(detail["prob"] * 100)
         except Exception:
-            u_state.record_message(msg, 0)
+            pass  # inference failed; log with score 0 so the event is still recorded
+        u_state.record_message(msg, a_score)
+        rolling_ai = int(u_state.rolling_ai_likelihood())
+        log_ai_event(
+            nick, target, msg, u_score, m_score, a_score, rolling_ai,
+            heu_score=detail["heu"], bino_score=detail["bino"],
+            cls_score=detail["cls"], llama_score=detail["llama"],
+        )
+        await self.ui_queue.put(("ai_score", nick, rolling_ai))
 
 # =========================
 # Per-server state container
@@ -2350,6 +2361,7 @@ class TUI:
             self.windows.append(_dcw)
             self.window_by_name[DEFAULT_CHANNEL] = _dcw
             _primary_ctx.channel_users[DEFAULT_CHANNEL] = set()
+            _dcw.add_line(f"log channel {DEFAULT_CHANNEL} enabled", timestamp=True)
 
         # Alias primary ctx dicts directly onto self so all existing code continues
         # to work without changes.  _sync_ctx() swaps these aliases when a
@@ -2693,7 +2705,7 @@ class TUI:
             if _in_chans:
                 L(f"  Currently in           : {' '.join(_in_chans)}")
             if nick.lower() in self.ignored_nicks:
-                L(f"  Status                 : IGNORED")
+                L("  Status                 : IGNORED")
             if spark:
                 L(f"  Score history          : {spark}")
             L("")
