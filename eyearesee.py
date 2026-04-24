@@ -87,7 +87,7 @@ DEFAULT_NICK = "cfuser"
 DEFAULT_CHANNEL = "##anime"
 NICKSERV_PASSWORD = os.environ.get("IRC_NICKSERV_PASSWORD", "")
 
-MAX_MESSAGES = 100
+MAX_MESSAGES = 500
 USER_HISTORY_WINDOW = 200
 AI_LOG_PATH = "ai_scores.log"
 AI_SUSPECT_THRESHOLD = 70
@@ -98,30 +98,35 @@ _ai_logging_enabled: bool = os.environ.get("IRC_AI_LOG", "1") not in ("0", "fals
 INPUT_HISTORY_PATH = "irc_input_history.txt"
 INPUT_HISTORY_MAX  = 500
 CHAT_LOG_DIR       = "chat_logs"
-CHAT_LOG_LOAD      = 100
+CHAT_LOG_LOAD      = 500
 
 # AI provider keys
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
 # Ollama: local/offline LLM server.  Override with OLLAMA_URL env var if running elsewhere.
-OLLAMA_URL: str   = os.environ.get("OLLAMA_URL", "http://127.0.0.1:8033")
+OLLAMA_URL: str    = os.environ.get("OLLAMA_URL",    "http://127.0.0.1:8033")
+# llama.cpp: local server with OpenAI-compatible API.  Override with LLAMACPP_URL env var.
+LLAMACPP_URL: str  = os.environ.get("LLAMACPP_URL",  "http://127.0.0.1:8033")
 
 # Unified model registry — key is the short name used in /askai, /summarize, /model.
-# Each entry: provider ("claude"|"openai"|"ollama"), api model id, human label.
+# Each entry: provider ("claude"|"openai"|"ollama"|"llamacpp"), api model id, human label.
 # Ollama models require `ollama serve` running locally; no API key needed.
 # Pull models with e.g.:  ollama pull gemma3:4b   or   ollama pull llama3.2
+# llama.cpp models require `llama-server` running at LLAMACPP_URL; model field is advisory.
 AI_MODELS: Dict[str, Dict[str, str]] = {
     # ── Cloud: Anthropic Claude ───────────────────────────────────────────
-    "opus":    {"provider": "claude", "id": "claude-opus-4-6",            "label": "Claude Opus 4"},
-    "sonnet":  {"provider": "claude", "id": "claude-sonnet-4-6",          "label": "Claude Sonnet 4"},
-    "haiku":   {"provider": "claude", "id": "claude-haiku-4-5-20251001",  "label": "Claude Haiku 4"},
+    "opus":    {"provider": "claude",   "id": "claude-opus-4-6",            "label": "Claude Opus 4"},
+    "sonnet":  {"provider": "claude",   "id": "claude-sonnet-4-6",          "label": "Claude Sonnet 4"},
+    "haiku":   {"provider": "claude",   "id": "claude-haiku-4-5-20251001",  "label": "Claude Haiku 4"},
     # ── Cloud: OpenAI GPT ─────────────────────────────────────────────────
-    "gpt4o":   {"provider": "openai", "id": "gpt-4o",                     "label": "GPT-4o"},
-    "gpt4":    {"provider": "openai", "id": "gpt-4-turbo",                "label": "GPT-4 Turbo"},
-    "gpt35":   {"provider": "openai", "id": "gpt-3.5-turbo",              "label": "GPT-3.5 Turbo"},
+    "gpt4o":   {"provider": "openai",   "id": "gpt-4o",                     "label": "GPT-4o"},
+    "gpt4":    {"provider": "openai",   "id": "gpt-4-turbo",                "label": "GPT-4 Turbo"},
+    "gpt35":   {"provider": "openai",   "id": "gpt-3.5-turbo",              "label": "GPT-3.5 Turbo"},
     # ── Local/offline: Ollama ─────────────────────────────────────────────
-    "gemma":   {"provider": "ollama", "id": "gemma3:4b",   "label": "Gemma 3 4B   (Ollama/offline)"},
-    "llama3":  {"provider": "ollama", "id": "llama3.2",    "label": "Llama 3.2    (Ollama/offline)"},
+    "gemma":   {"provider": "ollama",   "id": "gemma3:4b",   "label": "Gemma 3 4B   (Ollama/offline)"},
+    "llama3":  {"provider": "ollama",   "id": "llama3.2",    "label": "Llama 3.2    (Ollama/offline)"},
+    # ── Local/offline: llama.cpp ─────────────────────────────────────────
+    "gemma4":  {"provider": "llamacpp", "id": "gemma-4",     "label": "Gemma 4      (llama.cpp/offline)"},
 }
 # Keep CLAUDE_MODELS as a filtered view so existing internal references still work.
 CLAUDE_MODELS: Dict[str, str] = {
@@ -1009,6 +1014,119 @@ def _ollama_blocking_call(model_id: str, prompt: str, max_tokens: int) -> Tuple[
         return f"[error] Ollama call failed: {exc}", "?"
 
 
+def _llamacpp_blocking_call(model_id: str, prompt: str, max_tokens: int) -> Tuple[str, str]:
+    """Synchronous HTTP call to a llama.cpp server (run via asyncio executor).
+
+    Uses only stdlib urllib so no extra package is required.
+    Requires `llama-server` running at LLAMACPP_URL (default http://127.0.0.1:8033).
+    The model field is sent but ignored by llama.cpp — it serves whichever model was
+    loaded at startup.  Uses the OpenAI-compatible /v1/chat/completions endpoint.
+    """
+    body = json.dumps({
+        "model":      model_id,
+        "messages":   [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "stream":     False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{LLAMACPP_URL}/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        answer = (data.get("choices", [{}])[0]
+                      .get("message", {})
+                      .get("content", "(empty response)"))
+        usage  = data.get("usage", {})
+        total  = usage.get("total_tokens")
+        tokens = str(total) if isinstance(total, int) else "?"
+        return answer, tokens
+    except urllib.error.URLError as exc:
+        return (
+            f"[error] llama.cpp unreachable at {LLAMACPP_URL} — "
+            f"start it with: llama-server -m <model.gguf>\n"
+            f"Detail: {exc}"
+        ), "?"
+    except Exception as exc:
+        return f"[error] llama.cpp call failed: {exc}", "?"
+
+
+async def _llm_classify_ai(text: str, model_key: str) -> float:
+    """Ask the active /model to classify *text* as AI- or human-written.
+
+    Sends a tightly constrained prompt and expects a single-word reply of
+    "AI" or "HUMAN".  Returns 0.0–1.0 (1.0 = AI-generated).  Returns 0.0
+    on any network or parse error so it degrades gracefully.
+
+    Skipped for messages shorter than 6 words — too little signal to be
+    meaningful and would waste API / local-inference budget.
+    """
+    if len(text.split()) < 6:
+        return 0.0
+
+    prompt = (
+        "You are an AI-text detector reviewing IRC chat messages.\n"
+        "Classify the message below as written by a human or generated by AI.\n"
+        "Consider: informal language, typos, slang, IRC conventions, naturalness.\n"
+        "Reply with ONLY one word: AI or HUMAN.\n\n"
+        f"Message: {text!r}\n\nClassification:"
+    )
+
+    try:
+        if model_key.startswith("ollama:"):
+            provider = "ollama"
+            model_id = model_key[len("ollama:"):]
+        else:
+            spec = AI_MODELS.get(model_key)
+            if not spec:
+                return 0.0
+            provider = spec["provider"]
+            model_id = spec["id"]
+
+        answer = ""
+        if provider == "claude":
+            if not ANTHROPIC_AVAILABLE or not ANTHROPIC_API_KEY:
+                return 0.0
+            ac  = _anthropic_mod.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+            msg = await ac.messages.create(
+                model=model_id, max_tokens=10,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            answer = msg.content[0].text if msg.content else ""
+        elif provider == "openai":
+            if not OPENAI_AVAILABLE or not OPENAI_API_KEY:
+                return 0.0
+            oc   = _openai_mod.AsyncOpenAI(api_key=OPENAI_API_KEY)
+            resp = await oc.chat.completions.create(
+                model=model_id, max_tokens=10,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            answer = resp.choices[0].message.content if resp.choices else ""
+        elif provider == "ollama":
+            loop   = asyncio.get_running_loop()
+            answer, _ = await loop.run_in_executor(
+                None, _ollama_blocking_call, model_id, prompt, 10)
+        elif provider == "llamacpp":
+            loop   = asyncio.get_running_loop()
+            answer, _ = await loop.run_in_executor(
+                None, _llamacpp_blocking_call, model_id, prompt, 10)
+        else:
+            return 0.0
+
+        upper = answer.strip().upper()
+        if "HUMAN" in upper:
+            return 0.0
+        if "AI" in upper:
+            return 1.0
+        return 0.5   # ambiguous / unexpected reply
+
+    except Exception:
+        return 0.0
+
+
 class EnsembleAIDetector:
     _CACHE_MAX = 512  # LRU-style prediction cache (bots repeat themselves)
 
@@ -1021,6 +1139,7 @@ class EnsembleAIDetector:
 
     def __init__(self):
         self.enabled = True
+        self.active_detect_model: str = ""  # set by /model; empty = LLM detection disabled
         self._gpt2_model = None   # GPT-2: Binoculars performer
         self._obs_model  = None   # distilgpt2: Binoculars observer
         self._gpt2_tok   = None   # shared tokenizer (same BPE vocab)
@@ -1372,7 +1491,7 @@ class UserState:
                  "total_msgs", "ai_scores", "_rolling_sum", "_len_sum", "_time_sum")
     def __init__(self, nick: str):
         self.nick = nick
-        self.join_time = time.time()
+        self.join_time = time.monotonic()
         self.last_msg_time: Optional[float] = None
         self.msg_times: deque = deque(maxlen=USER_HISTORY_WINDOW)
         self.msg_lengths: deque = deque(maxlen=USER_HISTORY_WINDOW)
@@ -1383,7 +1502,7 @@ class UserState:
         self._time_sum:    float = 0.0
 
     def record_message(self, msg: str, ai_score: Optional[int] = None) -> None:
-        now = time.time()
+        now = time.monotonic()
         if self.last_msg_time is not None:
             gap = now - self.last_msg_time
             if len(self.msg_times) == USER_HISTORY_WINDOW:
@@ -1632,7 +1751,7 @@ class IRCClient:
 
     def _ctcp_allowed(self, nick: str) -> bool:
         """Allow at most 3 CTCP replies per nick per 30 s."""
-        now = time.time()
+        now = time.monotonic()
         q = self._ctcp_times.get(nick)
         if q is not None:
             while q and now - q[0] > 30:
@@ -2289,7 +2408,14 @@ class IRCClient:
             loop = asyncio.get_running_loop()
             detail = await loop.run_in_executor(
                 None, self.scoring.ai_detector.predict_detailed, msg)
-            a_score = int(detail["prob"] * 100)
+            prob = detail["prob"]
+            # Optional LLM-based classification: blended in when /model is set.
+            # Weight: 60% local ensemble (fast, always-on) + 40% LLM signal.
+            detect_model = self.scoring.ai_detector.active_detect_model
+            if detect_model:
+                llm_prob = await _llm_classify_ai(msg, detect_model)
+                prob = 0.60 * prob + 0.40 * llm_prob
+            a_score = int(prob * 100)
         except Exception:
             pass  # inference failed; log with score 0 so the event is still recorded
         u_state.record_message(msg, a_score)
@@ -2551,7 +2677,7 @@ class TUI:
             A("  No high-AI users detected in this session.")
         else:
             for nick, ai_pct, state in sorted(suspects, key=lambda x: x[1], reverse=True):
-                now = time.time()
+                now = time.monotonic()
                 join_ago = int((now - state.join_time) // 60)
                 last_ago = int((now - state.last_msg_time) // 60) if state.last_msg_time else 0
                 avg_len  = state.avg_msg_length()
@@ -2603,7 +2729,7 @@ class TUI:
         hist_task = loop.run_in_executor(None, load_nick_history, nick)
 
         state = self.client.users.get(nick)
-        now   = time.time()
+        now   = time.monotonic()
 
         # ── In-memory (current session) ─────────────────────────────────────
         if state:
@@ -2792,7 +2918,7 @@ class TUI:
 
         self._dashboard_mode        = "profile"
         self._dashboard_dirty       = False
-        self._dashboard_last_update = time.time()
+        self._dashboard_last_update = time.monotonic()
         self.current_window_index   = 1
         self._chat_dirty            = True
         self.dirty                  = True
@@ -2870,6 +2996,14 @@ class TUI:
             )
             return answer, tokens
 
+        if provider == "llamacpp":
+            # llama.cpp server — OpenAI-compatible API, no key needed.
+            loop   = asyncio.get_event_loop()
+            answer, tokens = await loop.run_in_executor(
+                None, _llamacpp_blocking_call, model_id, prompt, max_tokens
+            )
+            return answer, tokens
+
         return f"[error] unknown provider '{provider}'", "?"
 
     async def _do_askai(self, question: str, model_key: str) -> None:
@@ -2913,7 +3047,7 @@ class TUI:
         self.current_window_index = 1   # switch to *dashboard*
         self._chat_dirty = True
         self._dashboard_dirty = False
-        self._dashboard_last_update = time.time()
+        self._dashboard_last_update = time.monotonic()
         self.dirty = True
 
     async def _post_translation(self, win: ChatWindow, text: str) -> None:
@@ -3187,9 +3321,9 @@ class TUI:
             pass
 
     def redraw(self) -> bool:
-        if time.time() - self.last_redraw < 0.033:
+        if time.monotonic() - self.last_redraw < 0.033:
             return False
-        self.last_redraw = time.time()
+        self.last_redraw = time.monotonic()
 
         new_h, new_w = self.stdscr.getmaxyx()
         if new_h != self.height or new_w != self.width:
@@ -3507,6 +3641,7 @@ class TUI:
         h["ns"] = h["nickserv"] = self._slash_ns
         h["cs"] = h["chanserv"] = self._slash_cs
         h["ai"]         = self._slash_ai
+        h["topai"]      = self._slash_topai
         h["aitoggle"]   = self._slash_aitoggle
         h["logtoggle"]  = self._slash_logtoggle
         h["join"]       = self._slash_join
@@ -3639,6 +3774,63 @@ class TUI:
             await self.show_user_ai_profile(args)
         else:
             await self.ui_queue.put(("status", "Usage: /ai <nick>"))
+
+    async def _slash_topai(self, args, extra, line):
+        cur_win = self.get_current_window()
+        channel = cur_win.name if cur_win.name.startswith("#") else self.current_channel or ""
+        if not channel or channel not in self.channel_users:
+            await self.ui_queue.put(("status", "/topai: switch to a channel window first"))
+            return
+
+        client    = self._active_client()
+        chan_nicks = self.channel_users.get(channel, set())
+        bars      = "▁▂▃▄▅▆▇█"
+        now       = time.monotonic()
+
+        rows = []
+        for nick in chan_nicks:
+            state = client.users.get(nick)
+            if state is None or state.total_msgs == 0:
+                continue
+            ai_pct = int(state.rolling_ai_likelihood())
+            if ai_pct == 0:
+                continue
+            rows.append((nick, ai_pct, state))
+        rows.sort(key=lambda x: (-x[1], x[0].lower()))
+
+        dash = self.window_by_name["*dashboard*"]
+        dash.lines.clear()
+        dash._wrap_dirty = True
+        L = lambda t: dash.add_line(t, timestamp=False)
+
+        L(f"=== /topai — {channel}  ({len(rows)} scored users) ===")
+        L("")
+
+        if not rows:
+            L("  No users with scored messages in this channel yet.")
+        else:
+            L(f"  {'Nick':<16} {'AI%':>4}  {'Msgs':>4}  {'AvgLen':>6}  {'mpm':>5}  {'Last':>5}  History")
+            L("  " + "─" * 66)
+            thresh = self.ai_suspect_threshold
+            for nick, ai_pct, state in rows:
+                last_ago = (int((now - state.last_msg_time) // 60)
+                            if state.last_msg_time else 0)
+                spark    = "".join(bars[min(7, s * 8 // 101)]
+                                   for s in list(state.ai_scores)[-12:])
+                flag     = "*" if ai_pct >= thresh else " "
+                L(f"  {flag}{nick:<15} {ai_pct:3d}%  {state.total_msgs:4d}  "
+                  f"{state.avg_msg_length():6.0f}  {state.messages_per_minute():5.1f}"
+                  f"  {last_ago:3d}m  {spark}")
+
+        L("")
+        L(f"  * = at or above suspect threshold ({self.ai_suspect_threshold}%)")
+
+        self._dashboard_mode        = "profile"
+        self._dashboard_dirty       = False
+        self._dashboard_last_update = time.monotonic()
+        self.current_window_index   = 1
+        self._chat_dirty            = True
+        self.dirty                  = True
 
     async def _slash_aitoggle(self, args, extra, line):
         detector = self._active_client().scoring.ai_detector
@@ -3969,14 +4161,20 @@ class TUI:
             await self.ui_queue.put(("status", "/summarize: no messages in this window"))
             return
 
-        _TS_RE     = re.compile(r'^\[\d{2}:\d{2}\]\s*')
-        transcript = "\n".join(
-            irc_strip_formatting(_TS_RE.sub("", ln)) for ln in raw_lines
-        )
+        _TS_RE      = re.compile(r'^\[\d{2}:\d{2}\]\s*')
+        _SPEAKER_RE = re.compile(r'^<(\S+?)>')
+        cleaned     = [irc_strip_formatting(_TS_RE.sub("", ln)) for ln in raw_lines]
+        transcript  = "\n".join(cleaned)
+
+        speakers = sorted({m.group(1) for ln in cleaned for m in [_SPEAKER_RE.match(ln)] if m})
+        speaker_hint = (f"Active speakers: {', '.join(speakers)}\n\n" if speakers else "")
 
         if model_key.startswith("ollama:"):
             model_id = model_key[len("ollama:"):]
             label    = f"Ollama/{model_id}"
+        elif model_key.startswith("llamacpp:"):
+            model_id = model_key[len("llamacpp:"):]
+            label    = f"llama.cpp/{model_id}"
         else:
             spec     = AI_MODELS.get(model_key) or AI_MODELS[CLAUDE_DEFAULT_MODEL]
             model_id = spec["id"]
@@ -3984,9 +4182,17 @@ class TUI:
 
         prompt = (
             f"The following is a transcript of an IRC chat in \"{win.name}\" "
-            f"(last {len(raw_lines)} messages).\n\n"
-            f"Please provide a concise summary: main topics, key points, any decisions "
-            f"or conclusions, and notable participants. Keep it under 200 words.\n\n"
+            f"({len(raw_lines)} messages).\n"
+            f"{speaker_hint}"
+            f"Write a structured analysis covering:\n"
+            f"1. Main topics — what the conversation was about (2-3 sentences).\n"
+            f"2. Per-user contributions — for each active speaker, one or two sentences "
+            f"on what they said or argued.\n"
+            f"3. User interactions — who replied to whom, any debates, agreements, "
+            f"disagreements, jokes, or notable exchanges between specific users.\n"
+            f"4. Conclusions or open threads — any decisions reached or questions left unanswered.\n\n"
+            f"Be specific: name the users involved in each point. "
+            f"Keep the total under 400 words.\n\n"
             f"Transcript:\n{transcript}"
         )
 
@@ -3997,7 +4203,7 @@ class TUI:
 
         answer, tokens = "", "?"
         try:
-            answer, tokens = await self._call_ai(prompt, model_key, max_tokens=512)
+            answer, tokens = await self._call_ai(prompt, model_key, max_tokens=800)
         finally:
             self._askai_pending = False
 
@@ -4006,8 +4212,9 @@ class TUI:
         dash._wrap_dirty = True
         L = lambda t: dash.add_line(t, timestamp=False)
 
-        L(f"=== /summarize  [{win.name}]  last {len(raw_lines)} msgs"
-          f"  [{model_key}  {spec['label']}] ===")
+        L(f"=== /summarize  [{win.name}]  last {len(raw_lines)} msgs  [{model_key}  {label}] ===")
+        if speakers:
+            L(f"  Speakers: {', '.join(speakers)}")
         L("")
         for raw_line in answer.splitlines():
             L(f"  {raw_line}" if raw_line.strip() else "")
@@ -4017,41 +4224,46 @@ class TUI:
         self.current_window_index = 1
         self._chat_dirty = True
         self._dashboard_dirty = False
-        self._dashboard_last_update = time.time()
+        self._dashboard_last_update = time.monotonic()
         self._dashboard_mode = "profile"
         self.dirty = True
 
     async def _slash_model(self, args, extra, line):
         key = args.strip().lower()
+        detector = self._active_client().scoring.ai_detector
         if not key:
             # List every available model with its provider
             sw = self._status_win()
-            sw.add_line("Available AI models for /askai and /summarize:")
+            sw.add_line("Available AI models for /askai, /summarize, and AI detection:")
             for k, spec in AI_MODELS.items():
-                marker = "→" if k == self.ai_chat_model else " "
+                chat_mark = ">" if k == self.ai_chat_model else " "
+                det_mark  = "D" if k == detector.active_detect_model else " "
                 avail  = ""
                 if spec["provider"] == "claude" and not ANTHROPIC_API_KEY:
                     avail = "  (ANTHROPIC_API_KEY not set)"
                 elif spec["provider"] == "openai" and not OPENAI_API_KEY:
                     avail = "  (OPENAI_API_KEY not set)"
-                sw.add_line(f"  {marker} {k:<8} {spec['label']:<22} [{spec['provider']}]{avail}")
+                sw.add_line(f"  {chat_mark}{det_mark} {k:<8} {spec['label']:<22} [{spec['provider']}]{avail}")
+            sw.add_line("  > = chat model   D = also used for AI detection")
             sw.add_line(f"  Usage: /model <key>   current: {self.ai_chat_model}")
             self._chat_dirty = True
             self.dirty = True
             return
         if key in AI_MODELS:
             self.ai_chat_model = key
+            detector.active_detect_model = key
             spec = AI_MODELS[key]
             await self.ui_queue.put(("status",
-                f"AI model set to {key}  ({spec['label']}  {spec['id']})  [{spec['provider']}]"))
+                f"AI model set to {key}  ({spec['label']}  {spec['id']})  [{spec['provider']}]"
+                f"  — also active for AI detection"))
         else:
             keys = "  ".join(AI_MODELS)
             await self.ui_queue.put(("status",
                 f"Unknown model '{key}'. Available: {keys}  (current: {self.ai_chat_model})"))
 
     async def _slash_api(self, args, extra, line):
-        global ANTHROPIC_API_KEY, OPENAI_API_KEY, OLLAMA_URL
-        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OLLAMA_URL"}
+        global ANTHROPIC_API_KEY, OPENAI_API_KEY, OLLAMA_URL, LLAMACPP_URL
+        _KNOWN = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OLLAMA_URL", "LLAMACPP_URL"}
 
         if not args:
             sw = self._status_win()
@@ -4066,18 +4278,20 @@ class TUI:
                 return val[:8] + "\u2026" + val[-4:]
 
             rows = [
-                ("Claude", "ANTHROPIC_API_KEY", ANTHROPIC_API_KEY, "console.anthropic.com"),
-                ("OpenAI", "OPENAI_API_KEY",    OPENAI_API_KEY,    "platform.openai.com"),
-                ("Ollama", "OLLAMA_URL",         OLLAMA_URL,        "local server — no key needed"),
+                ("Claude",    "ANTHROPIC_API_KEY", ANTHROPIC_API_KEY, "console.anthropic.com"),
+                ("OpenAI",    "OPENAI_API_KEY",    OPENAI_API_KEY,    "platform.openai.com"),
+                ("Ollama",    "OLLAMA_URL",         OLLAMA_URL,        "local server — no key needed"),
+                ("llama.cpp", "LLAMACPP_URL",       LLAMACPP_URL,      "local server — no key needed"),
             ]
             for provider, varname, val, note in rows:
-                sw.add_line(f"  {provider:<8}  {varname:<22}  {_mask(val):<32}  ({note})")
+                sw.add_line(f"  {provider:<10}  {varname:<22}  {_mask(val):<32}  ({note})")
 
             sw.add_line("")
             sw.add_line("  Set a key:  /api <VAR_NAME> <value>")
             sw.add_line("    /api ANTHROPIC_API_KEY  sk-ant-api03-...")
             sw.add_line("    /api OPENAI_API_KEY     sk-proj-...")
             sw.add_line("    /api OLLAMA_URL         http://192.168.1.10:11434")
+            sw.add_line("    /api LLAMACPP_URL       http://192.168.1.10:8033")
             sw.add_line("")
             self._chat_dirty = True
             self.dirty = True
@@ -4098,13 +4312,15 @@ class TUI:
                     _openai_mod.api_key = value
             elif var_name == "OLLAMA_URL":
                 OLLAMA_URL = value
+            elif var_name == "LLAMACPP_URL":
+                LLAMACPP_URL = value
             masked = (value[:8] + "\u2026" + value[-4:]) if len(value) > 12 else (value[:4] + "****")
             await self.ui_queue.put(("status",
                 f"Set {var_name} = {masked}  (active immediately)"))
             return
 
         await self.ui_queue.put(("status",
-            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  OLLAMA_URL"))
+            f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  OLLAMA_URL  LLAMACPP_URL"))
 
     async def _slash_autotranslate(self, args, extra, line):
         self.auto_translate = not self.auto_translate
@@ -4163,6 +4379,7 @@ class TUI:
         _C("")
         _H("AI Detection")
         _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
+        _E("/topai",                        "All scored users in current channel, ranked by AI%")
         _E("/aitoggle",                     "Enable or disable AI scoring (detection)")
         _E("/logtoggle",                    "Enable or disable AI detection logging to disk (default: on)")
         _C("")
@@ -4219,8 +4436,8 @@ class TUI:
             "── Services ──────────────────────────────────────────────",
             "  /ns <cmd>  /cs <cmd>  /ctcp <nick> <cmd> [args]",
             "── AI Detection ──────────────────────────────────────────",
-            "  /ai <nick>  full profile    /aitoggle  enable/disable scoring",
-            "  /logtoggle  toggle logging to disk (on by default)",
+            "  /ai <nick>  full profile    /topai  channel ranking by AI%",
+            "  /aitoggle  enable/disable scoring    /logtoggle  toggle log",
             "── AI  (Claude / OpenAI) ─────────────────────────────────",
             "  /askai [model] <question>  (answer in dashboard)",
             "  /summarize [n] [model]  summarize last n msgs (default 50)",
@@ -4523,11 +4740,14 @@ class TUI:
                 pass
 
             # ── 4. Dashboard auto-refresh ─────────────────────────────────────────
-            now = time.time()
+            now = time.monotonic()
             on_dashboard = (self.get_current_window().name == "*dashboard*")
             # When the user navigates back to the dashboard from another window,
             # drop the profile view so the suspects list auto-refreshes normally.
             if on_dashboard and not self._prev_on_dashboard and self._dashboard_mode == "profile":
+                self._dashboard_mode = "suspects"
+            # Profile views (/summarize, /ai, /topai) hold for 30 s then expire.
+            if self._dashboard_mode == "profile" and now - self._dashboard_last_update >= 30.0:
                 self._dashboard_mode = "suspects"
             self._prev_on_dashboard = on_dashboard
             # Auto-refresh is suppressed while showing a profile (/ai output) so
