@@ -1473,9 +1473,98 @@ class EnsembleAIDetector:
         """Convenience wrapper — returns only the ensemble probability (0–1)."""
         return self.predict_detailed(text)["prob"]
 
+# =========================
+# BotFingerprint
+# =========================
+_STRIP_PUNCT = str.maketrans("", "", ".,!?;:\"'()[]")
+
+class BotFingerprint:
+    """Linguistic fingerprint built from a confirmed bot/AI user's messages.
+
+    Extracts vocabulary, bigrams, and trigrams so that future messages from
+    *other* users with similar word patterns receive a score boost — effectively
+    learning style from confirmed positives.
+    """
+
+    def __init__(self, nick: str):
+        self.nick       = nick
+        self.word_vocab: set = set()   # all lowercase words seen
+        self.bigrams:   set = set()    # consecutive word pairs
+        self.trigrams:  set = set()    # consecutive word triples
+        self.msg_count: int = 0
+
+    def _tokenize(self, text: str) -> List[str]:
+        return [w.lower().translate(_STRIP_PUNCT) for w in text.split() if w.strip(_STRIP_PUNCT)]
+
+    def ingest(self, text: str) -> None:
+        """Feed one message into this fingerprint."""
+        words = self._tokenize(text)
+        if not words:
+            return
+        self.word_vocab.update(words)
+        for i in range(len(words) - 1):
+            self.bigrams.add((words[i], words[i + 1]))
+        for i in range(len(words) - 2):
+            self.trigrams.add((words[i], words[i + 1], words[i + 2]))
+        self.msg_count += 1
+
+    def similarity(self, text: str) -> float:
+        """Return 0..1 — how closely *text* matches this bot's writing patterns.
+
+        Combines Jaccard vocabulary overlap with bigram/trigram hit rates.
+        Trigrams are the strongest signal because accidental three-word collisions
+        are rare in natural IRC conversation.
+        """
+        if not self.word_vocab:
+            return 0.0
+        words = self._tokenize(text)
+        if not words:
+            return 0.0
+
+        text_set = set(words)
+        vocab_j  = len(text_set & self.word_vocab) / len(text_set | self.word_vocab)
+
+        bi_score = 0.0
+        if len(words) >= 2 and self.bigrams:
+            text_bi  = {(words[i], words[i + 1]) for i in range(len(words) - 1)}
+            bi_score = len(text_bi & self.bigrams) / len(text_bi)
+
+        tri_score = 0.0
+        if len(words) >= 3 and self.trigrams:
+            text_tri  = {(words[i], words[i + 1], words[i + 2]) for i in range(len(words) - 2)}
+            tri_score = len(text_tri & self.trigrams) / len(text_tri)
+
+        return min(1.0, 0.25 * vocab_j + 0.35 * bi_score + 0.40 * tri_score)
+
+
 class ScoringEngine:
     def __init__(self, ai_detector: EnsembleAIDetector):
-        self.ai_detector = ai_detector
+        self.ai_detector      = ai_detector
+        self.confirmed_bot_nicks: set = set()
+        self.bot_fingerprints: Dict[str, BotFingerprint] = {}
+
+    def confirm_bot(self, nick: str, messages: List[str]) -> BotFingerprint:
+        """Mark *nick* as a confirmed bot and build their linguistic fingerprint."""
+        self.confirmed_bot_nicks.add(nick)
+        fp = self.bot_fingerprints.get(nick) or BotFingerprint(nick)
+        for msg in messages:
+            fp.ingest(msg)
+        self.bot_fingerprints[nick] = fp
+        return fp
+
+    def unconfirm_bot(self, nick: str) -> None:
+        self.confirmed_bot_nicks.discard(nick)
+        self.bot_fingerprints.pop(nick, None)
+
+    def max_fingerprint_similarity(self, text: str, exclude_nick: str = "") -> float:
+        """Return the highest similarity score of *text* against all bot fingerprints."""
+        if not self.bot_fingerprints:
+            return 0.0
+        return max(
+            fp.similarity(text)
+            for n, fp in self.bot_fingerprints.items()
+            if n != exclude_nick
+        )
 
     def score_user(self, user_state) -> int:
         return min(99, user_state.total_msgs // 2)
@@ -1488,7 +1577,8 @@ class ScoringEngine:
 # =========================
 class UserState:
     __slots__ = ("nick", "join_time", "last_msg_time", "msg_times", "msg_lengths",
-                 "total_msgs", "ai_scores", "_rolling_sum", "_len_sum", "_time_sum")
+                 "total_msgs", "ai_scores", "_rolling_sum", "_len_sum", "_time_sum",
+                 "is_confirmed_bot")
     def __init__(self, nick: str):
         self.nick = nick
         self.join_time = time.monotonic()
@@ -1500,6 +1590,7 @@ class UserState:
         self._rolling_sum: float = 0.0
         self._len_sum:     int   = 0
         self._time_sum:    float = 0.0
+        self.is_confirmed_bot: bool = False
 
     def record_message(self, msg: str, ai_score: Optional[int] = None) -> None:
         now = time.monotonic()
@@ -2405,17 +2496,33 @@ class IRCClient:
         a_score = 0
         detail: Dict[str, float] = {"prob": 0.0, "heu": 0.0, "bino": 0.0, "cls": 0.0, "llama": 0.0}
         try:
-            loop = asyncio.get_running_loop()
-            detail = await loop.run_in_executor(
-                None, self.scoring.ai_detector.predict_detailed, msg)
-            prob = detail["prob"]
-            # Optional LLM-based classification: blended in when /model is set.
-            # Weight: 60% local ensemble (fast, always-on) + 40% LLM signal.
-            detect_model = self.scoring.ai_detector.active_detect_model
-            if detect_model:
-                llm_prob = await _llm_classify_ai(msg, detect_model)
-                prob = 0.60 * prob + 0.40 * llm_prob
-            a_score = int(prob * 100)
+            # Confirmed bots: skip inference entirely — score is always 100.
+            # Also ingest the message into their fingerprint to keep learning.
+            if nick in self.scoring.confirmed_bot_nicks:
+                fp = self.scoring.bot_fingerprints.get(nick)
+                if fp is not None:
+                    fp.ingest(msg)
+                a_score = 100
+            else:
+                loop = asyncio.get_running_loop()
+                detail = await loop.run_in_executor(
+                    None, self.scoring.ai_detector.predict_detailed, msg)
+                prob = detail["prob"]
+                # Optional LLM-based classification: blended in when /model is set.
+                # Weight: 60% local ensemble (fast, always-on) + 40% LLM signal.
+                detect_model = self.scoring.ai_detector.active_detect_model
+                if detect_model:
+                    llm_prob = await _llm_classify_ai(msg, detect_model)
+                    prob = 0.60 * prob + 0.40 * llm_prob
+                # Fingerprint similarity boost: if this message strongly resembles
+                # a confirmed bot's writing style, nudge the probability up.
+                # Excluded nicks: this user's own fingerprint (if they were later
+                # confirmed too) — only cross-nick learning applies here.
+                fp_sim = self.scoring.max_fingerprint_similarity(msg, exclude_nick=nick)
+                if fp_sim > 0.0:
+                    # Max +35 percentage points at full similarity; tapers off smoothly.
+                    prob = min(1.0, prob + 0.35 * fp_sim)
+                a_score = int(prob * 100)
         except Exception:
             pass  # inference failed; log with score 0 so the event is still recorded
         u_state.record_message(msg, a_score)
@@ -2784,7 +2891,12 @@ class TUI:
         combined_avg  = h_avg if h_total > 0 else (int(sum(scores) / len(scores)) if scores else 0)
         n_sessions    = len(active_sessions)
         is_consistent = h_std < 10 if h_total > 0 else (s_std < 10 if scores else True)
-        if combined_avg >= 80 and n_sessions >= 3 and is_consistent:
+        is_bot        = (state and state.is_confirmed_bot) or (
+            nick in self._active_client().scoring.confirmed_bot_nicks)
+        fp            = self._active_client().scoring.bot_fingerprints.get(nick)
+        if is_bot:
+            verdict = "CONFIRMED BOT/AI — manually identified"
+        elif combined_avg >= 80 and n_sessions >= 3 and is_consistent:
             verdict = "HIGH RISK — persistent, consistent AI pattern across multiple sessions"
         elif combined_avg >= 70:
             verdict = "SUSPECT — elevated AI score"
@@ -2794,7 +2906,11 @@ class TUI:
             verdict = "LOW — no strong AI signal"
 
         # ── Render ───────────────────────────────────────────────────────────
-        L(f"=== AI Profile: {nick} ===")
+        bot_badge = "  *** CONFIRMED BOT/AI ***" if is_bot else ""
+        L(f"=== AI Profile: {nick}{bot_badge} ===")
+        if is_bot and fp:
+            L(f"  Fingerprint: {fp.msg_count} msgs  {len(fp.bigrams)} bigrams  "
+              f"{len(fp.trigrams)} trigrams  {len(fp.word_vocab)} unique words")
         L("")
 
         if state:
@@ -3645,6 +3761,8 @@ class TUI:
         h["ns"] = h["nickserv"] = self._slash_ns
         h["cs"] = h["chanserv"] = self._slash_cs
         h["ai"]         = self._slash_ai
+        h["bot"]        = self._slash_bot
+        h["unbot"]      = self._slash_unbot
         h["topai"]      = self._slash_topai
         h["aitoggle"]   = self._slash_aitoggle
         h["logtoggle"]  = self._slash_logtoggle
@@ -3779,6 +3897,65 @@ class TUI:
         else:
             await self.ui_queue.put(("status", "Usage: /ai <nick>"))
 
+    # ── /bot and /unbot ──────────────────────────────────────────────────────
+
+    _MSG_LINE_RE = re.compile(r'^\[\d{2}:\d{2}\] <(\S+?)> (.+)$')
+    _ACT_LINE_RE = re.compile(r'^\[\d{2}:\d{2}\] \* (\S+) (.+)$')
+
+    async def _slash_bot(self, args, extra, line):
+        """Mark a nick as a confirmed bot/AI and build a fingerprint from history."""
+        nick = args.strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /bot <nick>  —  mark as confirmed bot/AI"))
+            return
+
+        client  = self._active_client()
+        scoring = client.scoring
+
+        # Mark UserState if the nick is seen this session.
+        u_state = client.users.get(nick)
+        if u_state:
+            u_state.is_confirmed_bot = True
+
+        # Extract messages by this nick from all visible chat windows to seed the
+        # fingerprint with as much context as possible.
+        raw_msgs: List[str] = []
+        for win in self.windows:
+            for ln in win.lines:
+                m = self._MSG_LINE_RE.match(ln)
+                if m and m.group(1) == nick:
+                    raw_msgs.append(m.group(2))
+                    continue
+                a = self._ACT_LINE_RE.match(ln)
+                if a and a.group(1) == nick:
+                    raw_msgs.append(a.group(2))
+
+        fp = scoring.confirm_bot(nick, raw_msgs)
+
+        msg_count = u_state.total_msgs if u_state else 0
+        await self.ui_queue.put(("status",
+            f"[bot] {nick} marked as confirmed bot/AI — "
+            f"fingerprint built from {fp.msg_count} msgs "
+            f"({len(fp.bigrams)} bigrams, {len(fp.trigrams)} trigrams)  "
+            f"session msgs: {msg_count}"))
+
+    async def _slash_unbot(self, args, extra, line):
+        """Remove confirmed-bot status from a nick."""
+        nick = args.strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /unbot <nick>"))
+            return
+
+        client  = self._active_client()
+        scoring = client.scoring
+
+        u_state = client.users.get(nick)
+        if u_state:
+            u_state.is_confirmed_bot = False
+
+        scoring.unconfirm_bot(nick)
+        await self.ui_queue.put(("status", f"[bot] {nick} removed from confirmed-bot list"))
+
     async def _slash_topai(self, args, extra, line):
         cur_win = self.get_current_window()
         channel = cur_win.name if cur_win.name.startswith("#") else self.current_channel or ""
@@ -3791,16 +3968,22 @@ class TUI:
         bars      = "▁▂▃▄▅▆▇█"
         now       = time.monotonic()
 
+        confirmed = client.scoring.confirmed_bot_nicks
+
         rows = []
         for nick in chan_nicks:
             state = client.users.get(nick)
+            is_bot = nick in confirmed
             if state is None or state.total_msgs == 0:
+                # Include confirmed bots even with 0 session messages
+                if not is_bot:
+                    continue
+            ai_pct = int(state.rolling_ai_likelihood()) if state else 100
+            if ai_pct == 0 and not is_bot:
                 continue
-            ai_pct = int(state.rolling_ai_likelihood())
-            if ai_pct == 0:
-                continue
-            rows.append((nick, ai_pct, state))
-        rows.sort(key=lambda x: (-x[1], x[0].lower()))
+            rows.append((nick, ai_pct, state, is_bot))
+        # Confirmed bots always sort first, then by descending AI%
+        rows.sort(key=lambda x: (not x[3], -x[1], x[0].lower()))
 
         dash = self.window_by_name["*dashboard*"]
         dash.lines.clear()
@@ -3816,18 +3999,27 @@ class TUI:
             L(f"  {'Nick':<16} {'AI%':>4}  {'Msgs':>4}  {'AvgLen':>6}  {'mpm':>5}  {'Last':>5}  History")
             L("  " + "─" * 66)
             thresh = self.ai_suspect_threshold
-            for nick, ai_pct, state in rows:
+            for nick, ai_pct, state, is_bot in rows:
                 last_ago = (int((now - state.last_msg_time) // 60)
-                            if state.last_msg_time else 0)
-                spark    = "".join(bars[min(7, s * 8 // 101)]
-                                   for s in list(state.ai_scores)[-12:])
-                flag     = "*" if ai_pct >= thresh else " "
-                L(f"  {flag}{nick:<15} {ai_pct:3d}%  {state.total_msgs:4d}  "
-                  f"{state.avg_msg_length():6.0f}  {state.messages_per_minute():5.1f}"
+                            if state and state.last_msg_time else 0)
+                spark    = ("".join(bars[min(7, s * 8 // 101)]
+                                    for s in list(state.ai_scores)[-12:])
+                            if state else "")
+                msgs     = state.total_msgs if state else 0
+                avg_len  = state.avg_msg_length() if state else 0.0
+                mpm      = state.messages_per_minute() if state else 0.0
+                if is_bot:
+                    flag = "B"
+                elif ai_pct >= thresh:
+                    flag = "*"
+                else:
+                    flag = " "
+                L(f"  {flag}{nick:<15} {ai_pct:3d}%  {msgs:4d}  "
+                  f"{avg_len:6.0f}  {mpm:5.1f}"
                   f"  {last_ago:3d}m  {spark}")
 
         L("")
-        L(f"  * = at or above suspect threshold ({self.ai_suspect_threshold}%)")
+        L(f"  B = confirmed bot/AI  * = at or above suspect threshold ({self.ai_suspect_threshold}%)")
 
         self._dashboard_mode           = "profile"
         self._dashboard_profile_locked = True
@@ -4386,6 +4578,8 @@ class TUI:
         _H("AI Detection")
         _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
         _E("/topai",                        "All scored users in current channel, ranked by AI%")
+        _E("/bot <nick>",                   "Mark nick as confirmed bot/AI; builds typing fingerprint")
+        _E("/unbot <nick>",                 "Remove confirmed-bot status and fingerprint for nick")
         _E("/aitoggle",                     "Enable or disable AI scoring (detection)")
         _E("/logtoggle",                    "Enable or disable AI detection logging to disk (default: on)")
         _C("")
