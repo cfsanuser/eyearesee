@@ -2524,6 +2524,7 @@ class TUI:
         # "profile"  = /ai output; suppresses auto-refresh until user navigates away and back
         self._dashboard_mode = "suspects"
         self._prev_on_dashboard = False           # edge-detect navigate-back-to-dashboard
+        self._dashboard_profile_locked = False    # one-shot: skip reset on same-tick navigate
 
         # Claude API state
         self.ai_chat_model: str = CLAUDE_DEFAULT_MODEL   # key into CLAUDE_MODELS
@@ -2916,12 +2917,13 @@ class TUI:
         L("  ── Verdict ──────────────────────────────────")
         L(f"  {verdict}")
 
-        self._dashboard_mode        = "profile"
-        self._dashboard_dirty       = False
-        self._dashboard_last_update = time.monotonic()
-        self.current_window_index   = 1
-        self._chat_dirty            = True
-        self.dirty                  = True
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self.current_window_index      = 1
+        self._chat_dirty               = True
+        self.dirty                     = True
 
     async def _call_ai(self, prompt: str, model_key: str,
                        max_tokens: int = 1024) -> Tuple[str, str]:
@@ -3044,11 +3046,13 @@ class TUI:
         L("")
         L(f"  model: {model_id}  tokens used: {tokens}")
 
-        self.current_window_index = 1   # switch to *dashboard*
-        self._chat_dirty = True
-        self._dashboard_dirty = False
-        self._dashboard_last_update = time.monotonic()
-        self.dirty = True
+        self.current_window_index      = 1   # switch to *dashboard*
+        self._chat_dirty               = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self.dirty                     = True
 
     async def _post_translation(self, win: ChatWindow, text: str) -> None:
         """Translate *text* and append the result as an indented line in *win*.
@@ -3825,12 +3829,13 @@ class TUI:
         L("")
         L(f"  * = at or above suspect threshold ({self.ai_suspect_threshold}%)")
 
-        self._dashboard_mode        = "profile"
-        self._dashboard_dirty       = False
-        self._dashboard_last_update = time.monotonic()
-        self.current_window_index   = 1
-        self._chat_dirty            = True
-        self.dirty                  = True
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self.current_window_index      = 1
+        self._chat_dirty               = True
+        self.dirty                     = True
 
     async def _slash_aitoggle(self, args, extra, line):
         detector = self._active_client().scoring.ai_detector
@@ -4221,12 +4226,13 @@ class TUI:
         L("")
         L(f"  model: {model_id}  tokens used: {tokens}")
 
-        self.current_window_index = 1
-        self._chat_dirty = True
-        self._dashboard_dirty = False
-        self._dashboard_last_update = time.monotonic()
-        self._dashboard_mode = "profile"
-        self.dirty = True
+        self.current_window_index      = 1
+        self._chat_dirty               = True
+        self._dashboard_dirty          = False
+        self._dashboard_last_update    = time.monotonic()
+        self._dashboard_mode           = "profile"
+        self._dashboard_profile_locked = True
+        self.dirty                     = True
 
     async def _slash_model(self, args, extra, line):
         key = args.strip().lower()
@@ -4744,8 +4750,13 @@ class TUI:
             on_dashboard = (self.get_current_window().name == "*dashboard*")
             # When the user navigates back to the dashboard from another window,
             # drop the profile view so the suspects list auto-refreshes normally.
+            # _dashboard_profile_locked is set by commands that switch to profile in
+            # the same tick — skip the reset once so the 30-second hold can start.
             if on_dashboard and not self._prev_on_dashboard and self._dashboard_mode == "profile":
-                self._dashboard_mode = "suspects"
+                if self._dashboard_profile_locked:
+                    self._dashboard_profile_locked = False  # consume lock; hold the profile
+                else:
+                    self._dashboard_mode = "suspects"       # genuine navigate-back — reset
             # Profile views (/summarize, /ai, /topai) hold for 30 s then expire.
             if self._dashboard_mode == "profile" and now - self._dashboard_last_update >= 30.0:
                 self._dashboard_mode = "suspects"
