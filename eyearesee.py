@@ -4757,8 +4757,8 @@ class TUI:
                     self._dashboard_profile_locked = False  # consume lock; hold the profile
                 else:
                     self._dashboard_mode = "suspects"       # genuine navigate-back — reset
-            # Profile views (/summarize, /ai, /topai) hold for 30 s then expire.
-            if self._dashboard_mode == "profile" and now - self._dashboard_last_update >= 30.0:
+            # Profile views (/summarize, /ai, /topai) hold for 60 s then expire.
+            if self._dashboard_mode == "profile" and now - self._dashboard_last_update >= 60.0:
                 self._dashboard_mode = "suspects"
             self._prev_on_dashboard = on_dashboard
             # Auto-refresh is suppressed while showing a profile (/ai output) so
