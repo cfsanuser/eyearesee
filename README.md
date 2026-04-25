@@ -63,7 +63,8 @@ Honest assessment:
 
 The TUI class is enormous (~2,700 lines). It's doing rendering, input, every slash command, multi-server bookkeeping, and dashboard generation. It's the obvious refactor target — pulling slash commands into a registry like the plugin system already uses would shed thousands of lines.
 Single-file packaging at 5,500 lines makes the codebase harder to navigate than it needs to be. Splitting EnsembleAIDetector and the IRC protocol layer into their own modules would help future-you a lot.
-Auto-pip-install on launch is convenient but surprising; some users won't expect a chat client to mutate their site-packages. A --no-install flag or at least a confirmation prompt would be friendlier.
+Auto-pip-install on launch is convenient but surprising; some users won't expect a chat client to mutate their site-packages. A --no-install flag or --no-ai is
+set it will stay disabled.
 The Google Translate endpoint used (translate.googleapis.com/translate_a/single?client=gtx) is undocumented and unofficial — it works today but Google has rate-limited or broken it before. Worth having a graceful fallback path.
 Heuristics in formality_score have hand-tuned weights without an obvious calibration corpus. The comment says "calibrated for 2025/2026 LLM output patterns" which is honest, but the false-positive rate on heavily formal human writers (academics, non-native English speakers writing carefully) is probably non-trivial. The fingerprint feedback loop could amplify this.
 Plenty of broad except Exception: pass in the I/O paths. Pragmatic for a TUI app where you don't want a logging hiccup to crash the chat, but it does swallow real bugs.
