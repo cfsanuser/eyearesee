@@ -74,6 +74,9 @@ except ModuleNotFoundError:
     try:
         import windows_curses  # type: ignore
     except ImportError:
+        if "--no-install" in sys.argv:
+            sys.exit("windows-curses not found and --no-install is set. "
+                     "Run without --no-install or: pip install windows-curses")
         print("windows-curses not found — installing...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "windows-curses"])
     import curses
