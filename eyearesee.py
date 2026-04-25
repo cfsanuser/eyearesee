@@ -788,6 +788,44 @@ def load_nick_history(nick: str) -> dict:
     }
 
 
+# Per-nick AI score history loaded from ai_scores.log at startup.
+# Maps nick → list[int] of the last _NICK_AI_HISTORY_LIMIT 'a' scores, chronological.
+_NICK_AI_HISTORY: Dict[str, List[int]] = {}
+_NICK_AI_HISTORY_LIMIT = 50  # max prior scores seeded per nick per session
+
+
+def _load_all_nick_ai_history() -> None:
+    """Read ai_scores.log once at startup and populate _NICK_AI_HISTORY.
+
+    Keeps only the last _NICK_AI_HISTORY_LIMIT scores per nick so historical
+    evidence doesn't overwhelm new in-session observations.  Silently skips
+    corrupt lines and missing files.
+    """
+    global _NICK_AI_HISTORY
+    tmp: Dict[str, List[int]] = {}
+    try:
+        with open(AI_LOG_PATH, "r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw or not raw.startswith("{"):
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if rec.get("type") == "session_start":
+                    continue
+                nick = rec.get("nick", "")
+                a    = rec.get("a")
+                if nick and isinstance(a, (int, float)):
+                    tmp.setdefault(nick, []).append(int(a))
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    _NICK_AI_HISTORY = {k: v[-_NICK_AI_HISTORY_LIMIT:] for k, v in tmp.items()}
+
+
 def load_historical_suspects(threshold: int) -> list:
     """Return list of (nick, avg_score, total_msgs, first_ts) for all nicks in the
     log whose average AI score is >= threshold, sorted by avg_score descending."""
@@ -1619,6 +1657,15 @@ class UserState:
             self.ai_scores.append(ai_score)
             self._rolling_sum += ai_score
 
+    def seed_ai_history(self, scores: List[int]) -> None:
+        """Pre-seed ai_scores from historical log data without affecting message counts."""
+        for score in scores:
+            score = max(0, min(100, score))
+            if len(self.ai_scores) == USER_HISTORY_WINDOW:
+                self._rolling_sum -= self.ai_scores[0]
+            self.ai_scores.append(score)
+            self._rolling_sum += score
+
     def rolling_ai_likelihood(self) -> float:
         n = len(self.ai_scores)
         return self._rolling_sum / n if n else 0.0
@@ -2230,7 +2277,10 @@ class IRCClient:
             return  # CTCP — never treat as normal message
 
         if nick not in self.users:
-            self.users[nick] = UserState(nick)
+            u = UserState(nick)
+            if nick in _NICK_AI_HISTORY:
+                u.seed_ai_history(_NICK_AI_HISTORY[nick])
+            self.users[nick] = u
         u_state = self.users[nick]
         u_score = self.scoring.score_user(u_state)
         m_score = self.scoring.score_message(None, u_state)
@@ -2462,7 +2512,10 @@ class IRCClient:
             self.send_raw(f"PRIVMSG {target} :{text}")
 
         if self.nick not in self.users:
-            self.users[self.nick] = UserState(self.nick)
+            u = UserState(self.nick)
+            if self.nick in _NICK_AI_HISTORY:
+                u.seed_ai_history(_NICK_AI_HISTORY[self.nick])
+            self.users[self.nick] = u
         u_state = self.users[self.nick]
         u_state.record_message(text)
         u_score = self.scoring.score_user(u_state)
@@ -5412,6 +5465,7 @@ def main():
     # Load AI models before curses starts so progress prints go to the normal
     # terminal and don't corrupt the TUI display.
     ai_detector = EnsembleAIDetector()
+    _load_all_nick_ai_history()
 
     # Start logging immediately — before curses initialises — so the session
     # record is written even if the TUI fails to start (bad terminal size, etc.).
