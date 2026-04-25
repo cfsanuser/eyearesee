@@ -112,7 +112,7 @@ CHAT_LOG_LOAD      = 500
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
 # Ollama: local/offline LLM server.  Override with OLLAMA_URL env var if running elsewhere.
-OLLAMA_URL: str    = os.environ.get("OLLAMA_URL",    "http://127.0.0.1:8033")
+OLLAMA_URL: str    = os.environ.get("OLLAMA_URL",    "http://127.0.0.1:11434")
 # llama.cpp: local server with OpenAI-compatible API.  Override with LLAMACPP_URL env var.
 LLAMACPP_URL: str  = os.environ.get("LLAMACPP_URL",  "http://127.0.0.1:8033")
 
