@@ -1,3 +1,5 @@
+( For windows users don't forget to install Python: https://www.python.org/downloads/ and don't forget to run pip install windows-curses )
+
 eyearesee — Terminal IRC Client with Built-in AI Detection
 eyearesee.py is a single-file, ~5,200-line Python IRC client that runs in the terminal (curses TUI) and bolts a fairly serious AI-text-detection pipeline onto a real, working IRC stack. The headline idea: while you're chatting, every message on the channel is scored in the background for how likely it is to have been written by an LLM, and suspect users get flagged in the userlist with a rolling score.
 It runs on Linux, macOS, and Windows (auto-installs windows-curses if needed), connects over SSL by default (irc.libera.chat:6697), and prompts you for server / nick / channel / NickServ password on first launch.
