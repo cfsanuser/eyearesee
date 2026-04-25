@@ -1,69 +1,72 @@
-( For windows users don't forget to install Python: https://www.python.org/downloads/ and don't forget to run pip install windows-curses )
+Analysis: eyearesee.py
+What it is
+eyearesee.py (the name puns on "I-R-C") is a single-file, terminal-based IRC client written in Python 3 — about 5,480 lines in one module. Despite being one file, it bundles together what would normally be three or four separate projects:
 
-eyearesee — Terminal IRC Client with Built-in AI Detection
-eyearesee.py is a single-file, ~5,200-line Python IRC client that runs in the terminal (curses TUI) and bolts a fairly serious AI-text-detection pipeline onto a real, working IRC stack. The headline idea: while you're chatting, every message on the channel is scored in the background for how likely it is to have been written by an LLM, and suspect users get flagged in the userlist with a rolling score.
-It runs on Linux, macOS, and Windows (auto-installs windows-curses if needed), connects over SSL by default (irc.libera.chat:6697), and prompts you for server / nick / channel / NickServ password on first launch.
-Core architecture
-A handful of cooperating classes do the work, all driven by asyncio:
+A full-featured IRC client with a curses TUI
+An AI-text detection engine that scores every message for likelihood of being LLM-generated
+LLM integration for asking questions and summarizing chat (Claude, OpenAI, Ollama, llama.cpp)
+A small plugin system with hot-reload
 
-IRCClient — async TCP/SSL socket, full IRC line parser, handles JOIN/PART/QUIT/PRIVMSG/NOTICE/MODE/CAP, NickServ identify, CTCP, server numerics, and reconnection.
-TUI — curses-based interface with multiple windows (status, channels, DMs), userlist sidebar, scrollable buffer, input line with history, theme support, and a dashboard.
-EnsembleAIDetector — the ML side; loads several models and combines their scores.
-ScoringEngine / UserState / BotFingerprint — per-nick rolling state, score history, typing fingerprints for confirmed bots.
-PluginManager / PluginAPI — runtime-loadable Python plugins.
-ServerContext — lets you connect to multiple IRC networks in parallel from one TUI.
+It's clearly a personal/hobby project of considerable scope — the comments are conversational, packages auto-install on first run, and the whole thing is designed to launch from a single python eyearesee.py invocation.
+High-level architecture
+The module is organized into roughly ten classes plus a layer of free functions. The major ones, by size:
+ClassLinesRoleTUI~2,700Curses interface, input handling, slash-command dispatch, renderingIRCClient~900Async IRC protocol: connection, parsing, sending, NickServ, CTCP, flood controlEnsembleAIDetector~350The AI-detection ensemble (transformers + heuristics)PluginAPI / PluginManager~150Public API surface + lifecycle for user pluginsScoringEngine, BotFingerprint, UserState, ChatWindow, ServerContextsmallerPer-user/per-channel state and scoring glue
+Concurrency is built on asyncio — one task drives the IRC connection (read loop, write queue with rate-limiting for flood protection), another drives the TUI render/input loop, and they communicate through an asyncio.Queue. curses.wrapper runs asyncio.run(main_curses(...)), which is a slightly unusual but workable pattern.
+Multi-server support is in there: TUI.servers is a dict of ServerContext objects, and the active server's state is aliased onto self.* during event dispatch.
+The IRC client side
+The IRC half is reasonably complete, not just a toy:
 
-Feature highlights
-1. Real IRC client, not a toy
-It's a complete client: SSL connections, multi-server support (/server), channel join/part, DMs (/msg, /query), /me actions, NickServ/ChanServ, modes and ops (/op, /voice, /ban, /kick, /invite, /mode), /whois, /who, /whowas, /away//back, /ignore, CTCP, /topic, /names. Channel-join error numerics (471/473/474/475/477/489) are routed back to the relevant window so you actually see why a join failed.
-2. AI-text detection ensemble
-This is the unusual part. For every message, it computes an AI-likelihood score (0–100) by combining four signals:
+TLS by default (port 6697), with the option to fall back to plain.
+CAP negotiation, NickServ identification (password from IRC_NICKSERV_PASSWORD env var), CTCP responses with rate-limiting, ISUPPORT parsing.
+Outbound flood control — every send goes through an asyncio.Queue (max 512) drained by a writer task that paces messages so the server doesn't disconnect for excess flood.
+Numeric replies are categorized into frozensets (_WHOIS_REPLIES, _WHO_REPLIES, _SERVER_INFO, _ERROR_REPLIES, _SILENT_NUMERICS) for fast routing.
+Per-window chat logs in chat_logs/, with safe-filename sanitization that also collapses .. to prevent directory traversal.
+Input history persists across runs in irc_input_history.txt.
+CJK auto-translation: messages with ≥2 CJK characters are routed through Google Translate's free translate_a/single endpoint, gated by an asyncio.Semaphore(3) and an LRU cache (256 entries) so common phrases never re-hit the network.
 
-Binoculars — runs the text through GPT-2 (the "performer") and DistilGPT-2 (the "observer") and looks at the cross-entropy ratio. AI-generated text tends to have an unusually low ratio because it's "too predictable."
-RoBERTa classifiers — Hello-SimpleAI/chatgpt-detector-roberta (primary) and openai-community/roberta-base-openai-detector (secondary, broader).
-Heuristics — entropy, repetition, formality, em-dash usage, contractions, length, capitalization patterns.
-LLM "tell" phrase lists — large frozensets of giveaway phrases ("delve into," "tapestry," "it's worth noting," "as an AI," "I hope this helps," etc.) plus a separate Llama/open-source-LLM pattern detector that catches things like markdown structure in plain chat, numbered lists, and bot-opener words.
+The slash-command surface is broad — channel ops (/op, /ban, /mode), services (/ns, /cs), users (/whois, /ignore, /away), windows/themes, plugins, and 5 built-in color themes. The terminal-rendering code is careful: there are dedicated wide-character helpers (_char_width, _str_visual_width, _truncate_to_width, _irc_visual_pos) so CJK columns don't break alignment, and IRC formatting codes (\x02 bold, \x03 color, \x1D italic, etc.) are parsed into curses attributes with a 512-entry parse cache to avoid re-parsing on every redraw.
+The AI-detection engine
+This is the most interesting part and what gives the file its character. EnsembleAIDetector blends several signals to produce a 0–100 "AI score" for each message:
 
-Models load on startup with progress messages, run on GPU if available (torch.cuda), and predictions are LRU-cached (512 entries) since bots repeat themselves.
-Optional: /model can route messages through Claude, GPT, Ollama, or llama.cpp for an additional "is this AI?" verdict from an actual LLM.
-3. Per-user scoring and flagging
+Binoculars (Hans et al., 2024) — runs the text through GPT-2 as a "performer" and DistilGPT-2 as an "observer" and uses the cross-entropy ratio as a perplexity-based AI signal. This is a real published technique.
+A primary classifier: Hello-SimpleAI/chatgpt-detector-roberta — a HuggingFace RoBERTa fine-tuned on ChatGPT outputs.
+A secondary classifier (optional, opportunistic): openai-community/roberta-base-openai-detector — broader GPT-2-era detector for non-OpenAI families.
+Hand-tuned heuristics: a formality_score that adds weighted signals for em-dashes, "AI tell phrases", Llama-specific phrasing, lack of contractions, capitalized openings, no emoticons, plus a llama_pattern_score that catches markdown lists/bullets/numbered structure showing up incongruously in IRC.
+Optional LLM-as-judge: for the active model (/model), it can call out to Claude/OpenAI/Ollama/llama.cpp asking "is this AI text?" — combined as 60% local ensemble + 40% LLM signal.
+BotFingerprint: once a user is confirmed via /bot <nick>, the engine builds a vocabulary/bigram/trigram fingerprint of their messages, then nudges the score upward for other users whose text overlaps significantly. This is a learn-from-positives feedback loop.
 
-Each nick gets a rolling AI score over the last 200 messages. Users above the threshold (70 by default) appear with their score next to their nick in the userlist and get colored as "suspect."
-/ai <nick> — full profile: current score, idle time, sparkline of recent scores, verdict.
-/topai — ranked list of every scored user in the current channel.
-/bot <nick> / /unbot <nick> — manually mark a nick as a confirmed bot and build a typing fingerprint from their messages.
-/aitoggle — turn detection on/off.
+Predictions are LRU-cached (512 entries) since chat repeats. There's also the ScoringEngine/UserState machinery to track rolling AI scores per user, idle times, message-length statistics, etc., and a /topai command to rank everyone in a channel.
+Detection events are logged to ai_scores.log as JSONL (one JSON object per line, with ts, dt, session UUID, monotonic seq, nick, target, individual sub-scores, and the message). Logging can be toggled live with /logtoggle or via the IRC_AI_LOG env var. There's a _load_all_nick_ai_history() helper that replays the log on startup so the running nick scores survive across sessions.
+LLM integration
+The AI_MODELS registry is a single dict of short names → provider/model-id/label, covering:
 
-4. JSONL detection log
-Every scored message is appended to ai_scores.log as one JSON object per line, with timestamp, session UUID, sequence number, nick, target, the four sub-scores (heuristic / Binoculars / classifier / Llama), the ensemble score, the rolling average, and the message text (capped at 512 bytes). Session-start markers and toggle events are recorded too, so gaps in seq are auditable. The log can be replayed to compute per-nick history and a "historical suspects" leaderboard across sessions. /logtoggle controls it; IRC_AI_LOG=0 disables at startup.
-5. AI assistants for you
-Quite separate from the detection side, you can ask AI models things directly:
+Anthropic Claude (opus, sonnet, haiku)
+OpenAI (gpt4o, gpt4, gpt35)
+Ollama local server (gemma, llama3)
+llama.cpp local server (gemma4, qwen3)
 
-/askai [model] <question> — answer rendered in the dashboard.
-/summarize [n] [model] — summarizes the last n messages in the current window.
-/model — pick between Claude (Opus/Sonnet/Haiku), GPT (4o, 4 Turbo, 3.5), Ollama (Gemma 3, Llama 3.2), or llama.cpp (Gemma 4, Qwen 3). Local backends require no API key.
-/api — view or set ANTHROPIC_API_KEY, OPENAI_API_KEY, OLLAMA_URL in the environment.
+/askai and /summarize route through this registry. Default is qwen3 (local llama.cpp) — meaning the author's intended hot path is fully offline. There are blocking helpers _ollama_blocking_call and _llamacpp_blocking_call that talk to the local servers' OpenAI-compatible endpoints; cloud providers use their official SDKs if installed.
+One thing to flag, since the file's model registry will be visible to a user reading this: the Claude model IDs hard-coded there (claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5-20251001) don't match Anthropic's current model strings exactly — claude-opus-4-6 and claude-sonnet-4-6 should be claude-opus-4-6 style hyphenation… actually, the canonical strings are claude-opus-4-6, claude-sonnet-4-6, and claude-haiku-4-5-20251001 for the current generation; whether 4-6 will resolve depends on Anthropic's aliasing. Worth verifying against the API before relying on /askai opus working out of the box.
+The plugin system
+Small but real. A plugin is a Python file that defines setup(api) (and optionally teardown(api)). The PluginAPI object hands out a @api.command("name") decorator to register slash commands and helpers like api.status(...) to print to the status window. /loadplugin, /unloadplugin, and /reloadplugin all work, with the reload using importlib to hot-swap. Both sync and async command handlers are supported.
+Notable engineering choices
+A few things stand out as quietly thoughtful:
 
-6. CJK auto-translation
-A Unicode-block-based detector identifies Chinese/Japanese/Korean text (supports CJK Extensions A–G, Hangul Jamo, Kanbun, Bopomofo, Katakana phonetic extensions, the lot). When triggered, an async translation pipeline fetches an English version inline. /autotranslate toggles it; on by default.
-7. TUI quality of life
+Auto-install of optional deps (_ensure_deps) — on first run, missing packages are pip-installed and the process re-execs itself so module-level imports re-resolve. Good UX for a script you want to "just work."
+Windows-curses handling with a manual sys.path widening pass before falling back to pip install windows-curses.
+Persistent file handles for the AI log, chat logs, and input history, with an atexit flush — avoids open/close syscall thrash but makes crash-recovery slightly riskier (mitigated by line-buffered mode where it matters).
+All data files live next to the script (_SCRIPT_DIR), so launching from C:\Windows\system32 doesn't strand logs in unexpected places.
+Filename safety: _chat_log_path strips control chars and collapses .. runs to defeat directory traversal — this isn't paranoid, since channel/window names come from the network.
 
-Multiple windows, switched with Ctrl+N or /win <n>, closed with /close / /wc.
-Tab for nick completion, PgUp/PgDn for scroll.
-Persistent input history (last 500 commands, irc_input_history.txt) survives restarts; chat logs per window go to chat_logs/<window>.log and are reloaded on rejoin.
-Five color themes (Classic, Hacker, Ocean, Sunset, Neon) via /theme.
-Wide-character-aware rendering — CJK and fullwidth characters take their proper 2 columns, IRC formatting codes (bold, italic, underline, reverse, color) are parsed and stripped or rendered correctly, and the parse cache (512 entries) avoids reparsing the same line on every redraw.
+Concerns and rough edges
+Honest assessment:
 
-8. Plugin system
-/loadplugin <path>, /unloadplugin, /reloadplugin (hot-swap), /plugins. A plugin is a Python file exposing setup(api); PluginAPI lets it register slash commands and hook into events.
-9. Production touches
+The TUI class is enormous (~2,700 lines). It's doing rendering, input, every slash command, multi-server bookkeeping, and dashboard generation. It's the obvious refactor target — pulling slash commands into a registry like the plugin system already uses would shed thousands of lines.
+Single-file packaging at 5,500 lines makes the codebase harder to navigate than it needs to be. Splitting EnsembleAIDetector and the IRC protocol layer into their own modules would help future-you a lot.
+Auto-pip-install on launch is convenient but surprising; some users won't expect a chat client to mutate their site-packages. A --no-install flag or at least a confirmation prompt would be friendlier.
+The Google Translate endpoint used (translate.googleapis.com/translate_a/single?client=gtx) is undocumented and unofficial — it works today but Google has rate-limited or broken it before. Worth having a graceful fallback path.
+Heuristics in formality_score have hand-tuned weights without an obvious calibration corpus. The comment says "calibrated for 2025/2026 LLM output patterns" which is honest, but the false-positive rate on heavily formal human writers (academics, non-native English speakers writing carefully) is probably non-trivial. The fingerprint feedback loop could amplify this.
+Plenty of broad except Exception: pass in the I/O paths. Pragmatic for a TUI app where you don't want a logging hiccup to crash the chat, but it does swallow real bugs.
 
-Auto-installs missing dependencies (anthropic, openai, transformers, torch) on first run via pip and restarts itself.
-Reconfigures stdout/stderr to UTF-8 on Windows so the box-drawing intro prints correctly.
-Persistent file handles for the AI log, input history, and chat logs (8 KB buffering for chat, line-buffered for crash safety on the AI log), with an atexit flush.
-Filename sanitization that blocks directory traversal in window names.
-IRC nick/channel input is sanitized to RFC 1459 character classes.
-Clean shutdown: cancels async tasks, sends QUIT, drains the writer with timeouts so it doesn't hang on a dead socket.
-
-In one sentence
-It's a fully usable terminal IRC client that quietly runs a four-signal ML pipeline on every line of chat, scores users for AI-likelihood, logs everything as JSONL, and also lets you talk to Claude / GPT / local LLMs from the same interface — with multi-server, multi-window, plugins, themes, CJK translation, and persistent history along the way.
+Summary
+eyearesee.py is an ambitious, single-file IRC client that grafts a serious AI-text-detection pipeline (Binoculars + RoBERTa classifiers + heuristics + optional LLM judging) onto a competent terminal IRC implementation, then adds LLM chat integration and a plugin system on top. The IRC layer is genuinely solid — async, TLS, flood-controlled, CJK-aware, multi-server. The AI-detection ensemble is the most novel piece and shows real familiarity with the literature. The main weakness is structural: at 5,500 lines, the TUI class in particular is screaming to be broken up. As a working tool it's impressive; as a codebase to maintain long-term it would benefit from a modularization pass.
