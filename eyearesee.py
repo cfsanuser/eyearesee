@@ -22,7 +22,7 @@ import uuid
 import warnings
 from collections import deque, OrderedDict
 from math import log2
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Callable
 
 # =========================
 # Anthropic (optional)
