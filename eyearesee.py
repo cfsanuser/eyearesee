@@ -93,6 +93,8 @@ NICKSERV_PASSWORD = os.environ.get("IRC_NICKSERV_PASSWORD", "")
 MAX_MESSAGES = 500
 USER_HISTORY_WINDOW = 200
 AI_SUSPECT_THRESHOLD = 70
+# Disable all AI detection (--no-ai flag).  Models are never loaded when True.
+_NO_AI: bool = "--no-ai" in sys.argv
 # AI detection logging: enabled by default.  Set IRC_AI_LOG=0 to disable at startup.
 # Can also be toggled at runtime with /logtoggle.
 _ai_logging_enabled: bool = os.environ.get("IRC_AI_LOG", "1") not in ("0", "false", "no", "off")
@@ -1182,9 +1184,9 @@ class EnsembleAIDetector:
     # Loaded opportunistically — falls back gracefully if unavailable.
     _CLS2_MODEL = "openai-community/roberta-base-openai-detector"
 
-    def __init__(self):
-        self.enabled = True
-        self.active_detect_model: str = "qwen3"  # default: llama.cpp qwen3 for LLM detection
+    def __init__(self, disabled: bool = False):
+        self.enabled = not disabled
+        self.active_detect_model: str = "" if disabled else "qwen3"  # default: llama.cpp qwen3 for LLM detection
         self._gpt2_model = None   # GPT-2: Binoculars performer
         self._obs_model  = None   # distilgpt2: Binoculars observer
         self._gpt2_tok   = None   # shared tokenizer (same BPE vocab)
@@ -1195,6 +1197,8 @@ class EnsembleAIDetector:
         self._device = "cpu"
         self._pred_cache: OrderedDict = OrderedDict()  # text → Dict[str,float], LRU
 
+        if disabled:
+            return
         if not AI_AVAILABLE:
             raise SystemExit(
                 "AI detector requires: pip install transformers torch\n"
@@ -2555,6 +2559,8 @@ class IRCClient:
     async def _score_msg_bg(self, nick: str, target: str, msg: str,
                             u_state: "UserState", u_score: int, m_score: int) -> None:
         """Run AI inference off the read loop, then push an update event."""
+        if not self.scoring.ai_detector.enabled:
+            return
         a_score = 0
         detail: Dict[str, float] = {"prob": 0.0, "heu": 0.0, "bino": 0.0, "cls": 0.0, "llama": 0.0}
         try:
@@ -5467,8 +5473,11 @@ def main():
 
     # Load AI models before curses starts so progress prints go to the normal
     # terminal and don't corrupt the TUI display.
-    ai_detector = EnsembleAIDetector()
-    _load_all_nick_ai_history()
+    if _NO_AI:
+        print("  AI detection: DISABLED (--no-ai)")
+    ai_detector = EnsembleAIDetector(disabled=_NO_AI)
+    if not _NO_AI:
+        _load_all_nick_ai_history()
 
     # Start logging immediately — before curses initialises — so the session
     # record is written even if the TUI fails to start (bad terminal size, etc.).
