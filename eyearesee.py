@@ -127,6 +127,7 @@ AI_MODELS: Dict[str, Dict[str, str]] = {
     "llama3":  {"provider": "ollama",   "id": "llama3.2",    "label": "Llama 3.2    (Ollama/offline)"},
     # ── Local/offline: llama.cpp ─────────────────────────────────────────
     "gemma4":  {"provider": "llamacpp", "id": "gemma-4",     "label": "Gemma 4      (llama.cpp/offline)"},
+    "qwen3":   {"provider": "llamacpp", "id": "qwen3",       "label": "Qwen 3       (llama.cpp/offline)"},
 }
 # Keep CLAUDE_MODELS as a filtered view so existing internal references still work.
 CLAUDE_MODELS: Dict[str, str] = {
@@ -2537,6 +2538,159 @@ class IRCClient:
 # =========================
 # Per-server state container
 # =========================
+# =========================
+# Plugin System
+# =========================
+
+class PluginAPI:
+    """Public interface passed to plugin setup(api) functions.
+
+    Plugin files should define a top-level setup(api) function.  Optionally
+    they may also define teardown(api) which is called on /unloadplugin.
+
+    Minimal plugin example
+    ----------------------
+    def setup(api):
+        @api.command("hello")
+        async def hello(api, args):
+            await api.status(f"Hello, {args or 'world'}!")
+    """
+
+    def __init__(self, name: str, tui: "TUI") -> None:
+        self.name = name
+        self._tui = tui
+        self._commands: Dict[str, Callable] = {}
+
+    # ── Command registration ─────────────────────────────────────────────────
+
+    def command(self, name: str) -> Callable:
+        """Decorator: register a /name slash command.
+
+        The decorated function receives (api, args) where args is the
+        remainder of the input line after the command name.  Both sync and
+        async functions are accepted.
+        """
+        def decorator(fn: Callable) -> Callable:
+            self._commands[name.lower()] = fn
+            return fn
+        return decorator
+
+    def register(self, name: str, handler: Callable) -> None:
+        """Imperatively register a slash command handler."""
+        self._commands[name.lower()] = handler
+
+    # ── Status / output helpers ──────────────────────────────────────────────
+
+    async def status(self, text: str) -> None:
+        """Post text to the *status* window."""
+        await self._tui.ui_queue.put(("status", text))
+
+    def add_to_window(self, window_name: str, text: str) -> None:
+        """Append a timestamped line to *window_name* (creates the window if absent)."""
+        win = self._tui.window_by_name.get(window_name)
+        if win is None:
+            win = self._tui.ensure_window(window_name, is_channel=window_name.startswith("#"))
+        win.add_line(text, timestamp=True)
+        self._tui._chat_dirty = True
+        self._tui.dirty = True
+
+    # ── IRC helpers ──────────────────────────────────────────────────────────
+
+    def send(self, target: str, text: str) -> None:
+        """Send an IRC PRIVMSG to *target* (channel or nick)."""
+        self._tui._active_client().cmd_msg(target, text)
+
+    def send_raw(self, line: str) -> None:
+        """Send a raw IRC line."""
+        self._tui._active_client().send_raw(line)
+
+    # ── State accessors ──────────────────────────────────────────────────────
+
+    @property
+    def current_channel(self) -> Optional[str]:
+        return self._tui.current_channel
+
+    @property
+    def current_window(self) -> str:
+        return self._tui.get_current_window().name
+
+    def get_window_lines(self, window_name: str) -> List[str]:
+        win = self._tui.window_by_name.get(window_name)
+        return list(win.lines) if win else []
+
+    def ensure_window(self, name: str, is_channel: bool = False) -> None:
+        self._tui.ensure_window(name, is_channel=is_channel)
+
+
+class PluginManager:
+    """Loads, tracks, and routes commands for all active plugins."""
+
+    def __init__(self) -> None:
+        self._plugins: Dict[str, Tuple[PluginAPI, Any]] = {}          # name → (api, module)
+        self._commands: Dict[str, Tuple[PluginAPI, Callable]] = {}    # cmd  → (api, handler)
+
+    def load(self, path: str, tui: "TUI") -> Tuple[bool, str]:
+        """Load a plugin from *path*.  Returns (success, message)."""
+        name = os.path.splitext(os.path.basename(path))[0]
+        if name in self._plugins:
+            return False, f"Plugin '{name}' already loaded — use /reloadplugin {name} to reload"
+        try:
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                return False, f"Cannot load '{path}': not a valid Python file"
+            module = importlib.util.module_from_spec(spec)
+            api = PluginAPI(name, tui)
+            spec.loader.exec_module(module)  # type: ignore[union-attr]
+            if not hasattr(module, "setup"):
+                return False, f"'{path}' has no setup(api) function"
+            module.setup(api)
+            self._plugins[name] = (api, module)
+            for cmd_name, handler in api._commands.items():
+                self._commands[cmd_name] = (api, handler)
+            cmds = " ".join(f"/{c}" for c in api._commands) if api._commands else "(no commands)"
+            return True, f"Loaded plugin '{name}'  {cmds}"
+        except Exception as exc:
+            return False, f"Failed to load '{path}': {exc}"
+
+    def unload(self, name: str) -> Tuple[bool, str]:
+        """Unload plugin *name*.  Returns (success, message)."""
+        if name not in self._plugins:
+            return False, f"No plugin named '{name}' is loaded"
+        api, module = self._plugins.pop(name)
+        if hasattr(module, "teardown"):
+            try:
+                result = module.teardown(api)
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
+            except Exception:
+                pass
+        for cmd_name in list(api._commands):
+            self._commands.pop(cmd_name, None)
+        return True, f"Unloaded plugin '{name}'"
+
+    def reload(self, name: str, tui: "TUI") -> Tuple[bool, str]:
+        """Unload then re-load plugin *name* from its original file."""
+        if name not in self._plugins:
+            return False, f"No plugin named '{name}' is loaded"
+        _, module = self._plugins[name]
+        path = getattr(module, "__file__", None)
+        if not path:
+            return False, f"Cannot determine source file for plugin '{name}'"
+        ok, msg = self.unload(name)
+        if not ok:
+            return ok, msg
+        return self.load(path, tui)
+
+    def get_command(self, cmd: str) -> Optional[Tuple[PluginAPI, Callable]]:
+        return self._commands.get(cmd)
+
+    def list_plugins(self) -> List[Tuple[str, List[str]]]:
+        return [
+            (name, list(api._commands.keys()))
+            for name, (api, _) in self._plugins.items()
+        ]
+
+
 class ServerContext:
     """Holds all state that is scoped to a single IRC server connection."""
     __slots__ = ("server_id", "client", "channel_users", "user_scores",
@@ -2670,6 +2824,8 @@ class TUI:
         self._slash_handlers: dict = {}
         self._build_event_handlers()
         self._build_slash_handlers()
+
+        self.plugin_manager = PluginManager()
 
         stdscr.nodelay(True)
         stdscr.keypad(True)
@@ -3802,6 +3958,11 @@ class TUI:
         h["autotranslate"] = self._slash_autotranslate
         h["commands"]   = self._slash_commands
         h["help"]       = self._slash_help
+        h["loadplugin"]   = self._slash_loadplugin
+        h["unloadplugin"] = self._slash_unloadplugin
+        h["reloadplugin"] = self._slash_reloadplugin
+        h["plugins"]      = self._slash_plugins
+        h["redraw"]       = self._slash_redraw
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -3818,7 +3979,19 @@ class TUI:
             if handler:
                 await handler(args, extra, line)
             else:
-                self._active_client().send_raw(line[1:])
+                plugin_entry = self.plugin_manager.get_command(cmd)
+                if plugin_entry:
+                    plug_api, plug_handler = plugin_entry
+                    plug_args = line[1 + len(cmd):].lstrip()
+                    try:
+                        result = plug_handler(plug_api, plug_args)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as plug_exc:
+                        await self.ui_queue.put(
+                            ("status", f"[plugin:{plug_api.name}] error: {plug_exc}"))
+                else:
+                    self._active_client().send_raw(line[1:])
         else:
             await self._send_plain_text(line)
         self._chat_dirty = True
@@ -4609,7 +4782,14 @@ class TUI:
         _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
         _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
         _C("")
+        _H("Plugins")
+        _E("/loadplugin <path>",   "Load a Python plugin file; its setup(api) is called")
+        _E("/unloadplugin <name>", "Unload a plugin and remove its commands")
+        _E("/reloadplugin <name>", "Reload a plugin from its original file (hot-swap)")
+        _E("/plugins",             "List loaded plugins and their registered commands")
+        _C("")
         _H("General")
+        _E("/redraw [channel]",   "Force full screen repaint and reload userlist from server")
         _E("/quit [message]", "Send quit message and exit")
         _E("/help",           "Brief one-line command reference")
         _E("/commands",       "This full command list")
@@ -4651,11 +4831,77 @@ class TUI:
             "  Ctrl+N next window  Tab nick-complete  PgUp/Dn scroll",
             "  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread",
             "  /quit [msg]  /commands  (full list)  /help  (this)",
+            "  /redraw [channel]  force repaint + reload userlist from server",
+            "── Plugins ────────────────────────────────────────────────",
+            "  /loadplugin <path>  load .py plugin    /plugins  list loaded",
+            "  /unloadplugin <name>    /reloadplugin <name>  hot-swap",
         ]:
             self.window_by_name["*status*"].add_line(l)
         self.current_window_index = 0
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
+
+    async def _slash_redraw(self, args, extra, line):
+        channel = args.strip() or self.current_channel or ""
+        # Clear all subwindows so the next noutrefresh repaints from scratch.
+        # This fixes display corruption without restarting curses.
+        for w in (self.chat_win, self.user_win, self.input_win):
+            try:
+                w.clearok(True)
+            except curses.error:
+                pass
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self.dirty = True
+        if channel and channel.startswith("#"):
+            # Flush the stale userlist so the NAMES reply replaces it entirely
+            # rather than merging on top of potentially outdated entries.
+            self.channel_users.setdefault(channel, set()).clear()
+            self._sorted_users.pop(channel, None)
+            self._active_client().cmd_names(channel)
+            await self.ui_queue.put(("status",
+                f"Redrawing and refreshing userlist for {channel}…"))
+        else:
+            await self.ui_queue.put(("status", "Redrawing screen…"))
+
+    # ── Plugin management commands ───────────────────────────────────────────
+
+    async def _slash_loadplugin(self, args, extra, line):
+        path = args.strip()
+        if not path:
+            await self.ui_queue.put(("status",
+                "Usage: /loadplugin <path/to/plugin.py>"))
+            return
+        ok, msg = self.plugin_manager.load(path, self)
+        prefix = "[plugin] " if ok else "[plugin:error] "
+        await self.ui_queue.put(("status", prefix + msg))
+
+    async def _slash_unloadplugin(self, args, extra, line):
+        name = args.strip()
+        if not name:
+            await self.ui_queue.put(("status", "Usage: /unloadplugin <name>"))
+            return
+        ok, msg = self.plugin_manager.unload(name)
+        prefix = "[plugin] " if ok else "[plugin:error] "
+        await self.ui_queue.put(("status", prefix + msg))
+
+    async def _slash_reloadplugin(self, args, extra, line):
+        name = args.strip()
+        if not name:
+            await self.ui_queue.put(("status", "Usage: /reloadplugin <name>"))
+            return
+        ok, msg = self.plugin_manager.reload(name, self)
+        prefix = "[plugin] " if ok else "[plugin:error] "
+        await self.ui_queue.put(("status", prefix + msg))
+
+    async def _slash_plugins(self, args, extra, line):
+        plugins = self.plugin_manager.list_plugins()
+        if not plugins:
+            await self.ui_queue.put(("status",
+                "[plugin] No plugins loaded — use /loadplugin <path>"))
+            return
+        for name, cmds in plugins:
+            cmds_str = "  ".join(f"/{c}" for c in cmds) if cmds else "(no commands)"
+            await self.ui_queue.put(("status", f"[plugin] {name}  {cmds_str}"))
 
     def _handle_key(self, ch: int) -> bool:
         """Process a single keycode synchronously.  Returns True if the key was
