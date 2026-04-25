@@ -136,7 +136,7 @@ AI_MODELS: Dict[str, Dict[str, str]] = {
 CLAUDE_MODELS: Dict[str, str] = {
     k: v["id"] for k, v in AI_MODELS.items() if v["provider"] == "claude"
 }
-CLAUDE_DEFAULT_MODEL = "sonnet"   # default model key
+CLAUDE_DEFAULT_MODEL = "qwen3"    # default model key
 
 # 5 built-in UI colour themes
 # Each row: (name, pair1_fg, pair1_bg, pair2_fg, pair2_bg, pair3_fg, pair3_bg, pair8_fg, pair8_bg)
@@ -1143,7 +1143,7 @@ class EnsembleAIDetector:
 
     def __init__(self):
         self.enabled = True
-        self.active_detect_model: str = ""  # set by /model; empty = LLM detection disabled
+        self.active_detect_model: str = "qwen3"  # default: llama.cpp qwen3 for LLM detection
         self._gpt2_model = None   # GPT-2: Binoculars performer
         self._obs_model  = None   # distilgpt2: Binoculars observer
         self._gpt2_tok   = None   # shared tokenizer (same BPE vocab)
@@ -1369,6 +1369,8 @@ class EnsembleAIDetector:
         distributions due to overlapping pre-training data (Common Crawl, etc.).
         Returns 0..1, higher = more AI-like.
         """
+        if self._gpt2_tok is None or self._gpt2_model is None or self._obs_model is None:
+            return 0.0
         try:
             enc = self._gpt2_tok(text, return_tensors="pt", truncation=True, max_length=128)
             enc = {k: v.to(self._device) for k, v in enc.items()}
