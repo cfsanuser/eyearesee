@@ -89,15 +89,18 @@ NICKSERV_PASSWORD = os.environ.get("IRC_NICKSERV_PASSWORD", "")
 
 MAX_MESSAGES = 500
 USER_HISTORY_WINDOW = 200
-AI_LOG_PATH = "ai_scores.log"
 AI_SUSPECT_THRESHOLD = 70
 # AI detection logging: enabled by default.  Set IRC_AI_LOG=0 to disable at startup.
 # Can also be toggled at runtime with /logtoggle.
 _ai_logging_enabled: bool = os.environ.get("IRC_AI_LOG", "1") not in ("0", "false", "no", "off")
 
-INPUT_HISTORY_PATH = "irc_input_history.txt"
+# All data files are placed next to the script so they are writable regardless
+# of the working directory the user launches from (e.g. C:\Windows\system32).
+_SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
+AI_LOG_PATH        = os.path.join(_SCRIPT_DIR, "ai_scores.log")
+INPUT_HISTORY_PATH = os.path.join(_SCRIPT_DIR, "irc_input_history.txt")
 INPUT_HISTORY_MAX  = 500
-CHAT_LOG_DIR       = "chat_logs"
+CHAT_LOG_DIR       = os.path.join(_SCRIPT_DIR, "chat_logs")
 CHAT_LOG_LOAD      = 500
 
 # AI provider keys
@@ -2524,6 +2527,17 @@ class IRCClient:
                     # Max +35 percentage points at full similarity; tapers off smoothly.
                     prob = min(1.0, prob + 0.35 * fp_sim)
                 a_score = int(prob * 100)
+        except asyncio.CancelledError:
+            # Task cancelled (e.g. during shutdown) — log the partial result before
+            # propagating so the message is never silently dropped from the audit log.
+            u_state.record_message(msg, a_score)
+            log_ai_event(
+                nick, target, msg, u_score, m_score, a_score,
+                int(u_state.rolling_ai_likelihood()),
+                heu_score=detail["heu"], bino_score=detail["bino"],
+                cls_score=detail["cls"], llama_score=detail["llama"],
+            )
+            raise
         except Exception:
             pass  # inference failed; log with score 0 so the event is still recorded
         u_state.record_message(msg, a_score)
