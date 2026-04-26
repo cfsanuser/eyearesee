@@ -1,3 +1,5 @@
+( Note: python eyearesee.py --no-ai --no-install will run without installing dependencies or using offline AI )
+
 Analysis: eyearesee.py
 What it is
 eyearesee.py (the name puns on "I-R-C") is a single-file, terminal-based IRC client written in Python 3 — about 5,480 lines in one module. Despite being one file, it bundles together what would normally be three or four separate projects:
