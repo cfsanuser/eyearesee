@@ -2854,6 +2854,7 @@ class TUI:
         self.dirty = True
         self.last_redraw = 0.0
         self.ignored_nicks: set = set()
+        self.mention_beep_muted: bool = False
 
         # Performance caches — maintained incrementally to avoid per-frame rebuilds
         # NOTE: _suspect_nicks and _sorted_users are now aliased from the active
@@ -3901,6 +3902,7 @@ class TUI:
         win.add_line(f"{prefix_str}{msg}")
         our_nick = self._active_client().nick
         if (our_nick and nick.lower() != our_nick.lower()
+                and not self.mention_beep_muted
                 and re.search(r'\b' + re.escape(our_nick) + r'\b', msg, re.IGNORECASE)):
             try:
                 curses.beep()
@@ -4135,6 +4137,7 @@ class TUI:
         h["plugins"]      = self._slash_plugins
         h["redraw"]       = self._slash_redraw
         h["userlist"]     = self._slash_userlist
+        h["mute"]         = self._slash_mute
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -4548,7 +4551,23 @@ class TUI:
                 self.dirty = True
 
     async def _slash_quit(self, args, extra, line):
-        self._active_client().send_raw(f"QUIT :{args}" if args else "QUIT :Client exiting")
+        quit_line = (
+            (f"QUIT :{args}" if args else "QUIT :Client exiting")
+            .encode("utf-8", "replace")[:510] + b"\r\n"
+        )
+        for ctx in self.servers.values():
+            c = ctx.client
+            c.running = False          # prevent the reconnect loop from restarting
+            if c.writer and not c.writer.is_closing():
+                try:
+                    # Write directly to the transport — bypasses _send_queue so the
+                    # QUIT is guaranteed to go out before we tear down the event loop.
+                    c.writer.write(quit_line)
+                    await asyncio.wait_for(c.writer.drain(), timeout=1.0)
+                    c.writer.close()   # sends TCP FIN → reader in run_connection gets
+                                       # EOF and exits naturally, no cancel needed
+                except Exception:
+                    pass
         raise SystemExit
 
     async def _slash_server(self, args, extra, line):
@@ -4864,6 +4883,11 @@ class TUI:
 
         await self.ui_queue.put(("status",
             f"Unknown variable '{args}'.  Known: ANTHROPIC_API_KEY  OPENAI_API_KEY  OLLAMA_URL  LLAMACPP_URL"))
+
+    async def _slash_mute(self, args, extra, line):
+        self.mention_beep_muted = not self.mention_beep_muted
+        state = "muted" if self.mention_beep_muted else "unmuted"
+        await self.ui_queue.put(("status", f"Mention beep {state} (highlight still active)"))
 
     async def _slash_autotranslate(self, args, extra, line):
         self.auto_translate = not self.auto_translate
