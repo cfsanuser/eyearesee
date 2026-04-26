@@ -3,6 +3,7 @@ import asyncio
 import atexit
 import base64
 import getpass
+import webbrowser
 import importlib.util
 import logging
 import socket
@@ -163,6 +164,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 # =========================
 _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _ACTION_LINE_RE     = re.compile(r'^\[\d{2}:\d{2}\] \* \S')  # "[HH:MM] * nick …"
+_URL_RE             = re.compile(r'https?://[^\s\x00-\x1f\x7f<>"]+')  # bare URL in plain text
 
 # Frozensets for O(1) IRC numeric-reply membership tests in process_line
 _WHOIS_REPLIES = frozenset({"307", "311", "312", "313", "317", "318", "319", "330", "671"})
@@ -1693,6 +1695,7 @@ class ChatWindow:
         self.server_id = server_id
         self.lines: deque = deque(maxlen=MAX_MESSAGES)
         self.wrapped_cache: List[str] = []
+        self.url_map: Dict[int, str] = {}  # wrapped line index -> full URL
         self._wrap_dirty = True
         self._last_wrap_width = 0
         self.scroll_offset: int = 0  # 0 = pinned to bottom
@@ -2795,6 +2798,7 @@ class TUI:
         self.chat_height = max(1, self.height - 4)  # 1 extra row for tab bar
         self._content_height = max(1, self.chat_height - 1)  # row 0 is always the title bar
         self.userlist_width = 30
+        self._show_userlist = True
 
         try:
             self.chat_win  = curses.newwin(self.chat_height, max(1, self.width - self.userlist_width), 0, 0)
@@ -2856,6 +2860,8 @@ class TUI:
         # ServerContext; see _sync_ctx().
         self._suspect_re: Optional[re.Pattern] = None   # compiled regex, rebuilt on change
         self._suspect_re_nicks: frozenset = frozenset() # snapshot used to build _suspect_re
+        self._mention_re: Optional[re.Pattern] = None   # matches our nick in message body
+        self._mention_re_nick: str = ""                  # nick the regex was compiled for
         self._dashboard_dirty = False             # needs rebuild?
         self._dashboard_last_update = 0.0         # last rebuild timestamp
         self._dashboard_ota_interval = 5.0        # auto-refresh interval while dashboard is visible
@@ -2880,10 +2886,20 @@ class TUI:
         self._attr_title      = curses.A_REVERSE | curses.color_pair(1)
         self._attr_userheader = curses.A_REVERSE | curses.color_pair(2)
         self._attr_suspect    = curses.A_BOLD | curses.color_pair(3)
+        self._attr_mention    = curses.A_BOLD | curses.A_REVERSE
+        self._attr_url        = curses.A_BOLD | curses.A_UNDERLINE | curses.color_pair(6)
 
         # Theme — starts at 1 (Classic); apply_theme reinitialises color pairs
         self.current_theme: int = 1
         self.apply_theme(1, announce=False)
+
+        # Mouse: capture clicks so Ctrl+Click can open URLs.
+        # Shift+Click still reaches the terminal for text selection in most emulators.
+        try:
+            curses.mouseinterval(0)
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        except curses.error:
+            pass
 
         # Per-pane dirty flags — skip drawing panes that haven't changed
         self._chat_dirty    = True
@@ -2977,27 +2993,65 @@ class TUI:
         max_width = self._chat_text_width()
         if not win._wrap_dirty and win._last_wrap_width == max_width:
             return
-        wrapped = []
+        wrapped: List[str] = []
+        url_map: Dict[int, str] = {}
+
+        def _wrap_raw(raw: str) -> None:
+            """Wrap a raw (possibly IRC-formatted) text fragment into wrapped[]."""
+            if not raw:
+                return
+            s = irc_strip_formatting(raw)
+            while _str_visual_width(s) > max_width:
+                rm = _irc_visual_pos(raw, max_width)
+                sp = raw.rfind(" ", 0, rm)
+                if sp == -1:
+                    sp = rm if rm > 0 else 1
+                wrapped.append(raw[:sp])
+                raw = raw[sp:].lstrip()
+                s   = irc_strip_formatting(raw)
+            wrapped.append(raw)
+
         for line in win.lines:
             if not line:
                 wrapped.append("")
                 continue
-            # Strip IRC formatting codes once per line, not on every loop
-            # iteration, to avoid O(n²) cost for long lines without spaces.
             stripped = irc_strip_formatting(line)
-            while _str_visual_width(stripped) > max_width:
-                raw_max   = _irc_visual_pos(line, max_width)
-                split_pos = line.rfind(" ", 0, raw_max)
-                if split_pos == -1:
-                    # No space found; force at least 1 raw character consumed so
-                    # the loop always terminates (edge case: max_width=1 + wide char).
-                    split_pos = raw_max if raw_max > 0 else 1
-                wrapped.append(line[:split_pos])
-                line = line[split_pos:].lstrip()
-                stripped = irc_strip_formatting(line)
-            wrapped.append(line)
-        win.wrapped_cache = wrapped
-        win._wrap_dirty = False
+            url_matches = list(_URL_RE.finditer(stripped))
+            if url_matches:
+                # Extract each URL as its own single display line so long URLs
+                # never get split across rows.  The full URL is stored in url_map;
+                # the display line is truncated with "…" only if needed.
+                remaining = line
+                for um in url_matches:
+                    url_str   = um.group(0)
+                    url_clean = url_str.rstrip('.,;:!?)"\'>')
+                    pos = remaining.find(url_str)
+                    if pos < 0:
+                        continue
+                    _wrap_raw(remaining[:pos].rstrip())
+                    display = (url_clean
+                               if _str_visual_width(url_clean) <= max_width
+                               else _truncate_to_width(url_clean, max_width - 1) + "…")
+                    url_map[len(wrapped)] = url_clean
+                    wrapped.append(display)
+                    remaining = remaining[pos + len(url_str):].lstrip()
+                _wrap_raw(remaining)
+            else:
+                # Normal word-wrap — no URLs present
+                s = stripped
+                while _str_visual_width(s) > max_width:
+                    rm = _irc_visual_pos(line, max_width)
+                    sp = line.rfind(" ", 0, rm)
+                    if sp == -1:
+                        sp = rm if rm > 0 else 1
+                    wrapped.append(line[:sp])
+                    line = line[sp:].lstrip()
+                    s    = irc_strip_formatting(line)
+                wrapped.append(line)
+
+        win.wrapped_cache    = wrapped
+        win.url_map          = url_map
+        win._wrap_dirty      = False
         win._last_wrap_width = max_width
 
     async def update_dashboard(self):
@@ -3445,7 +3499,10 @@ class TUI:
 
     def _resize_windows(self) -> None:
         """Resize/reposition subwindows and refresh cached dimensions."""
-        chat_w = max(1, self.width - self.userlist_width)
+        if self._show_userlist:
+            chat_w = max(1, self.width - self.userlist_width)
+        else:
+            chat_w = max(1, self.width)
         user_x = self.width - self.userlist_width
         try:
             self.chat_win.resize(self.chat_height, chat_w)
@@ -3505,9 +3562,12 @@ class TUI:
         visible   = wrapped[start_idx:end_idx]
 
         suspect_nicks = self._suspect_nicks
-        attr_bold   = self._attr_bold
-        attr_normal = self._attr_normal
-        attr_action = self._attr_action
+        attr_bold    = self._attr_bold
+        attr_normal  = self._attr_normal
+        attr_action  = self._attr_action
+        attr_mention = self._attr_mention
+        attr_url     = self._attr_url
+        url_map      = current_win.url_map
         # Rebuild suspect regex only when the set has changed (not every frame)
         if suspect_nicks != self._suspect_re_nicks:
             self._suspect_re = (
@@ -3516,18 +3576,35 @@ class TUI:
             )
             self._suspect_re_nicks = frozenset(suspect_nicks)
         _suspect_re = self._suspect_re
+        # Rebuild mention regex only when our nick changes
+        _our_nick = self._active_client().nick
+        if _our_nick != self._mention_re_nick:
+            self._mention_re = (
+                re.compile(
+                    r'\[\d{2}:\d{2}\] (?:<[^>]+>|\* \S+) .*\b'
+                    + re.escape(_our_nick) + r'\b',
+                    re.IGNORECASE,
+                )
+                if _our_nick else None
+            )
+            self._mention_re_nick = _our_nick
 
         # Bind hot callables to locals — avoids repeated global/attr lookups
         # inside the per-line render loop (called up to ~60 times per frame).
-        _action_match   = _ACTION_LINE_RE.match
-        _render         = self._render_irc_line
-        _suspect_search = _suspect_re.search if _suspect_re else None
-        _content_height = content_height
+        _action_match    = _ACTION_LINE_RE.match
+        _render          = self._render_irc_line
+        _suspect_search  = _suspect_re.search if _suspect_re else None
+        _mention_search  = self._mention_re.search if self._mention_re else None
+        _content_height  = content_height
 
         for i, line in enumerate(visible):
             if i >= _content_height: break
-            if _action_match(line):
+            if (start_idx + i) in url_map:
+                base = attr_url
+            elif _action_match(line):
                 base = attr_action
+            elif _mention_search and _mention_search(line):
+                base = attr_mention
             elif _suspect_search and _suspect_search(line):
                 base = attr_bold
             else:
@@ -3694,9 +3771,10 @@ class TUI:
             self._chat_dirty = False
             refreshed.append(self.chat_win)
         if self._userlist_dirty:
-            self._draw_userlist()
+            if self._show_userlist:
+                self._draw_userlist()
+                refreshed.append(self.user_win)
             self._userlist_dirty = False
-            refreshed.append(self.user_win)
         if self._input_dirty:
             self._draw_input()
             self._input_dirty = False
@@ -3813,6 +3891,13 @@ class TUI:
         win = self.ensure_window(win_name, is_channel=is_chan)
         prefix_str = f"* {nick} " if is_action else f"<{nick}> "
         win.add_line(f"{prefix_str}{msg}")
+        our_nick = self._active_client().nick
+        if (our_nick and nick.lower() != our_nick.lower()
+                and re.search(r'\b' + re.escape(our_nick) + r'\b', msg, re.IGNORECASE)):
+            try:
+                curses.beep()
+            except Exception:
+                pass
         if self.auto_translate and _has_cjk(irc_strip_formatting(msg)):
             asyncio.create_task(self._post_translation(win, msg))
         self.user_scores[nick] = u_score
@@ -4041,6 +4126,7 @@ class TUI:
         h["reloadplugin"] = self._slash_reloadplugin
         h["plugins"]      = self._slash_plugins
         h["redraw"]       = self._slash_redraw
+        h["userlist"]     = self._slash_userlist
 
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
@@ -4856,6 +4942,7 @@ class TUI:
         _E("/close  (or /wc)", "Close current window; focus moves to previous")
         _E("/clear",     "Clear messages in the current window")
         _E("/theme <1-5>","Switch colour theme: Classic Hacker Ocean Sunset Neon")
+        _E("/userlist",   "Toggle the user list panel on/off")
         _C("  Ctrl+N  next window    Tab  nick completion    PgUp/PgDn  scroll")
         _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
         _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
@@ -4905,8 +4992,9 @@ class TUI:
             "── Connection ─────────────────────────────────────────────",
             "  /server [-ssl] <host> [port]  (parallel; -ssl for TLS)  /reconnect",
             "── Interface ──────────────────────────────────────────────",
-            "  /win <n>  /close (/wc)  /clear  /theme <1-5>",
+            "  /win <n>  /close (/wc)  /clear  /theme <1-5>  /userlist",
             "  Ctrl+N next window  Tab nick-complete  PgUp/Dn scroll",
+            "  Left-click a highlighted URL line to open it in the browser",
             "  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread",
             "  /quit [msg]  /commands  (full list)  /help  (this)",
             "  /redraw [channel]  force repaint + reload userlist from server",
@@ -4918,6 +5006,12 @@ class TUI:
         self.current_window_index = 0
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
+
+    async def _slash_userlist(self, args, extra, line):
+        self._show_userlist = not self._show_userlist
+        self._resize_windows()
+        state = "shown" if self._show_userlist else "hidden"
+        await self.ui_queue.put(("status", f"Userlist {state}"))
 
     async def _slash_redraw(self, args, extra, line):
         channel = args.strip() or self.current_channel or ""
@@ -5184,6 +5278,39 @@ class TUI:
         elif ch == curses.KEY_NPAGE:
             win = self.get_current_window()
             win.scroll_offset = max(0, win.scroll_offset - self._content_height // 2)
+            self._chat_dirty = True
+            self.dirty = True
+
+        elif ch == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+            except curses.error:
+                return False
+            _BTN1 = (getattr(curses, 'BUTTON1_PRESSED', 0x0002)
+                     | getattr(curses, 'BUTTON1_CLICKED', 0x0004))
+            if not (bstate & _BTN1):
+                return False
+            # Left-click: open URL if the clicked line is a URL line
+            chat_w = self.chat_win.getmaxyx()[1]
+            if my < 1 or my >= self.chat_height or mx >= chat_w:
+                return False  # title bar, input area, or userlist column
+            win = self.get_current_window()
+            self._wrap_window(win)
+            total     = len(win.wrapped_cache)
+            offset    = win.scroll_offset
+            end_idx   = total - offset
+            start_idx = max(0, end_idx - self._content_height)
+            line_idx  = start_idx + (my - 1)  # row 0 is the title bar
+            if line_idx >= total:
+                return False
+            url = win.url_map.get(line_idx)
+            if not url:
+                return False
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+            self.window_by_name["*status*"].add_line(f"Opening: {url}")
             self._chat_dirty = True
             self.dirty = True
 
