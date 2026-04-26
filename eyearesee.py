@@ -2267,7 +2267,7 @@ class IRCClient:
                 safe_args = ctcp_args.replace("\x01", "")[:100]
                 self.send_raw(f"NOTICE {nick} :\x01PING {safe_args}\x01")
             elif ctcp_cmd == "VERSION":
-                self.send_raw(f"NOTICE {nick} :\x01VERSION eyearesee IRC client v2.0\x01")
+                self.send_raw(f"NOTICE {nick} :\x01VERSION eyearesee IRC client v3.0\x01")
                 await self.ui_queue.put(("status", f"-!- CTCP VERSION from {nick}"))
             elif ctcp_cmd == "TIME":
                 self.send_raw(
