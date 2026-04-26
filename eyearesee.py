@@ -2893,11 +2893,12 @@ class TUI:
         self.current_theme: int = 1
         self.apply_theme(1, announce=False)
 
-        # Mouse: capture clicks so Ctrl+Click can open URLs.
+        # Mouse: capture clicks so left-click can open URL lines.
         # Shift+Click still reaches the terminal for text selection in most emulators.
         try:
-            curses.mouseinterval(0)
-            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+            curses.mouseinterval(0)  # 0 → no click-interval; only PRESSED events fire
+            _mouse_extra = getattr(curses, 'REPORT_MOUSE_POSITION', 0)
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | _mouse_extra)
         except curses.error:
             pass
 
@@ -3021,7 +3022,14 @@ class TUI:
                 # Extract each URL as its own single display line so long URLs
                 # never get split across rows.  The full URL is stored in url_map;
                 # the display line is truncated with "…" only if needed.
-                remaining = line
+                #
+                # Use `stripped` (not `line`) for position tracking: IRC bots
+                # sometimes apply bold/underline codes around or inside the URL
+                # text, so searching the raw line for the stripped URL string
+                # would fail.  The stripped text has no such codes and find()
+                # is always reliable on it.  Pre/post segments are wrapped via
+                # _wrap_raw which accepts plain text without IRC codes.
+                remaining = stripped
                 for um in url_matches:
                     url_str   = um.group(0)
                     url_clean = url_str.rstrip('.,;:!?)"\'>')
@@ -5286,9 +5294,10 @@ class TUI:
                 _, mx, my, _, bstate = curses.getmouse()
             except curses.error:
                 return False
-            _BTN1 = (getattr(curses, 'BUTTON1_PRESSED', 0x0002)
-                     | getattr(curses, 'BUTTON1_CLICKED', 0x0004))
-            if not (bstate & _BTN1):
+            # Fire on any button-1 event (press or click) regardless of platform
+            # constant differences between ncurses and pdcurses/windows-curses.
+            # Values 1-16 cover: released, pressed, clicked, double, triple.
+            if not (bstate & 0x001F):
                 return False
             # Left-click: open URL if the clicked line is a URL line
             chat_w = self.chat_win.getmaxyx()[1]
