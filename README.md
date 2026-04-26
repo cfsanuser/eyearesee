@@ -1,6 +1,6 @@
 ( Note: python eyearesee.py --no-ai --no-install will run without installing dependencies or using offline AI )
 
-( Thank you Amigojapan for feature list suggestions! )
+( Thank you Amigojapan for feature list suggestions! Check his page out! https://github.com/amigojapan )
 
 Analysis: eyearesee.py
 What it is
