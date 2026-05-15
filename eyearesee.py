@@ -8091,7 +8091,8 @@ class TUI:
             sw.add_line("  No social connections found.")
         else:
             sw.add_line(f"  {'Nick':<20} {'Str':>5}  {'Adj':>4} {'Tgt':>4} {'Inv':>4}")
-            sw.add_line(f"  {'\u2500'*20} {'\u2500'*5}  {'\u2500'*4} {'\u2500'*4} {'\u2500'*4}")
+            hl = "\u2500"
+            sw.add_line(f"  {hl*20} {hl*5}  {hl*4} {hl*4} {hl*4}")
             for combined, other, adj_score, tgt_score, inv_score in connections[:20]:
                 sw.add_line(
                     f"  {other:<20} {combined:4.0f}%  "
