@@ -8022,7 +8022,9 @@ class TUI:
                         (f"  (min similarity: {min_sim:.2f})" if min_sim > 0 else ""))
         else:
             sw.add_line(f"  {'Nick':<20} {'Sim':>6}  {'Msgs':>5}")
-            sw.add_line(f"  {'\u2500'*20} {'\u2500'*6}  {'\u2500'*5}")
+            # Use a constant to avoid backslashes in f-string expressions (pre-3.12 compatibility)
+            hl = "\u2500"
+            sw.add_line(f"  {hl*20} {hl*6}  {hl*5}")
             for sim, nick_l, msg_count in results[:20]:
                 sw.add_line(f"  {nick_l:<20} {sim*100:5.1f}%  {msg_count:>5}")
         sw.add_line(f"\u2500\u2500 {len(results)} matches, showing top 20 \u2500\u2500")
