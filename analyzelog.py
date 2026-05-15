@@ -1986,7 +1986,7 @@ def forecast_aware_anomaly(entries: list[Entry], user: str, z: float = 2.5,
         expected = forecast_map.get(str(date_key))
         if expected is not None:
             dev = abs(actual - expected)
-            if dev > z * (statistics.mean([abs(a - v) for v in forecast_map.values() if v > 0]) or 1):
+            if dev > z * (statistics.mean([abs(actual - v) for v in forecast_map.values() if v > 0]) or 1):
                 anomalies.append({"date": str(date_key), "actual": actual, "expected": expected})
     return {"user": user, "anomalies": anomalies, "forecast_based": True}
 
