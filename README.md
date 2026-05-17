@@ -7,6 +7,9 @@ eyearesee is a sophisticated terminal-based IRC suite featuring an integrated se
 - [Architecture and AI Composition](#architecture-and-ai-composition)
 - [Core IRC Features](#core-irc-features)
 - [AI Detection System](#ai-detection-system)
+- [Bouncer & Connectivity](#bouncer--connectivity)
+- [Social & Behavioral Analysis](#social--behavioral-analysis)
+- [Collaboration & Media](#collaboration--media)
 - [Analysis & Monitoring (analyzelog.py)](#analysis--monitoring-analyzelogpy)
 - [Comprehensive Command Reference](#comprehensive-command-reference)
 - [Keyboard and Mouse Interactions](#keyboard-and-mouse-interactions)
@@ -83,6 +86,26 @@ eyearesee provides advanced features for maintaining persistent connections and 
 
 ---
 
+## Social & Behavioral Analysis
+
+Beyond simple AI detection, eyearesee tracks deep behavioral patterns to map social structures and identify sophisticated automation.
+
+- **Linguistic Fingerprinting:** Use `/fingerprint` to analyze a user's unique N-gram distribution (words, bigrams, trigrams). Compare users to identify sockpuppets or recurring bot templates.
+- **Social Clustering:** `/cluster <nick>` analyzes a user's social circle by combining adjacency tracking (who they talk *after*), targeting (who they mention), and inverse-targeting (who mentions them).
+- **Activity Heatmaps:** Track per-nick and per-channel activity levels over time.
+- **Adjacency Tracking:** Real-time tracking of message flow to identify users who consistently respond to specific targets.
+
+---
+
+## Collaboration & Media
+
+- **Jitsi Integration:** Instantly create and share a secure Jitsi Meet room using `/jitsi`. The link is sent to your current PM recipient and opened in your default browser.
+- **Common Interests:** `/together <nick1> <nick2>` identifies shared channels and common interests between two users based on their activity logs.
+- **DCC File Transfer:** Full support for Direct Client-to-Client transfers including `SEND`, `ACCEPT`, `RESUME`, and a high-performance "Turbo" mode (`TSEND`).
+- **Media Previews:** Automatic metadata fetching and link previews for URLs shared in chat.
+
+---
+
 ## Analysis & Monitoring (analyzelog.py)
 
 The companion `analyzelog.py` utility provides professional-grade log auditing and real-time monitoring of AI scores.
@@ -99,25 +122,28 @@ The companion `analyzelog.py` utility provides professional-grade log auditing a
 ## Comprehensive Command Reference
 
 ### Messaging
-- `/msg`, `/query`, `/jitsi`, `/chain`, `/idle`, `/together`, `/adjacent`, `/targets`, `/notice`, `/me`, `/reply`, `/react`, `/ml` (multiline), `/redact`, `/tagmsg`, `/x0` (image upload)
+- `/msg`, `/query`, `/chain`, `/idle`, `/notice`, `/me`, `/reply`, `/react`, `/ml` (multiline), `/redact`, `/tagmsg`, `/x0` (image upload)
 
 ### Channels
 - `/join`, `/part`, `/topic`, `/names`, `/kick`, `/invite`, `/mode`, `/autojoin`
 
-### Operator
-- `/op`, `/deop`, `/voice`, `/devoice`, `/hop`, `/dehop`, `/ban`, `/ban -l`, `/unban`
-
-### Users & Status
-- `/nick`, `/whois`, `/whowas`, `/who`, `/ignore`, `/unignore`, `/away`, `/back`, `/seen`, `/tell`, `/monitor`, `/whox`, `/cluster`
+### Social & Behavioral Analysis
+- `/cluster`, `/fingerprint`, `/together`, `/adjacent`, `/targets`, `/seen`, `/tell`
 
 ### AI Detection
-- `/ai`, `/topai`, `/bot`, `/unbot`, `/aitoggle`, `/logtoggle`, `/learn_tell`, `/forget_tell`, `/scan_watermark`, `/fingerprint`
+- `/ai`, `/topai`, `/bot`, `/unbot`, `/aitoggle`, `/logtoggle`, `/learn_tell`, `/forget_tell`, `/scan_watermark`
 
 ### AI Integration (Claude, OpenAI, Ollama)
 - `/askai`, `/summarize`, `/model`, `/vibe`, `/explain`, `/api`
 
-### Translation & Utilities
-- `/autotranslate`, `/linkpreview`, `/dcc` (send/trust/untrust/trusted/status)
+### Collaboration & Media
+- `/jitsi`, `/linkpreview`, `/autotranslate`, `/dcc` (send/tsend/accept/resume/chat/trust/untrust/trusted/status)
+
+### Users & Status
+- `/nick`, `/whois`, `/whowas`, `/who`, `/ignore`, `/unignore`, `/away`, `/back`, `/monitor`, `/whox`
+
+### Operator
+- `/op`, `/deop`, `/voice`, `/devoice`, `/hop`, `/dehop`, `/ban`, `/ban -l`, `/unban`
 
 ### Windows & Navigation
 - `/win`, `/close` (`/wc`), `/clear`, `/alias`, `/links`, `/list`, `/lf`, `/theme`, `/userlist`

@@ -26,3 +26,9 @@ i am about to part
 /bouncer detach 
 hi 
 /leave 
+/bouncer deattach 
+/bouncer on 
+/bouncer detach 
+/bouncer attach 
+/bouncer clear 
+hi 

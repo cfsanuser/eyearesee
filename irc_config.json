@@ -6,5 +6,12 @@
   "sasl_mechanism": "PLAIN",
   "nickserv_password": "",
   "ollama_url": "http://127.0.0.1:11434",
-  "llamacpp_url": "http://127.0.0.1:8033"
+  "llamacpp_url": "http://127.0.0.1:8033",
+  "bouncer": {
+    "enabled": true,
+    "detached": false
+  },
+  "gpg": {
+    "key_fingerprint": ""
+  }
 }
