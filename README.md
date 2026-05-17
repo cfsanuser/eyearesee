@@ -149,10 +149,10 @@ The companion `analyzelog.py` utility provides professional-grade log auditing a
 - `/win`, `/close` (`/wc`), `/clear`, `/alias`, `/links`, `/list`, `/lf`, `/theme`, `/userlist`
 
 ### Bouncer & Connectivity (BNC / ZNC)
-- `/bouncer` (on|off|status|detach|attach|replay|clear), `/detach`, `/attach`, `/znc`
+- `/bouncer` (on|off|status|detach|attach|replay|clear), `/replay` `/znc`
 
 ### Connection & Services
-- `/server`, `/reconnect`, `/replay`, `/register`, `/pem`, `/ns`, `/cs`, `/ctcp`
+- `/server`, `/reconnect`, `/register`, `/pem`, `/ns`, `/cs`, `/ctcp`
 
 ### Plugins & System
 - `/loadplugin`, `/unloadplugin`, `/reloadplugin`, `/plugins`, `/redraw`, `/quit`, `/help`, `/commands`, `/mute`
