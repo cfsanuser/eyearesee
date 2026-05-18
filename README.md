@@ -155,9 +155,6 @@ The companion `analyzelog.py` utility provides professional-grade log auditing a
 ### Windows & Navigation
 - `/win` (`/window`), `/close` (`/wc`), `/clear`, `/alias`, `/lf`, `/theme`, `/userlist`
 
-### Bouncer & Connectivity (BNC / ZNC)
-- `/bouncer` (`/bnc`) (on|off|status|detach|attach|replay|clear), `/detach`, `/attach`, `/znc`, `/tor`, `/pgp`, `/ctcpmode`
-
 ### Connection & Services
 - `/server`, `/reconnect`, `/replay`, `/register`, `/pem`, `/ns` (`/nickserv`), `/cs` (`/chanserv`), `/ctcp`
 
@@ -174,8 +171,7 @@ The companion `analyzelog.py` utility provides professional-grade log auditing a
 - **Formatting:** `Ctrl+B` (Bold), `Ctrl+]` (Italic), `Ctrl+_` (Underline), `Ctrl+O` (Reset formatting)
 
 ### Mouse Support
-- **Scrolling:** Full support for **Mouse Wheel** scrolling and a physical **Interactive Scrollbar**.
-- **Interactive Scrollbar:** Click anywhere on the scrollbar track to jump, or **click and drag** the handle for a smooth "glide" through history.
+- **Scrolling:** Support for **Mouse Wheel** scrolling and a physical **Visual Scrollbar** on the right edge of the chat window.
 - **URLs:** Click to open in default browser.
 - **Nicks:** Click in userlist or chat to initiate a `/query`.
 - **Header:** Click to switch between active channels/windows.

@@ -10791,50 +10791,6 @@ class TUI:
                 self.dirty = True
                 return True
 
-            # ── Interactive Scrollbar Detection ──
-            win = self.get_current_window()
-            self._wrap_window(win)
-            total = len(win.wrapped_cache)
-            content_height = self._content_height
-            max_off = max(0, total - content_height)
-            chat_h, chat_w = self.chat_win.getmaxyx()
-            bar_x = chat_w - 1
-
-            # Handle drag event (REPORT_MOUSE_POSITION = 0x8000000)
-            if self._scrollbar_dragging and (bstate & 0x8000000):
-                click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
-                click_pct = max(0, min(1, click_pct))
-                win.scroll_offset = int((1 - click_pct) * max_off)
-                self._chat_dirty = True
-                self.dirty = True
-                return True
-
-            if mx == bar_x and 1 <= my <= content_height and total > content_height:
-                # BUTTON1_PRESSED = 0x2, BUTTON1_CLICKED = 0x4
-                if bstate & (0x2 | 0x4):
-                    self._scrollbar_dragging = True
-                    click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
-                    click_pct = max(0, min(1, click_pct))
-                    win.scroll_offset = int((1 - click_pct) * max_off)
-                    self._chat_dirty = True
-                    self.dirty = True
-                    return True
-
-            # If any other mouse button/action happens, stop dragging
-            if not (bstate & (0x2 | 0x4 | 0x8000000)):
-                self._scrollbar_dragging = False
-
-            # my/mx are absolute screen coordinates. chat_win is at (0,0) in our layout.
-            if mx == bar_x and 1 <= my <= content_height and total > content_height:
-                # User clicked the scrollbar column in the chat window
-                # Click at y=1 is top (offset=max_off), y=content_height is bottom (offset=0)
-                click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
-                click_pct = max(0, min(1, click_pct))
-                win.scroll_offset = int((1 - click_pct) * max_off)
-                self._chat_dirty = True
-                self.dirty = True
-                return True
-
             # Fire on any button-1 event (press or click) regardless of platform
             if not (bstate & 0x001F):
                 return False
