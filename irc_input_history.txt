@@ -32,3 +32,15 @@ hi
 /bouncer attach 
 /bouncer clear 
 hi 
+/commands 
+/theme
+/theme 2 
+Ȣ
+hiiii 
+wsg 
+cutie 
+baby 
+MOTHERFUCKER
+/quit
+Ȣ
+/jitsi 

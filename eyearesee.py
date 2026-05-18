@@ -5699,6 +5699,7 @@ class TUI:
         self._dashboard_mode = "suspects"
         self._prev_on_dashboard = False           # edge-detect navigate-back-to-dashboard
         self._dashboard_profile_locked = False    # one-shot: skip reset on same-tick navigate
+        self._scrollbar_dragging = False          # is user currently dragging the scrollbar?
 
         # IRCv3 +typing client tag
         # Incoming: {target_lower: {nick_lower: [orig_nick, state, expiry_monotonic]}}
@@ -6645,6 +6646,30 @@ class TUI:
             else:
                 base = attr_normal
             _render(i + 1, line, base, tw)  # +1: row 0 is reserved for the title bar
+
+        # ── Visual scrollbar on the right edge ──
+        if total > content_height:
+            bar_x = self.chat_win.getmaxyx()[1] - 1
+            # Handle height: proportional to visible fraction of total lines
+            handle_h = max(1, int(content_height * content_height / total))
+            # Position: offset=0 is bottom, offset=max_offset is top
+            # We want pct=0 at top (offset=max_offset), pct=1 at bottom (offset=0)
+            if max_offset > 0:
+                scroll_pct = (max_offset - offset) / max_offset
+            else:
+                scroll_pct = 0
+            available = content_height - handle_h
+            start_y = 1 + int(scroll_pct * available)
+
+            for r in range(1, content_height + 1):
+                is_handle = (start_y <= r < start_y + handle_h)
+                # Use a solid block for the handle, a dim vertical line for the track
+                char = "█" if is_handle else "│"
+                attr = curses.A_NORMAL if is_handle else curses.A_DIM
+                try:
+                    self.chat_win.addstr(r, bar_x, char, attr)
+                except curses.error:
+                    pass
 
         # Typing indicator — drawn on the row just below the last message row.
         if _typing_names:
@@ -10748,9 +10773,69 @@ class TUI:
                 _, mx, my, _, bstate = curses.getmouse()
             except curses.error:
                 return False
+
+            # Mouse wheel support (ncurses/windows-curses bits)
+            # 0x10000 = BUTTON4_PRESSED (Up), 0x200000 = BUTTON5_PRESSED (Down)
+            if bstate & 0x10000:
+                win = self.get_current_window()
+                self._wrap_window(win)
+                max_off = max(0, len(win.wrapped_cache) - self._content_height)
+                win.scroll_offset = min(win.scroll_offset + 3, max_off)
+                self._chat_dirty = True
+                self.dirty = True
+                return True
+            if bstate & 0x200000:
+                win = self.get_current_window()
+                win.scroll_offset = max(0, win.scroll_offset - 3)
+                self._chat_dirty = True
+                self.dirty = True
+                return True
+
+            # ── Interactive Scrollbar Detection ──
+            win = self.get_current_window()
+            self._wrap_window(win)
+            total = len(win.wrapped_cache)
+            content_height = self._content_height
+            max_off = max(0, total - content_height)
+            chat_h, chat_w = self.chat_win.getmaxyx()
+            bar_x = chat_w - 1
+
+            # Handle drag event (REPORT_MOUSE_POSITION = 0x8000000)
+            if self._scrollbar_dragging and (bstate & 0x8000000):
+                click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
+                click_pct = max(0, min(1, click_pct))
+                win.scroll_offset = int((1 - click_pct) * max_off)
+                self._chat_dirty = True
+                self.dirty = True
+                return True
+
+            if mx == bar_x and 1 <= my <= content_height and total > content_height:
+                # BUTTON1_PRESSED = 0x2, BUTTON1_CLICKED = 0x4
+                if bstate & (0x2 | 0x4):
+                    self._scrollbar_dragging = True
+                    click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
+                    click_pct = max(0, min(1, click_pct))
+                    win.scroll_offset = int((1 - click_pct) * max_off)
+                    self._chat_dirty = True
+                    self.dirty = True
+                    return True
+
+            # If any other mouse button/action happens, stop dragging
+            if not (bstate & (0x2 | 0x4 | 0x8000000)):
+                self._scrollbar_dragging = False
+
+            # my/mx are absolute screen coordinates. chat_win is at (0,0) in our layout.
+            if mx == bar_x and 1 <= my <= content_height and total > content_height:
+                # User clicked the scrollbar column in the chat window
+                # Click at y=1 is top (offset=max_off), y=content_height is bottom (offset=0)
+                click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
+                click_pct = max(0, min(1, click_pct))
+                win.scroll_offset = int((1 - click_pct) * max_off)
+                self._chat_dirty = True
+                self.dirty = True
+                return True
+
             # Fire on any button-1 event (press or click) regardless of platform
-            # constant differences between ncurses and pdcurses/windows-curses.
-            # Values 1-16 cover: released, pressed, clicked, double, triple.
             if not (bstate & 0x001F):
                 return False
             chat_w = self.chat_win.getmaxyx()[1]
