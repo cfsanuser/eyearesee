@@ -5699,6 +5699,7 @@ class TUI:
         self._dashboard_mode = "suspects"
         self._prev_on_dashboard = False           # edge-detect navigate-back-to-dashboard
         self._dashboard_profile_locked = False    # one-shot: skip reset on same-tick navigate
+        self._scrollbar_dragging = False          # is user currently dragging the scrollbar?
 
         # IRCv3 +typing client tag
         # Incoming: {target_lower: {nick_lower: [orig_nick, state, expiry_monotonic]}}
@@ -10786,6 +10787,50 @@ class TUI:
             if bstate & 0x200000:
                 win = self.get_current_window()
                 win.scroll_offset = max(0, win.scroll_offset - 3)
+                self._chat_dirty = True
+                self.dirty = True
+                return True
+
+            # ── Interactive Scrollbar Detection ──
+            win = self.get_current_window()
+            self._wrap_window(win)
+            total = len(win.wrapped_cache)
+            content_height = self._content_height
+            max_off = max(0, total - content_height)
+            chat_h, chat_w = self.chat_win.getmaxyx()
+            bar_x = chat_w - 1
+
+            # Handle drag event (REPORT_MOUSE_POSITION = 0x8000000)
+            if self._scrollbar_dragging and (bstate & 0x8000000):
+                click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
+                click_pct = max(0, min(1, click_pct))
+                win.scroll_offset = int((1 - click_pct) * max_off)
+                self._chat_dirty = True
+                self.dirty = True
+                return True
+
+            if mx == bar_x and 1 <= my <= content_height and total > content_height:
+                # BUTTON1_PRESSED = 0x2, BUTTON1_CLICKED = 0x4
+                if bstate & (0x2 | 0x4):
+                    self._scrollbar_dragging = True
+                    click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
+                    click_pct = max(0, min(1, click_pct))
+                    win.scroll_offset = int((1 - click_pct) * max_off)
+                    self._chat_dirty = True
+                    self.dirty = True
+                    return True
+
+            # If any other mouse button/action happens, stop dragging
+            if not (bstate & (0x2 | 0x4 | 0x8000000)):
+                self._scrollbar_dragging = False
+
+            # my/mx are absolute screen coordinates. chat_win is at (0,0) in our layout.
+            if mx == bar_x and 1 <= my <= content_height and total > content_height:
+                # User clicked the scrollbar column in the chat window
+                # Click at y=1 is top (offset=max_off), y=content_height is bottom (offset=0)
+                click_pct = (my - 1) / (content_height - 1) if content_height > 1 else 0
+                click_pct = max(0, min(1, click_pct))
+                win.scroll_offset = int((1 - click_pct) * max_off)
                 self._chat_dirty = True
                 self.dirty = True
                 return True
