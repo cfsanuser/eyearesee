@@ -108,36 +108,43 @@ Beyond simple AI detection, eyearesee tracks deep behavioral patterns to map soc
 
 ## Analysis & Monitoring (analyzelog.py)
 
-The companion `analyzelog.py` utility provides professional-grade log auditing and real-time monitoring of AI scores.
+The companion `analyzelog.py` utility provides professional-grade log auditing and real-time monitoring.
 
-- **Web Portal:** A full-featured web interface (default port 80) with a retro "Hacker" aesthetic, real-time updates, and command execution.
-- **Web API:** A JSON-based API (port 8088) for log retrieval, summarization, and Prometheus-compatible metrics.
-- **Real-time Dashboard:** A terminal-based curses dashboard (`/dashboard` command) for live log monitoring and user drill-down.
-- **Alerting & Webhooks:** Automated Slack and Discord notifications for high AI detection scores.
-- **Batch Analysis:** Filter logs by time range (`--since`/`--until`), complex flags, or user similarity.
-- **Watch Mode:** Tail logs in real-time with integrated alert-engine evaluation.
+### CLI Batch Analysis
+- **Filtering:** `--since`, `--until`, `--flagged`, `--similar` (find related nicks), `--bursts`, `--diff`.
+- **Reporting:** `--summarize`, `--export`, `--json`.
+- **Modes:** `--dashboard` (real-time TUI), `--watch` (live tailing), `--web` (start API), `--webportal` (start UI).
+
+### Interactive Console Commands
+- **Dashboard:** `dashboard` (curses TUI), `watch` (live alerts), `cron` (scheduled checks).
+- **Web Services:** `web` (JSON API on :8088), `webportal` (Hacker UI on :80), `webhook` (Slack/Discord).
+- **Extensions:** `plugin` (load/reload analysis plugins), `script` (batch process script files).
+- **Output:** `export` (save analysis results).
 
 ---
 
 ## Comprehensive Command Reference
 
 ### Messaging
-- `/msg`, `/query`, `/chain`, `/idle`, `/notice`, `/me`, `/reply`, `/react`, `/ml` (multiline), `/redact`, `/tagmsg`, `/x0` (image upload)
+- `/msg` (`/m`), `/query`, `/notice`, `/me` (`/action`), `/reply`, `/react`, `/ml` (`/multiline`), `/redact`, `/tagmsg`, `/x0` (image upload), `/chain` (vim-style chaining)
 
 ### Channels
-- `/join`, `/part`, `/topic`, `/names`, `/kick`, `/invite`, `/mode`, `/autojoin`
+- `/join`, `/part`, `/topic`, `/names`, `/kick`, `/invite`, `/mode`, `/autojoin`, `/list`, `/links`
 
 ### Social & Behavioral Analysis
-- `/cluster`, `/fingerprint`, `/together`, `/adjacent`, `/targets`, `/seen`, `/tell`
+- `/cluster`, `/fingerprint`, `/together`, `/adjacent`, `/targets`, `/seen`, `/tell`, `/idle`, `/vibe`
 
 ### AI Detection
-- `/ai`, `/topai`, `/bot`, `/unbot`, `/aitoggle`, `/logtoggle`, `/learn_tell`, `/forget_tell`, `/scan_watermark`
+- `/ai`, `/topai`, `/bot`, `/unbot`, `/aitoggle`, `/logtoggle`, `/scan_watermark` (`/watermark`), `/learn_tell` (`/ltell`), `/forget_tell` (`/ftell`)
 
 ### AI Integration (Claude, OpenAI, Ollama)
-- `/askai`, `/summarize`, `/model`, `/vibe`, `/explain`, `/api`
+- `/askai`, `/summarize` (`/summarise`, `/summerize`), `/model`, `/explain`, `/api`
 
 ### Collaboration & Media
-- `/jitsi`, `/linkpreview`, `/autotranslate`, `/dcc` (send/tsend/accept/resume/chat/trust/untrust/trusted/status)
+- `/jitsi`, `/linkpreview`, `/autotranslate`, `/dcc` (send/tsend/accept/resume/trust/untrust/trusted/status), `/dccchat`
+
+### Connectivity & Bouncer
+- `/bouncer` (`/bnc`) (on|off|status|detach|attach|replay|clear), `/detach`, `/attach`, `/znc`, `/tor`, `/pgp`, `/ctcpmode`
 
 ### Users & Status
 - `/nick`, `/whois`, `/whowas`, `/who`, `/ignore`, `/unignore`, `/away`, `/back`, `/monitor`, `/whox`
@@ -146,16 +153,16 @@ The companion `analyzelog.py` utility provides professional-grade log auditing a
 - `/op`, `/deop`, `/voice`, `/devoice`, `/hop`, `/dehop`, `/ban`, `/ban -l`, `/unban`
 
 ### Windows & Navigation
-- `/win`, `/close` (`/wc`), `/clear`, `/alias`, `/links`, `/list`, `/lf`, `/theme`, `/userlist`
+- `/win` (`/window`), `/close` (`/wc`), `/clear`, `/alias`, `/lf`, `/theme`, `/userlist`
 
 ### Bouncer & Connectivity (BNC / ZNC)
-- `/bouncer` (on|off|status|detach|attach|replay|clear), `/replay` `/znc`
+- `/bouncer` (`/bnc`) (on|off|status|detach|attach|replay|clear), `/detach`, `/attach`, `/znc`, `/tor`, `/pgp`, `/ctcpmode`
 
 ### Connection & Services
-- `/server`, `/reconnect`, `/register`, `/pem`, `/ns`, `/cs`, `/ctcp`
+- `/server`, `/reconnect`, `/replay`, `/register`, `/pem`, `/ns` (`/nickserv`), `/cs` (`/chanserv`), `/ctcp`
 
 ### Plugins & System
-- `/loadplugin`, `/unloadplugin`, `/reloadplugin`, `/plugins`, `/redraw`, `/quit`, `/help`, `/commands`, `/mute`
+- `/loadplugin`, `/unloadplugin`, `/reloadplugin`, `/plugins`, `/script`, `/redraw`, `/quit` (`/exit`), `/help`, `/commands`, `/mute`
 
 ---
 
@@ -167,6 +174,8 @@ The companion `analyzelog.py` utility provides professional-grade log auditing a
 - **Formatting:** `Ctrl+B` (Bold), `Ctrl+]` (Italic), `Ctrl+_` (Underline), `Ctrl+O` (Reset formatting)
 
 ### Mouse Support
+- **Scrolling:** Full support for **Mouse Wheel** scrolling and a physical **Interactive Scrollbar**.
+- **Interactive Scrollbar:** Click anywhere on the scrollbar track to jump, or **click and drag** the handle for a smooth "glide" through history.
 - **URLs:** Click to open in default browser.
 - **Nicks:** Click in userlist or chat to initiate a `/query`.
 - **Header:** Click to switch between active channels/windows.
