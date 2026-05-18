@@ -3,6 +3,9 @@ GEMINI.md
 *.log
 *.jsonl
 config.json
+irc_config.json
+irc_input_history.txt
+desktop.ini
 __pycache__/
 *.pyc
 venv/
