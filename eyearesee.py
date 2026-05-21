@@ -5215,9 +5215,8 @@ async def _llm_classify_ai(text: str, model_key: str) -> float:
             if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
                 return 0.0
             try:
-                # The new google-genai SDK uses Client().aio for async support
-                gclient = _gemini_mod.Client(api_key=GEMINI_API_KEY)
-                resp = await gclient.aio.models.generate_content(
+                gclient = _gemini_mod.aio.Client(api_key=GEMINI_API_KEY)
+                resp = await gclient.models.generate_content(
                     model=model_id,
                     contents=prompt,
                     config=_gemini_mod.types.GenerateContentConfig(max_output_tokens=10))
@@ -8754,6 +8753,7 @@ class RealtimeStats:
     def __init__(self):
         self._msg_timestamps: deque = deque(maxlen=5000)
         self._channel_msg_counts: Dict[str, int] = {}
+        self._channel_msg_timestamps: Dict[str, deque] = {}
         self._hourly_activity: List[int] = [0] * 24
         self._session_start: float = time.time()
         self._total_msgs: int = 0
@@ -8762,6 +8762,8 @@ class RealtimeStats:
         self._sentiment_samples: deque = deque(maxlen=200)
         self._last_compute: float = 0.0
         self._cached_lines: List[str] = []
+        self._last_channel: str = ""
+        self._channel_speakers: Dict[str, Dict[str, int]] = {}
 
     def record_message(self, nick: str, channel: str, ai_score: int = 0, sentiment: float = 0.0) -> None:
         now = time.time()
@@ -8773,7 +8775,30 @@ class RealtimeStats:
             self._total_suspects_seen += 1
         self._ai_scores_in_window.append(ai_score)
         self._sentiment_samples.append(sentiment)
+        if channel not in self._channel_msg_timestamps:
+            self._channel_msg_timestamps[channel] = deque(maxlen=2000)
+        self._channel_msg_timestamps[channel].append(now)
+        if channel not in self._channel_speakers:
+            self._channel_speakers[channel] = {}
+        self._channel_speakers[channel][nick] = self._channel_speakers[channel].get(nick, 0) + 1
         self._last_compute = 0.0
+        if self._last_channel != channel:
+            self._last_channel = channel
+            self._cached_lines = []
+
+    def _compute_channel_rate(self, channel: str, window_seconds: int) -> float:
+        now = time.time()
+        cutoff = now - window_seconds
+        ts = self._channel_msg_timestamps.get(channel)
+        if not ts:
+            return 0.0
+        count = sum(1 for t in ts if t >= cutoff)
+        return count / (window_seconds / 60.0)
+
+    def get_top_speakers(self, channel: str, limit: int = 3) -> List[Tuple[str, int]]:
+        speakers = self._channel_speakers.get(channel, {})
+        sorted_speakers = sorted(speakers.items(), key=lambda x: x[1], reverse=True)
+        return sorted_speakers[:limit]
 
     def get_panel_lines(self, current_channel: str, total_users: int, suspect_count: int, channels_joined: int) -> List[str]:
         now = time.monotonic()
@@ -8798,7 +8823,13 @@ class RealtimeStats:
 
         if current_channel and current_channel.startswith("#"):
             ch_msgs = self._channel_msg_counts.get(current_channel, 0)
+            ch_rate = self._compute_channel_rate(current_channel, 60)
             lines.append(f" {ch_msgs} in {current_channel}")
+            lines.append(f" {ch_rate:.1f}/min")
+            top = self.get_top_speakers(current_channel, 3)
+            if top:
+                top_str = ", ".join(f"{n}({c})" for n, c in top)
+                lines.append(f" top: {top_str}")
 
         avg_ai = sum(self._ai_scores_in_window) / len(self._ai_scores_in_window) if self._ai_scores_in_window else 0
         lines.append(f" AI avg: {avg_ai:.0f}%")
@@ -10117,6 +10148,7 @@ class ScoringEngine:
         self.debate_analyzer = DebateAnalyzer()
         self.echo_chamber = EchoChamberDetector()
         self.achievements = AchievementBadges()
+        self.achievements_enabled = False
         self.sarcasm = SarcasmDetector()
         self.emotion_arc = EmotionArc()
         # Real-time stats panel
@@ -11721,6 +11753,8 @@ class IRCClient:
         self.biometrics.record_incoming_message()
         target = params[0]
         msg    = params[1]
+        if not target or not msg:
+            return
         # server-time: prefer server-provided timestamp over local clock
         ts_str = _parse_server_time(tags["time"]) if "time" in tags else None
         # account-tag: sender's services account (if server advertises it)
@@ -13230,7 +13264,9 @@ class PluginAPI:
                 self._tui._dashboard_last_update = 0.0
             self._tui.current_channel = name if name.startswith("#") else None
             self._tui._unread_windows.discard(name)
-            self._tui._chat_dirty = self._tui._userlist_dirty = self._tui._input_dirty = True
+            self._tui._chat_dirty = self._tui._userlist_dirty = self._tui._input_dirty = self._tui._stats_dirty = True
+            self._tui._last_stats_draw = 0.0
+            self._tui._last_stats_channel = ""
             self._tui.dirty = True
 
     # ── Scheduling ───────────────────────────────────────────────────────────
@@ -13828,6 +13864,11 @@ class TUI:
         self._userlist_dirty = True
         self._input_dirty   = True
         self._stats_dirty   = True
+
+        # Stats panel performance tracking
+        self._last_stats_draw: float = 0.0
+        self._stats_draw_interval: float = 1.0
+        self._last_stats_channel: str = ""
 
         # Cached window dimensions (updated only on resize)
         # Compute _tw from the logical expected width, not getmaxyx(), so that a
@@ -14547,8 +14588,8 @@ class TUI:
                         "set the environment variable and restart"), "?"
             try:
                 if self._gemini_client is None:
-                    self._gemini_client = _gemini_mod.Client(api_key=GEMINI_API_KEY)
-                resp = await self._gemini_client.aio.models.generate_content(
+                    self._gemini_client = _gemini_mod.aio.Client(api_key=GEMINI_API_KEY)
+                resp = await self._gemini_client.models.generate_content(
                     model=model_id,
                     contents=prompt,
                     config=_gemini_mod.types.GenerateContentConfig(
@@ -14599,16 +14640,10 @@ class TUI:
         try:
             answer, tokens = await asyncio.wait_for(
                 self._call_ai(question, model_key, max_tokens=1024), timeout=120.0)
-            if answer.startswith("[error]"):
-                await self.ui_queue.put(("status", f"[askai] failed: {answer[8:]}"))
-            else:
-                await self.ui_queue.put(("status", f"[askai] query complete ({tokens} tokens)"))
         except asyncio.TimeoutError:
             answer, tokens = "[error] AI request timed out after 120 s", "?"
-            await self.ui_queue.put(("status", "[askai] failed: timeout"))
         except Exception as exc:
             answer, tokens = f"[error] {exc}", "?"
-            await self.ui_queue.put(("status", f"[askai] failed: {exc}"))
         finally:
             self._askai_pending = False
 
@@ -15046,10 +15081,8 @@ class TUI:
     def _draw_stats_panel(self) -> None:
         if not self._show_stats_panel or self._stats_win is None:
             return
-        sw = self._stats_width
-        self._stats_win.erase()
-        self._stats_win.border()
 
+        now = time.monotonic()
         client = self._active_client()
         if not hasattr(client, 'scoring') or not hasattr(client.scoring, 'stats'):
             return
@@ -15059,6 +15092,17 @@ class TUI:
             ch = cur_win.name
         elif self.current_channel and self.current_channel in self.channel_users:
             ch = self.current_channel
+
+        channel_changed = ch != self._last_stats_channel
+        if not channel_changed and (now - self._last_stats_draw) < self._stats_draw_interval:
+            return
+
+        self._last_stats_draw = now
+        self._last_stats_channel = ch or ""
+
+        sw = self._stats_width
+        self._stats_win.erase()
+        self._stats_win.border()
 
         total_users = len(self.channel_users.get(ch, set())) if ch else 0
         suspect_count = len(self.channel_users.get(ch, set()) & self._suspect_nicks) if ch else 0
@@ -15155,7 +15199,9 @@ class TUI:
                     self._dashboard_dirty = True
                     self._dashboard_last_update = 0.0
                 self.current_channel = None
-                self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
+                self._last_stats_draw = 0.0
+                self._last_stats_channel = ""
                 self.dirty = True
                 return
             col += lw + 1
@@ -15395,7 +15441,9 @@ class TUI:
             win.scroll_offset = 0  # jump to bottom so the new messages are visible
         self._unread_windows.discard(win.name)
         win._unread_from = -1
-        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
+        self._last_stats_draw = 0.0
+        self._last_stats_channel = ""
         self.dirty = True
 
     @staticmethod
@@ -15608,6 +15656,8 @@ class TUI:
         # Unpack with defaults for the optional tail fields added for IRCv3
         (_, nick, target, msg, u_score, m_score, a_score, rolling_ai,
          is_action, *_extra) = event
+        if not target:
+            return
         ts_str    = _extra[0] if len(_extra) > 0 else None
         account   = _extra[1] if len(_extra) > 1 else ""
         is_replay = _extra[2] if len(_extra) > 2 else False
@@ -15626,6 +15676,8 @@ class TUI:
         else:
             win_name = nick
             is_chan   = False
+        if not win_name:
+            return
         win = self.ensure_window(win_name, is_channel=is_chan)
         # read-marker: mark the first unread line when this window is not active
         if not is_replay and win is not self.get_current_window() and win._unread_from < 0:
@@ -15738,11 +15790,12 @@ class TUI:
                 scoring.echo_chamber.observe(nick, target, msg, u_score / 100.0)
 
                 # Achievement badges
-                replied_to_by = [n.strip() for n in reply_to.split(",") if n.strip()] if reply_to else []
-                scoring.achievements.observe(nick, target, msg, time.time(), replied_to_by)
-                new_badges = scoring.achievements.check_achievements(nick)
-                for badge in new_badges:
-                    await self.ui_queue.put(("status", f"[achievement] 🏆 {nick} earned: {badge['icon']} {badge['name']} - {badge['desc']}"))
+                if scoring.achievements_enabled:
+                    replied_to_by = [n.strip() for n in reply_to.split(",") if n.strip()] if reply_to else []
+                    scoring.achievements.observe(nick, target, msg, time.time(), replied_to_by)
+                    new_badges = scoring.achievements.check_achievements(nick)
+                    for badge in new_badges:
+                        await self.ui_queue.put(("status", f"[achievement] {nick} earned: {badge['icon']} {badge['name']} - {badge['desc']}"))
                 
                 # Sarcasm detection
                 sarcasm_result = scoring.sarcasm.analyze(nick, msg, u_score / 100.0)
@@ -16486,6 +16539,8 @@ class TUI:
         h["latency"]    = self._slash_latency
         h["heatmap"]    = self._slash_heatmap
         h["network"]    = self._slash_network
+        h["achievements"] = self._slash_achievements
+        h["ach"]        = self._slash_achievements
         h["trigger"]    = self._slash_trigger
         h["automod"]    = self._slash_automod
         h["webhook"]    = self._slash_webhook
@@ -17123,6 +17178,13 @@ class TUI:
             log_toggle_event(enabled=True, nick=self._active_client().nick)
         state = "ENABLED" if _ai_logging_enabled else "DISABLED"
         await self.ui_queue.put(("status", f"AI detection logging {state}  (file: {AI_LOG_PATH})"))
+
+    async def _slash_achievements(self, args, extra, line):
+        client = self._active_client()
+        scoring = client.scoring
+        scoring.achievements_enabled = not scoring.achievements_enabled
+        state = "ENABLED" if scoring.achievements_enabled else "DISABLED"
+        await self.ui_queue.put(("status", f"Achievements {state}"))
 
     async def _slash_feedback(self, args, extra, line):
         """Provide feedback on AI detection to tune weights dynamically.
@@ -20764,7 +20826,6 @@ class TUI:
     def _ai_task_done(self, task: asyncio.Task) -> None:
         """Done-callback for fire-and-forget AI tasks.  Logs unhandled exceptions
         to the status window instead of letting them vanish silently."""
-        self._askai_pending = False
         exc = task.exception() if not task.cancelled() else None
         if exc:
             try:
@@ -20785,13 +20846,10 @@ class TUI:
             # larger response.
             answer, tokens = await asyncio.wait_for(
                 self._call_ai(prompt, model_key, max_tokens=2000), timeout=180.0)
-            await self.ui_queue.put(("status", f"[summarize] query complete ({tokens} tokens)"))
         except asyncio.TimeoutError:
             answer, tokens = "[error] AI request timed out after 180 s", "?"
-            await self.ui_queue.put(("status", "[summarize] failed: timeout"))
         except Exception as exc:
             answer, tokens = f"[error] {exc}", "?"
-            await self.ui_queue.put(("status", f"[summarize] failed: {exc}"))
         finally:
             self._askai_pending = False
 
@@ -20906,16 +20964,10 @@ class TUI:
         try:
             answer, tokens = await asyncio.wait_for(
                 self._call_ai(prompt, model_key, max_tokens=2000), timeout=180.0)
-            if answer.startswith("[error]"):
-                await self.ui_queue.put(("status", f"[vibe] failed: {answer[8:]}"))
-            else:
-                await self.ui_queue.put(("status", f"[vibe] query complete ({tokens} tokens)"))
         except asyncio.TimeoutError:
             answer, tokens = "[error] AI request timed out after 180 s", "?"
-            await self.ui_queue.put(("status", "[vibe] failed: timeout"))
         except Exception as exc:
             answer, tokens = f"[error] {exc}", "?"
-            await self.ui_queue.put(("status", f"[vibe] failed: {exc}"))
         finally:
             self._askai_pending = False
 
@@ -23899,7 +23951,9 @@ class TUI:
                             self._dashboard_last_update = 0.0
                         self.current_channel = win.name if win.name.startswith("#") else None
                         self._unread_windows.discard(win.name)
-                        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                        self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
+                        self._last_stats_draw = 0.0
+                        self._last_stats_channel = ""
                         self.dirty = True
                 except ValueError:
                     pass
