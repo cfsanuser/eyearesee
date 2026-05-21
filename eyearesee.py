@@ -5215,8 +5215,9 @@ async def _llm_classify_ai(text: str, model_key: str) -> float:
             if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
                 return 0.0
             try:
-                gclient = _gemini_mod.aio.Client(api_key=GEMINI_API_KEY)
-                resp = await gclient.models.generate_content(
+                # The new google-genai SDK uses Client().aio for async support
+                gclient = _gemini_mod.Client(api_key=GEMINI_API_KEY)
+                resp = await gclient.aio.models.generate_content(
                     model=model_id,
                     contents=prompt,
                     config=_gemini_mod.types.GenerateContentConfig(max_output_tokens=10))
@@ -14546,8 +14547,8 @@ class TUI:
                         "set the environment variable and restart"), "?"
             try:
                 if self._gemini_client is None:
-                    self._gemini_client = _gemini_mod.aio.Client(api_key=GEMINI_API_KEY)
-                resp = await self._gemini_client.models.generate_content(
+                    self._gemini_client = _gemini_mod.Client(api_key=GEMINI_API_KEY)
+                resp = await self._gemini_client.aio.models.generate_content(
                     model=model_id,
                     contents=prompt,
                     config=_gemini_mod.types.GenerateContentConfig(
@@ -14598,10 +14599,16 @@ class TUI:
         try:
             answer, tokens = await asyncio.wait_for(
                 self._call_ai(question, model_key, max_tokens=1024), timeout=120.0)
+            if answer.startswith("[error]"):
+                await self.ui_queue.put(("status", f"[askai] failed: {answer[8:]}"))
+            else:
+                await self.ui_queue.put(("status", f"[askai] query complete ({tokens} tokens)"))
         except asyncio.TimeoutError:
             answer, tokens = "[error] AI request timed out after 120 s", "?"
+            await self.ui_queue.put(("status", "[askai] failed: timeout"))
         except Exception as exc:
             answer, tokens = f"[error] {exc}", "?"
+            await self.ui_queue.put(("status", f"[askai] failed: {exc}"))
         finally:
             self._askai_pending = False
 
@@ -20757,6 +20764,7 @@ class TUI:
     def _ai_task_done(self, task: asyncio.Task) -> None:
         """Done-callback for fire-and-forget AI tasks.  Logs unhandled exceptions
         to the status window instead of letting them vanish silently."""
+        self._askai_pending = False
         exc = task.exception() if not task.cancelled() else None
         if exc:
             try:
@@ -20777,10 +20785,13 @@ class TUI:
             # larger response.
             answer, tokens = await asyncio.wait_for(
                 self._call_ai(prompt, model_key, max_tokens=2000), timeout=180.0)
+            await self.ui_queue.put(("status", f"[summarize] query complete ({tokens} tokens)"))
         except asyncio.TimeoutError:
             answer, tokens = "[error] AI request timed out after 180 s", "?"
+            await self.ui_queue.put(("status", "[summarize] failed: timeout"))
         except Exception as exc:
             answer, tokens = f"[error] {exc}", "?"
+            await self.ui_queue.put(("status", f"[summarize] failed: {exc}"))
         finally:
             self._askai_pending = False
 
@@ -20895,10 +20906,16 @@ class TUI:
         try:
             answer, tokens = await asyncio.wait_for(
                 self._call_ai(prompt, model_key, max_tokens=2000), timeout=180.0)
+            if answer.startswith("[error]"):
+                await self.ui_queue.put(("status", f"[vibe] failed: {answer[8:]}"))
+            else:
+                await self.ui_queue.put(("status", f"[vibe] query complete ({tokens} tokens)"))
         except asyncio.TimeoutError:
             answer, tokens = "[error] AI request timed out after 180 s", "?"
+            await self.ui_queue.put(("status", "[vibe] failed: timeout"))
         except Exception as exc:
             answer, tokens = f"[error] {exc}", "?"
+            await self.ui_queue.put(("status", f"[vibe] failed: {exc}"))
         finally:
             self._askai_pending = False
 
