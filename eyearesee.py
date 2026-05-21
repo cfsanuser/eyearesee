@@ -14825,7 +14825,9 @@ class TUI:
     def _create_windows(self) -> None:
         """Create all subwindows including the optional stats panel."""
         try:
-            self.chat_win  = curses.newwin(self.chat_height, max(1, self.width - self.userlist_width), 0, 0)
+            stats_offset = self._stats_width if self._show_stats_panel else 0
+            chat_w = max(1, self.width - self.userlist_width - stats_offset)
+            self.chat_win  = curses.newwin(self.chat_height, chat_w, 0, 0)
             self.user_win  = curses.newwin(self.chat_height, self.userlist_width, 0, max(0, self.width - self.userlist_width))
             self.input_win = curses.newwin(4, max(1, self.width), max(0, self.height - 4), 0)
             if self._show_stats_panel:
@@ -14893,6 +14895,7 @@ class TUI:
         tw = self._tw
         current_win = self.get_current_window()
         self.chat_win.erase()
+        self.chat_win.bkgd(' ', curses.A_NORMAL)
         self._wrap_window(current_win)
         wrapped = current_win.wrapped_cache
         total = len(wrapped)
@@ -14991,6 +14994,14 @@ class TUI:
         except curses.error:
             pass
 
+        # Clear remaining rows to prevent ghost content from previous window
+        last_row = content_height + (1 if _typing_names else 0)
+        for row in range(last_row + 1, self.chat_height):
+            try:
+                self.chat_win.addstr(row, 0, ' ' * tw)
+            except curses.error:
+                break
+
     def _draw_userlist(self) -> None:
         uw = self._uw
         self.user_win.erase()
@@ -15077,6 +15088,14 @@ class TUI:
                         self.user_win.addstr(i + 1, 1, line[:uw], attr_normal)
                 except curses.error:
                     break
+
+        # Clear remaining rows to prevent ghost content
+        last_user_row = min(len(users), self.chat_height - 2) if display_ch else 0
+        for row in range(last_user_row + 1, self.chat_height):
+            try:
+                self.user_win.addstr(row, 1, ' ' * (uw - 1))
+            except curses.error:
+                break
 
     def _draw_stats_panel(self) -> None:
         if not self._show_stats_panel or self._stats_win is None:
