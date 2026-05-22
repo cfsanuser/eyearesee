@@ -3049,6 +3049,7 @@ class ConversationalAgent:
         self._conversation_summaries: Dict[str, str] = {}
         self._user_preferences: Dict[str, Dict] = {}
         self._last_save: float = 0.0
+        self._llm_model: str = "gemma4"  # default model for /agent
         self.load()
 
     def configure(self, **kwargs) -> None:
@@ -3066,6 +3067,8 @@ class ConversationalAgent:
             self._proactive_participation = bool(kwargs["proactive_participation"])
         if "min_response_interval" in kwargs:
             self._min_response_interval = float(kwargs["min_response_interval"])
+        if "llm_model" in kwargs:
+            self._llm_model = kwargs["llm_model"]
 
     def enable(self) -> None:
         self._enabled = True
@@ -3098,7 +3101,7 @@ class ConversationalAgent:
         should_respond = False
         if is_mention and self._respond_to_mentions:
             should_respond = True
-        elif self._proactive_participation and random.random() < self._participation_rate:
+        elif self._proactive_participation:
             should_respond = self._should_participate(cl, nick, text)
 
         if should_respond:
@@ -3111,23 +3114,29 @@ class ConversationalAgent:
 
     def _should_participate(self, channel: str, nick: str, text: str) -> bool:
         ctx = self._channel_context.get(channel, deque())
-        if len(ctx) < 3:
+        if len(ctx) < 2:
             return False
 
         last_response = self._response_cooldowns.get(channel, 0)
-        if time.time() - last_response < 30:
+        cooldown = max(5.0, 30.0 * (1.0 - self._participation_rate))
+        if time.time() - last_response < cooldown:
             return False
+
+        rate = self._participation_rate
 
         text_lower = text.lower()
         question_markers = {"?", "what", "how", "why", "who", "when", "where", "does", "is there", "can someone"}
         if any(m in text_lower for m in question_markers):
-            return random.random() < 0.3
+            return random.random() < min(1.0, rate * 1.5)
 
         topic_keywords = {"help", "explain", "thoughts", "opinion", "agree", "disagree", "think", "know"}
         if any(k in text_lower for k in topic_keywords):
-            return random.random() < 0.2
+            return random.random() < min(1.0, rate * 1.2)
 
-        return False
+        if self._nick and self._nick.lower() in text_lower:
+            return random.random() < min(1.0, rate * 1.3)
+
+        return random.random() < rate
 
     def _generate_response(self, channel: str, nick: str, text: str) -> Optional[str]:
         ctx = self._channel_context.get(channel, deque())
@@ -3151,7 +3160,71 @@ class ConversationalAgent:
                 return response.strip()[:self._max_response_len]
         except Exception:
             pass
-        return None
+
+        return self._fallback_response(nick, text)
+
+    def _fallback_response(self, nick: str, text: str) -> str:
+        text_lower = text.lower()
+        question_markers = ["?", "what", "how", "why", "who", "when", "where"]
+        is_question = any(m in text_lower for m in question_markers)
+
+        fallbacks = {
+            "helpful": [
+                f"Good question, {nick}! Let me think about that...",
+                f"Interesting point, {nick}. I'd say it depends on the context.",
+                f"Thanks for sharing that, {nick}! Anyone else have thoughts?",
+                f"Hmm, {nick} raises a good point there.",
+                f"I see what you mean, {nick}. That's worth considering.",
+            ],
+            "sarcastic": [
+                f"Wow, {nick}, groundbreaking insight there.",
+                f"Ah yes, {nick}, because that's definitely how it works.",
+                f"Riveting stuff, {nick}. Truly.",
+                f"Sure, {nick}. And I'm the Queen of England.",
+                f"Bold take, {nick}. Bold but wrong.",
+            ],
+            "expert": [
+                f"Actually, {nick}, the data suggests otherwise.",
+                f"From a technical standpoint, {nick}, there are a few factors to consider.",
+                f"Research indicates that's not entirely accurate, {nick}.",
+                f"The evidence points in a different direction, {nick}.",
+                f"Let me clarify that, {nick} — it's more nuanced than that.",
+            ],
+            "casual": [
+                f"yeah {nick}, i feel you on that",
+                f"lol true {nick}",
+                f"eh, could go either way {nick}",
+                f"fair point {nick}, fair point",
+                f"nah {nick}, not really buying that",
+            ],
+            "debater": [
+                f"I'd challenge that assumption, {nick}. What's your evidence?",
+                f"Interesting position, {nick}, but have you considered the counterargument?",
+                f"I disagree, {nick}. Here's why...",
+                f"That's a common misconception, {nick}. Let me explain.",
+                f"Let's test that claim, {nick}. Does it hold up under scrutiny?",
+            ],
+            "mentor": [
+                f"Good thinking, {nick}. What led you to that conclusion?",
+                f"That's a thoughtful observation, {nick}. Let's explore it further.",
+                f"I appreciate your perspective, {nick}. Have you considered...?",
+                f"Wise words, {nick}. What do others think?",
+                f"Keep exploring that idea, {nick}. You're onto something.",
+            ],
+        }
+
+        personality_fallbacks = fallbacks.get(self._personality, fallbacks["helpful"])
+
+        if is_question:
+            question_fallbacks = [
+                f"Good question, {nick}! I'd say it depends.",
+                f"Hmm, {nick}, that's a tough one.",
+                f"Let me think about that, {nick}...",
+                f"Interesting question, {nick}. What do others think?",
+            ]
+            return random.choice(question_fallbacks)
+
+        return random.choice(personality_fallbacks)
 
     def _call_llm(self, system_prompt: str, user_prompt: str, temperature: float) -> Optional[str]:
         if ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
@@ -3162,6 +3235,8 @@ class ConversationalAgent:
             return self._call_gemini(system_prompt, user_prompt, temperature)
         elif OLLAMA_URL:
             return self._call_ollama(system_prompt, user_prompt, temperature)
+        elif LLAMACPP_URL:
+            return self._call_llamacpp(system_prompt, user_prompt, temperature)
         return None
 
     def _call_claude(self, system_prompt: str, user_prompt: str, temperature: float) -> Optional[str]:
@@ -3229,6 +3304,34 @@ class ConversationalAgent:
         except Exception:
             return None
 
+    def _call_llamacpp(self, system_prompt: str, user_prompt: str, temperature: float) -> Optional[str]:
+        try:
+            model_spec = AI_MODELS.get(self._llm_model, AI_MODELS.get("gemma4"))
+            model_id = model_spec.get("id", "gemma-4")
+            body = json.dumps({
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "max_tokens": 200,
+                "temperature": temperature,
+                "stream": False,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                f"{LLAMACPP_URL}/v1/chat/completions",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return (data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", ""))
+        except Exception:
+            return None
+
     def summarize_conversation(self, channel: str, limit: int = 20) -> str:
         ctx = self._channel_context.get(channel.lower(), deque())
         recent = list(ctx)[-limit:]
@@ -3249,6 +3352,25 @@ class ConversationalAgent:
             return "Unable to generate summary."
 
     def get_status(self) -> Dict[str, Any]:
+        llm_available = bool(
+            (ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY) or
+            (OPENAI_AVAILABLE and OPENAI_API_KEY) or
+            (GEMINI_AVAILABLE and GEMINI_API_KEY) or
+            OLLAMA_URL or
+            LLAMACPP_URL
+        )
+        # Determine which provider is active
+        active_provider = "unknown"
+        if ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
+            active_provider = "claude"
+        elif OPENAI_AVAILABLE and OPENAI_API_KEY:
+            active_provider = "openai"
+        elif GEMINI_AVAILABLE and GEMINI_API_KEY:
+            active_provider = "gemini"
+        elif OLLAMA_URL:
+            active_provider = "ollama"
+        elif LLAMACPP_URL:
+            active_provider = "llamacpp"
         return {
             "enabled": self._enabled,
             "personality": self._personality,
@@ -3256,6 +3378,10 @@ class ConversationalAgent:
             "participation_rate": self._participation_rate,
             "channels_active": len(self._channel_context),
             "total_messages_tracked": sum(len(ctx) for ctx in self._channel_context.values()),
+            "llm_available": llm_available,
+            "mode": "LLM" if llm_available else "fallback",
+            "provider": active_provider,
+            "llm_model": self._llm_model,
         }
 
     def list_personalities(self) -> List[str]:
@@ -3279,6 +3405,7 @@ class ConversationalAgent:
                 "respond_to_mentions": self._respond_to_mentions,
                 "proactive_participation": self._proactive_participation,
                 "min_response_interval": self._min_response_interval,
+                "llm_model": self._llm_model,
                 "long_term_memory": {k: v[-50:] for k, v in self._long_term_memory.items()},
                 "conversation_summaries": self._conversation_summaries,
             }
@@ -3299,6 +3426,7 @@ class ConversationalAgent:
             self._respond_to_mentions = data.get("respond_to_mentions", True)
             self._proactive_participation = data.get("proactive_participation", True)
             self._min_response_interval = data.get("min_response_interval", 5.0)
+            self._llm_model = data.get("llm_model", "gemma4")
             self._long_term_memory = data.get("long_term_memory", {})
             self._conversation_summaries = data.get("conversation_summaries", {})
             for ch in self._long_term_memory:
@@ -20485,6 +20613,7 @@ class TUI:
           /agent personality <name>     — set personality (helpful, sarcastic, expert, casual, debater, mentor)
           /agent nick <nick>            — set agent nick
           /agent rate <0.0-1.0>         — set participation rate
+          /agent model <key>            — set LLM model (default: gemma4 via llama.cpp)
           /agent mention on|off         — enable/disable responding to mentions
           /agent proactive on|off       — enable/disable proactive participation
           /agent summarize [channel]    — summarize recent conversation
@@ -20497,14 +20626,25 @@ class TUI:
         sw = self._status_win()
 
         if not parts:
-            await self.ui_queue.put(("status", "Usage: /agent <on|off|personality|nick|rate|mention|proactive|summarize|status|personalities>"))
+            await self.ui_queue.put(("status", "Usage: /agent <on|off|personality|nick|rate|model|mention|proactive|summarize|status|personalities>"))
             return
 
         action = parts[0].lower()
         if action in ("on", "enable"):
             agent.enable()
             agent.configure(nick=agent._nick or client.nick)
-            sw.add_line("-!- Conversational agent enabled")
+            llm_available = bool(
+                (ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY) or
+                (OPENAI_AVAILABLE and OPENAI_API_KEY) or
+                (GEMINI_AVAILABLE and GEMINI_API_KEY) or
+                OLLAMA_URL or
+                LLAMACPP_URL
+            )
+            mode = "LLM" if llm_available else "fallback"
+            sw.add_line(f"-!- Conversational agent enabled (mode: {mode})")
+            if not llm_available:
+                sw.add_line("-!- No LLM API key found — using personality-based fallback responses")
+                sw.add_line("-!- Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY for AI responses")
         elif action in ("off", "disable"):
             agent.disable()
             sw.add_line("-!- Conversational agent disabled")
@@ -20560,8 +20700,27 @@ class TUI:
             sw.add_line(f"  Personality: {status['personality']}")
             sw.add_line(f"  Nick: {status['nick']}")
             sw.add_line(f"  Participation rate: {status['participation_rate']}")
+            sw.add_line(f"  Response mode: {status['mode']}")
+            sw.add_line(f"  Provider: {status['provider']}")
+            sw.add_line(f"  LLM model: {status['llm_model']}")
             sw.add_line(f"  Channels active: {status['channels_active']}")
             sw.add_line(f"  Messages tracked: {status['total_messages_tracked']}")
+            if status['mode'] == "fallback":
+                sw.add_line("  No LLM API key configured - using fallback responses")
+                sw.add_line("  Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or run Ollama/llama.cpp")
+        elif action == "model":
+            if len(parts) < 2:
+                model_spec = AI_MODELS.get(agent._llm_model, AI_MODELS.get("gemma4"))
+                await self.ui_queue.put(("status", f"Current model: {agent._llm_model} ({model_spec.get('label', '?')})"))
+                await self.ui_queue.put(("status", f"Available: {', '.join(k for k, v in AI_MODELS.items() if v['provider'] in ('llamacpp', 'ollama'))}"))
+                return
+            model_key = parts[1].lower()
+            if model_key in AI_MODELS:
+                agent.configure(llm_model=model_key)
+                spec = AI_MODELS[model_key]
+                sw.add_line(f"-!- Agent model set to: {model_key} ({spec['label']}) [{spec['provider']}]")
+            else:
+                sw.add_line(f"-!- Unknown model '{parts[1]}'. Available: {', '.join(AI_MODELS.keys())}")
         elif action == "personalities":
             sw.add_line("=== Available Personalities ===")
             for name, config in agent.PERSONALITIES.items():
