@@ -16616,6 +16616,7 @@ class TUI:
         h["server"]     = self._slash_server
         h["reconnect"]  = self._slash_reconnect
         h["disconnect"] = self._slash_disconnect
+        h["all"]        = self._slash_all
         h["theme"]      = self._slash_theme
         h["askai"]      = self._slash_askai
         h["summarize"] = h["summarise"] = h["summerize"] = self._slash_summarize
@@ -20773,6 +20774,34 @@ class TUI:
             c.writer = None
         await self.ui_queue.put(("status", f"Disconnected (windows preserved — use /reconnect to rejoin)"))
 
+    async def _slash_all(self, args, extra, line):
+        """Disconnect from all servers and reconnect, rejoining all channels."""
+        quit_line = b"QUIT :Reconnecting all servers\r\n"
+        disconnected = []
+        for ctx in self.servers.values():
+            c = ctx.client
+            c.running = False
+            if c.writer and not c.writer.is_closing():
+                try:
+                    c.writer.write(quit_line)
+                    await asyncio.wait_for(c.writer.drain(), timeout=1.0)
+                    c.writer.close()
+                except Exception:
+                    pass
+            c.reader = None
+            c.writer = None
+            disconnected.append(f"{c.server}:{c.port}")
+
+        await self.ui_queue.put(("status", f"Disconnected from {len(disconnected)} server(s): {', '.join(disconnected)}"))
+        await self.ui_queue.put(("status", "Reconnecting all servers..."))
+
+        for ctx in self.servers.values():
+            c = ctx.client
+            c.running = True
+            task = asyncio.create_task(c.run_connection())
+            ctx.client._reconnect_task = task
+            await self.ui_queue.put(("status", f"  → Reconnecting to {c.server}:{c.port} (will rejoin {len(c.joined_channels) + len(_AUTOJOIN_CHANNELS)} channels)"))
+
     async def _slash_theme(self, args, extra, line):
         if args.isdigit() and 1 <= int(args) <= len(THEMES):
             self.apply_theme(int(args))
@@ -22220,6 +22249,7 @@ class TUI:
         _E("/server [-ssl] <host> [port]",  "Add a parallel server connection (SSL with -ssl, else plain)")
         _E("/reconnect",                    "Reconnect to server; rejoins auto-join and startup channels")
         _E("/disconnect [message]",         "Disconnect from server without closing windows")
+        _E("/all",                          "Reconnect all servers and rejoin all channels")
         _E("/replay [on|off|n|before|after|between <ts>]", "Request chat history via CHATHISTORY")
         _E("/tlsinfo [history]",            "Show TLS cert fingerprint for server; alert on cert changes")
         _E("/umode [+/-]modes",             "Set or view your user modes")
