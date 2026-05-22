@@ -285,8 +285,8 @@ def save_irc_config(cfg: dict) -> None:
     try:
         with open(IRC_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"Warning: Failed to save irc_config.json: {e}", file=sys.stderr)
 
 
 def _save_autojoin_config() -> None:
@@ -322,22 +322,23 @@ def _save_tui_settings(tui) -> None:
         cfg["silenced_channels"] = sorted(tui._silenced_channels)
     if "aliases" in p and hasattr(tui, '_aliases'):
         cfg["aliases"] = dict(tui._aliases)
-    if "triggers" in p and hasattr(tui, '_triggers'):
-        cfg["triggers"] = [t.to_dict() for t in tui._triggers]
-    if "automod" in p and hasattr(tui, '_automod_rules'):
-        cfg["automod_rules"] = [r.to_dict() for r in tui._automod_rules]
-    if "watch" in p and hasattr(tui, '_watch_list'):
-        cfg["watch_list"] = list(tui._watch_list)
-    if "snippets" in p and hasattr(tui, '_snippets'):
-        cfg["snippets"] = dict(tui._snippets)
-    if "ignore" in p and hasattr(tui, '_ignore_nicks'):
-        cfg["ignore_list"] = sorted(tui._ignore_nicks)
-    if "todos" in p and hasattr(tui, '_todos'):
-        cfg["todos"] = [t.to_dict() for t in tui._todos]
-    if "notes" in p and hasattr(tui, '_notes'):
-        cfg["notes"] = [n.to_dict() for n in tui._notes]
-    if "bookmarks" in p and hasattr(tui, '_bookmarks'):
-        cfg["bookmarks"] = [b.to_dict() for b in tui._bookmarks]
+    client = tui._active_client()
+    scoring = getattr(client, 'scoring', None)
+    if "triggers" in p and scoring and hasattr(scoring, 'triggers'):
+        cfg["triggers"] = list(scoring.triggers._triggers)
+    if "automod" in p and scoring and hasattr(scoring, 'automod'):
+        cfg["automod_rules"] = dict(scoring.automod._rules)
+        cfg["automod_whitelist"] = {k: sorted(v) for k, v in scoring.automod._whitelist.items()}
+    if "watch" in p and scoring and hasattr(scoring, 'watches'):
+        cfg["watch_list"] = dict(scoring.watches._watches)
+    if "todos" in p and scoring and hasattr(scoring, 'todos'):
+        cfg["todos"] = list(scoring.todos._todos)
+    if "notes" in p and scoring and hasattr(scoring, 'notes'):
+        cfg["notes"] = dict(scoring.notes._notes)
+    if "bookmarks" in p and scoring and hasattr(scoring, 'bookmarks'):
+        cfg["bookmarks"] = list(scoring.bookmarks._bookmarks)
+    if "snippets" in p and scoring and hasattr(scoring, 'snippets'):
+        cfg["snippets"] = dict(scoring.snippets._snippets)
     cfg["persisted_settings"] = sorted(tui._persisted_settings)
     save_irc_config(cfg)
 
@@ -7149,7 +7150,18 @@ class SnippetManager:
         except OSError:
             pass
 
-    def add(self, name: str, text: str, tags: List[str] = None, user: str = "") -> Dict:
+    def add_snippet(self, name: str, text: str, tags: List[str] = None, user: str = "") -> Dict:
+        return self.add(name, text, tags, user)
+
+    def remove_snippet(self, name: str) -> bool:
+        return self.remove(name)
+
+    def list_snippets(self, tag: str = "") -> List[Dict]:
+        return self.list_all(tag)
+
+    def get_snippet(self, name: str) -> Optional[str]:
+        s = self.get(name)
+        return s["text"] if s else None
         """Add a snippet."""
         name = name.lower()
         self._snippets[name] = {
@@ -13770,7 +13782,8 @@ class TUI:
         self._persisted_settings = set(_cfg.get("persisted_settings", [
             "theme", "userlist", "stats", "autotranslate", "linkpreview",
             "mute", "model", "achievements", "ai_scoring", "ctcp_mode",
-            "silence", "aliases", "snippets", "ignore"
+            "silence", "aliases", "snippets", "ignore",
+            "triggers", "automod", "watch", "todos", "notes", "bookmarks"
         ]))
         p = self._persisted_settings
         if "userlist" in p:
@@ -13784,7 +13797,7 @@ class TUI:
         if "mute" in p:
             self.mention_beep_muted = _cfg.get("mention_beep_muted", False)
         if "model" in p:
-            self.ai_chat_model = _cfg.get("ai_model", self.ai_chat_model)
+            self.ai_chat_model = _cfg.get("ai_model", CLAUDE_DEFAULT_MODEL)
         if "theme" in p:
             self.current_theme = _cfg.get("theme", 1)
         if "silence" in p:
@@ -13796,6 +13809,26 @@ class TUI:
         if "ignore" in p:
             self._ignore_nicks = set(_cfg.get("ignore_list", []))
 
+        # Ensure ai_chat_model always has a default
+        if not hasattr(self, "ai_chat_model"):
+            self.ai_chat_model = CLAUDE_DEFAULT_MODEL
+        if not hasattr(self, "current_theme"):
+            self.current_theme = 1
+        if not hasattr(self, "auto_translate"):
+            self.auto_translate = True
+        if not hasattr(self, "link_preview_enabled"):
+            self.link_preview_enabled = True
+        if not hasattr(self, "mention_beep_muted"):
+            self.mention_beep_muted = False
+        if not hasattr(self, "_silenced_channels"):
+            self._silenced_channels = set()
+        if not hasattr(self, "_aliases"):
+            self._aliases = {}
+        if not hasattr(self, "_snippets"):
+            self._snippets = {}
+        if not hasattr(self, "_ignore_nicks"):
+            self._ignore_nicks = set()
+
         # Apply loaded settings to scoring engine
         if hasattr(client, 'scoring'):
             if "achievements" in p:
@@ -13805,13 +13838,40 @@ class TUI:
             if "ctcp_mode" in p:
                 client._ctcp_mode = _cfg.get("ctcp_mode", "normal")
 
-        # Load complex data structures
-        self._triggers = []
-        self._automod_rules = []
-        self._watch_list = set()
-        self._todos = []
-        self._notes = []
-        self._bookmarks = []
+        # Load complex data structures from config into scoring managers
+        scoring = getattr(client, 'scoring', None)
+        if scoring:
+            if "triggers" in p and hasattr(scoring, 'triggers'):
+                triggers_data = _cfg.get("triggers", [])
+                if triggers_data:
+                    scoring.triggers._triggers = triggers_data
+            if "automod" in p and hasattr(scoring, 'automod'):
+                automod_rules = _cfg.get("automod_rules", {})
+                automod_wl = _cfg.get("automod_whitelist", {})
+                if automod_rules:
+                    scoring.automod._rules = automod_rules
+                if automod_wl:
+                    scoring.automod._whitelist = {k: set(v) for k, v in automod_wl.items()}
+            if "watch" in p and hasattr(scoring, 'watches'):
+                watch_data = _cfg.get("watch_list", {})
+                if watch_data:
+                    scoring.watches._watches = watch_data
+            if "todos" in p and hasattr(scoring, 'todos'):
+                todos_data = _cfg.get("todos", [])
+                if todos_data:
+                    scoring.todos._todos = todos_data
+            if "notes" in p and hasattr(scoring, 'notes'):
+                notes_data = _cfg.get("notes", {})
+                if notes_data:
+                    scoring.notes._notes = notes_data
+            if "bookmarks" in p and hasattr(scoring, 'bookmarks'):
+                bookmarks_data = _cfg.get("bookmarks", [])
+                if bookmarks_data:
+                    scoring.bookmarks._bookmarks = bookmarks_data
+            if "snippets" in p and hasattr(scoring, 'snippets'):
+                snippets_data = _cfg.get("snippets", {})
+                if snippets_data:
+                    scoring.snippets._snippets = snippets_data
 
         self.windows: List[ChatWindow] = []
         self.window_by_name: Dict[str, ChatWindow] = {}
