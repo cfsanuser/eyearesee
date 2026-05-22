@@ -13715,6 +13715,9 @@ class TUI:
         # whose dicts (channel_users etc.) are currently aliased to self.*
         self._active_server_id: str = self._primary_server_id
 
+        # Connection task reference (set by main_curses, used by /reconnect)
+        self._conn_task = None
+
         self.windows: List[ChatWindow] = []
         self.window_by_name: Dict[str, ChatWindow] = {}
         _psid = self._primary_server_id
@@ -16612,6 +16615,7 @@ class TUI:
         h["quit"] = h["exit"] = self._slash_quit
         h["server"]     = self._slash_server
         h["reconnect"]  = self._slash_reconnect
+        h["disconnect"] = self._slash_disconnect
         h["theme"]      = self._slash_theme
         h["askai"]      = self._slash_askai
         h["summarize"] = h["summarise"] = h["summerize"] = self._slash_summarize
@@ -20731,12 +20735,43 @@ class TUI:
 
     async def _slash_reconnect(self, args, extra, line):
         cur = self._active_client()
-        await self.ui_queue.put(("status", f"Forcing reconnect to {cur.server}:{cur.port}..."))
-        if cur.writer:
+        if cur.writer and not cur.writer.is_closing():
+            await self.ui_queue.put(("status", f"Reconnecting to {cur.server}:{cur.port}..."))
+            quit_line = b"QUIT :Reconnecting\r\n"
             try:
+                cur.writer.write(quit_line)
+                await asyncio.wait_for(cur.writer.drain(), timeout=1.0)
                 cur.writer.close()
             except Exception:
                 pass
+            cur.reader = None
+            cur.writer = None
+        cur.running = True
+        if not hasattr(self, '_conn_task') or self._conn_task.done():
+            self._conn_task = asyncio.create_task(cur.run_connection())
+            await self.ui_queue.put(("status", "Reconnection task started"))
+        else:
+            await self.ui_queue.put(("status", "Reconnection already in progress"))
+
+    async def _slash_disconnect(self, args, extra, line):
+        msg = (args + " " + extra).strip() if args else "Client disconnecting"
+        quit_line = (
+            (f"QUIT :{msg}" if msg else "QUIT :Client disconnecting")
+            .encode("utf-8", "replace")[:510] + b"\r\n"
+        )
+        for ctx in self.servers.values():
+            c = ctx.client
+            c.running = False
+            if c.writer and not c.writer.is_closing():
+                try:
+                    c.writer.write(quit_line)
+                    await asyncio.wait_for(c.writer.drain(), timeout=1.0)
+                    c.writer.close()
+                except Exception:
+                    pass
+            c.reader = None
+            c.writer = None
+        await self.ui_queue.put(("status", f"Disconnected (windows preserved — use /reconnect to rejoin)"))
 
     async def _slash_theme(self, args, extra, line):
         if args.isdigit() and 1 <= int(args) <= len(THEMES):
@@ -22183,7 +22218,8 @@ class TUI:
         _C("")
         _H("Connection")
         _E("/server [-ssl] <host> [port]",  "Add a parallel server connection (SSL with -ssl, else plain)")
-        _E("/reconnect",                    "Drop and re-establish (uses draft/resume token if available)")
+        _E("/reconnect",                    "Reconnect to server; rejoins auto-join and startup channels")
+        _E("/disconnect [message]",         "Disconnect from server without closing windows")
         _E("/replay [on|off|n|before|after|between <ts>]", "Request chat history via CHATHISTORY")
         _E("/tlsinfo [history]",            "Show TLS cert fingerprint for server; alert on cert changes")
         _E("/umode [+/-]modes",             "Set or view your user modes")
@@ -24248,6 +24284,7 @@ async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
         asyncio.create_task(client.run_connection()),
         asyncio.create_task(tui.run()),
     ]
+    tui._conn_task = tasks[0]
 
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
