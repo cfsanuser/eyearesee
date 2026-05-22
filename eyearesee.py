@@ -10674,6 +10674,8 @@ class IRCClient:
         self.users: Dict[str, UserState] = {}
         self.running = True
         self._identified = False
+        self._waiting_for_nickserv = False
+        self._pending_joins: list = []
         self.joined_channels: set = {DEFAULT_CHANNEL} if DEFAULT_CHANNEL else set()
         self._ctcp_times: Dict[str, deque] = {}  # rate-limit CTCP replies
         self._cap_ls_caps: set = set()           # accumulated caps across multiline CAP LS
@@ -11121,8 +11123,23 @@ class IRCClient:
         await asyncio.sleep(1.5)
         if self.writer and not self.writer.is_closing():
             self.send_raw(f"PRIVMSG NickServ :IDENTIFY {NICKSERV_PASSWORD}")
-            await self.ui_queue.put(("status", "Auto-identified to NickServ"))
-            self._identified = True
+            await self.ui_queue.put(("status", "Auto-identifying to NickServ..."))
+            # Queue channels to join after authentication
+            self._pending_joins = []
+            for ch in sorted(self.joined_channels):
+                self._pending_joins.append(ch)
+            for ch in sorted(_AUTOJOIN_CHANNELS):
+                if self._irc_lower(ch) not in (self._irc_lower(c) for c in self.joined_channels):
+                    self._pending_joins.append(ch)
+            # Set timeout to join channels even if NickServ doesn't respond
+            asyncio.create_task(self._nickserv_timeout())
+
+    async def _nickserv_timeout(self) -> None:
+        """Join channels after timeout if NickServ doesn't respond."""
+        await asyncio.sleep(10)
+        if self._waiting_for_nickserv and not self._identified:
+            await self.ui_queue.put(("status", "NickServ timeout — joining channels anyway"))
+            await self._join_pending_channels()
 
     async def run_connection(self) -> None:
         """Connect + keepalive with exponential-backoff auto-reconnect."""
@@ -11130,6 +11147,8 @@ class IRCClient:
         attempt = 0
         while self.running:
             self._identified = False
+            self._waiting_for_nickserv = False
+            self._pending_joins = []
             # Reset all per-connection state. Anything populated by
             # the previous session (caps, ISUPPORT, batches,
             # chathistory cap, ...) would otherwise leak into the
@@ -11787,20 +11806,28 @@ class IRCClient:
         else:
             await self.ui_queue.put(("status", "Successfully logged in to IRC"))
             if not self._identified and NICKSERV_PASSWORD:
+                self._waiting_for_nickserv = True
+                self._pending_joins = []
                 asyncio.create_task(self._delayed_nickserv_identify())
-            for ch in sorted(self.joined_channels):
-                self.send_raw(f"JOIN {ch}")
-                await self.ui_queue.put(("status", f"Joining {ch}..."))
-            for ch in sorted(_AUTOJOIN_CHANNELS):
-                if self._irc_lower(ch) not in (self._irc_lower(c) for c in self.joined_channels):
-                    self.send_raw(f"JOIN {ch}")
-                    await self.ui_queue.put(("status", f"Joining {ch}..."))
+                await self.ui_queue.put(("status", "Waiting for NickServ authentication before joining channels..."))
+            else:
+                await self._join_pending_channels()
         if not self.current_channel and DEFAULT_CHANNEL:
             self.current_channel = DEFAULT_CHANNEL
         if self._soju_is_bouncer and self._chathistory_cap:
             asyncio.create_task(self._soju_auto_replay())
         # Query own user modes (triggers 221 RPL_UMODEIS)
         self.send_raw(f"MODE {self.nick}")
+
+    async def _join_pending_channels(self) -> None:
+        """Join all channels that were queued during authentication."""
+        channels_to_join = list(self._pending_joins)
+        self._pending_joins.clear()
+        self._waiting_for_nickserv = False
+        
+        for ch in sorted(channels_to_join):
+            self.send_raw(f"JOIN {ch}")
+            await self.ui_queue.put(("status", f"Joining {ch}..."))
 
     async def _soju_auto_replay(self) -> None:
         """Request chathistory for all joined channels after soju connect."""
@@ -12021,6 +12048,24 @@ class IRCClient:
 
     async def _irc_notice(self, nick, params, prefix):
         text = params[-1] if params else ""
+        
+        # Detect NickServ authentication success
+        if nick and nick.lower() == "nickserv" and self._waiting_for_nickserv:
+            text_lower = text.lower()
+            success_patterns = [
+                "you are now identified",
+                "password accepted",
+                "you are successfully identified",
+                "you are already identified",
+                "identified for",
+            ]
+            if any(pattern in text_lower for pattern in success_patterns):
+                self._identified = True
+                await self.ui_queue.put(("status", f"NickServ: {text}"))
+                await self.ui_queue.put(("status", "NickServ authentication successful — joining channels"))
+                await self._join_pending_channels()
+                return
+        
         if "!" in prefix:  # user NOTICE (not server)
             target = params[0] if params else self.nick
             display_target = target if target.startswith("#") else "*status*"
