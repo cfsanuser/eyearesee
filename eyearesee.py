@@ -13885,6 +13885,9 @@ class TUI:
         # Unread tracking: window names that have received messages while inactive
         self._unread_windows: set = set()
 
+        # Silence: channels where join/part/quit messages are hidden
+        self._silenced_channels: set = set()
+
         self._event_handlers: dict = {}
         self._slash_handlers: dict = {}
         self._build_event_handlers()
@@ -16153,8 +16156,9 @@ class TUI:
                 self.channel_users[channel].add(nick)
                 self.channel_user_modes.setdefault(channel, {})[nick] = set()
                 self._sorted_users.pop(channel, None)
-            mark = "◈" if nick.lower() in self._ircop_nicks else "*"
-            win.add_line(f"{mark} {nick} has joined {channel}")
+            if channel not in self._silenced_channels:
+                mark = "◈" if nick.lower() in self._ircop_nicks else "*"
+                win.add_line(f"{mark} {nick} has joined {channel}")
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
         await self.plugin_manager.dispatch("on_join", nick=nick, channel=channel)
@@ -16175,10 +16179,11 @@ class TUI:
             self.channel_user_modes.get(channel, {}).pop(nick, None)
             self._sorted_users.pop(channel, None)
         win = self.ensure_window(channel)
-        win.add_line(f"* {nick} has left {channel}" + (f" ({reason})" if reason else ""))
-        if win is not self.get_current_window():
-            self._unread_windows.add(channel)
-            self._input_dirty = True
+        if channel not in self._silenced_channels:
+            win.add_line(f"* {nick} has left {channel}" + (f" ({reason})" if reason else ""))
+            if win is not self.get_current_window():
+                self._unread_windows.add(channel)
+                self._input_dirty = True
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
         await self.plugin_manager.dispatch("on_part", nick=nick, channel=channel, reason=reason)
@@ -16192,12 +16197,13 @@ class TUI:
                 users.discard(nick)
                 self.channel_user_modes.get(ch, {}).pop(nick, None)
                 self._sorted_users.pop(ch, None)
-                ch_win = self.window_by_name.get(self._wk(self._active_server_id, ch))
-                if ch_win:
-                    ch_win.add_line(quit_msg)
-                    if ch_win is not self.get_current_window():
-                        self._unread_windows.add(ch_win.name)
-                        self._input_dirty = True
+                if ch not in self._silenced_channels:
+                    ch_win = self.window_by_name.get(self._wk(self._active_server_id, ch))
+                    if ch_win:
+                        ch_win.add_line(quit_msg)
+                        if ch_win is not self.get_current_window():
+                            self._unread_windows.add(ch_win.name)
+                            self._input_dirty = True
         self._suspect_nicks.discard(nick)
         self._ircop_nicks.discard(nick.lower())
         self.user_scores.pop(nick, None)
@@ -16648,6 +16654,7 @@ class TUI:
         h["dcc"]          = self._slash_dcc
         h["dccchat"]      = self._slash_dccchat
         h["userlist"]     = self._slash_userlist
+        h["silence"]      = self._slash_silence
         h["znc"]          = self._slash_znc
         h["jitsi"]        = self._slash_jitsi
         h["chain"]        = self._slash_chain
@@ -22196,6 +22203,7 @@ class TUI:
         _E("/lf [keyword|min=<n>]",         "Locally filter cached /list results by keyword or min users")
         _E("/theme <1-12>",                 "Switch colour theme: Classic Hacker Ocean Sunset Neon Nord Dracula Monokai Solarized Gruvbox Tokyo Catppuccin")
         _E("/userlist",                     "Toggle the user list panel on/off")
+        _E("/silence",                      "Toggle join/part/quit message visibility in current channel")
         _E("/znc <cmd>",                    "Send a command to ZNC's *status (e.g. /znc play *chan 60)")
         _E("/soju <cmd>",                   "Send a command to soju bouncer")
         _E("/bouncer on|off|detach|attach|replay|limit|filter|clear","Built-in bouncer: buffer msgs when detached, replay on attach")
@@ -22333,6 +22341,20 @@ class TUI:
         self._resize_windows()
         state = "shown" if self._show_userlist else "hidden"
         await self.ui_queue.put(("status", f"Userlist {state}"))
+
+    async def _slash_silence(self, args, extra, line):
+        """Hide or show join/part/quit messages in the current channel."""
+        cur_win = self.get_current_window()
+        if not cur_win.is_channel:
+            await self.ui_queue.put(("status", "/silence: not in a channel"))
+            return
+        ch = cur_win.name
+        if ch in self._silenced_channels:
+            self._silenced_channels.discard(ch)
+            await self.ui_queue.put(("status", f"Silence OFF for {ch} — join/part/quit messages visible"))
+        else:
+            self._silenced_channels.add(ch)
+            await self.ui_queue.put(("status", f"Silence ON for {ch} — join/part/quit messages hidden"))
 
     async def _slash_lf(self, args, extra, line):
         """Locally filter the cached channel list by keyword or min users."""
