@@ -11207,11 +11207,15 @@ class IRCClient:
                 if "chathistory" in want and "draft/chathistory" in want:
                     want.remove("draft/chathistory")
                 _sasl_creds_ok = (
-                    SASL_MECHANISM == "EXTERNAL"
-                        and bool(SASL_CERT and SASL_KEY)
-                    or SASL_MECHANISM == "ECDSA-NIST256P-CHALLENGE"
-                        and bool(SASL_KEY)
-                    or bool(NICKSERV_PASSWORD)
+                    SASL_MECHANISM
+                    and (
+                        SASL_MECHANISM == "EXTERNAL"
+                            and bool(SASL_CERT and SASL_KEY)
+                        or SASL_MECHANISM == "ECDSA-NIST256P-CHALLENGE"
+                            and bool(SASL_KEY)
+                        or SASL_MECHANISM in ("PLAIN", "SCRAM-SHA-256")
+                            and bool(NICKSERV_PASSWORD)
+                    )
                 )
                 if "sasl" in self._cap_ls_caps and _sasl_creds_ok:
                     want.append("sasl")
@@ -16502,7 +16506,6 @@ class TUI:
         h["mood"]       = self._slash_sentiment
         h["anomaly"]    = self._slash_anomaly
         h["topics"]     = self._slash_topics
-        h["topic"]      = self._slash_topics
         h["similar"]    = self._slash_similar
         h["threads"]    = self._slash_threads
         h["thread"]     = self._slash_threads
@@ -16563,7 +16566,7 @@ class TUI:
         h["trigger"]    = self._slash_trigger
         h["automod"]    = self._slash_automod
         h["webhook"]    = self._slash_webhook
-        h["bot"]        = self._slash_bot_cmd
+        h["botcmd"]     = self._slash_bot_cmd
         h["github"]     = self._slash_github
         h["import"]     = self._slash_import
         h["astroturf"]  = self._slash_astroturf
@@ -16586,7 +16589,6 @@ class TUI:
         h["echamber"]   = self._slash_echo
         h["badges"]     = self._slash_badges
         h["badge"]      = self._slash_badges
-        h["achievements"] = self._slash_badges
         h["sarcasm"] = self._slash_sarcasm
         h["emotion"] = self._slash_emotion
         h["emotions"] = self._slash_emotion
@@ -22028,30 +22030,23 @@ class TUI:
         _H("Messaging")
         _E("/msg <nick> <text>",            "Send a PM; opens and switches to the DM window")
         _E("/query <nick> [message]",       "Open a DM window with nick; optionally send a first message")
-        _E("/jitsi",                        "Generate a Jitsi Meet link and send it in the current PM")
-        _E("/chain [nick]",                 "Show recent message chain for current window in status")
-        _E("/idle <nick>",                  "24h activity heatmap for a user")
-        _E("/together <n1> <n2>",           "Compare two users' channel overlap")
-        _E("/adjacent <nick>",              "Show who speaks before/after a user")
-        _E("/targets <nick>",               "Show who a user addresses most")
         _E("/notice <nick> <text>",         "Send a notice (-nick- style, not shown in chat)")
         _E("/me <text>",                    "Send an action line  (* nick waves)")
-        _E("/reply <text>",                 "Reply to last message with +reply tag (IRCv3 message-tags)")
-        _E("/react <emoji>",                "React to last message with +react TAGMSG (IRCv3 message-tags)")
-        _E("/ml <l1> | <l2> | ...",         "Send multiline message via draft/multiline batch")
-        _E("/redact [reason]",              "Redact last message in this window (message-redaction)")
-        _E("/tagmsg <target> key=val[;k=v]","Send a TAGMSG with client-only tags to a target")
-        _E("/x0 <path>",                    "Upload an image file to x0.at and share the URL")
+        _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
+        _E("/dcc [chat|send <nick> <file>]", "Direct Client-to-Client chat or file transfer")
+        _E("/dccchat",                      "Open DCC CHAT window with current nick")
         _C("")
         _H("Channels")
         _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
         _E("/part [channel] [message]",     "Leave a channel with an optional part message")
         _E("/topic [channel] [text]",       "View or set the channel topic (uses current channel)")
+        _E("/topics <keyword>",             "Search channel topics semantically")
         _E("/names [channel]",              "List users currently in the channel")
         _E("/kick <chan> <nick> [reason]",  "Kick a user from the channel")
         _E("/invite <nick> [channel]",      "Invite a user to a channel")
         _E("/mode [channel] [modes]",       "Get or set channel modes (no args = show current)")
         _E("/autojoin +<chan> | -<chan> | list | clear","Add/remove/list/clear auto-join channels")
+        _E("/mute <nick> [time]",           "Temporarily quiet a user in the channel")
         _C("")
         _H("Operator")
         _E("/op <nick>",    "Grant operator status  (+o)")
@@ -22061,8 +22056,17 @@ class TUI:
         _E("/hop <nick>",   "Grant half-op  (+h)")
         _E("/dehop <nick>", "Remove half-op (-h)")
         _E("/ban <nick|mask>","Ban user; bare nick expands to nick!*@*")
-        _E("/ban -l", "List bans in current channel")
+        _E("/ban -l",       "List bans in current channel")
         _E("/unban <mask>", "Remove a ban mask")
+        _E("/quiet <mask>", "Quiet a mask (+q)")
+        _E("/unquiet <mask>","Remove a quiet mask (-q)")
+        _E("/quietlist",    "List quiet masks in current channel")
+        _E("/halfop <nick>",   "Grant half-op (+h)")
+        _E("/dehalfop <nick>", "Remove half-op (-h)")
+        _E("/admin <nick>",   "Grant admin (+a)")
+        _E("/deadmin <nick>", "Remove admin (-a)")
+        _E("/owner <nick>",   "Grant owner (+q)")
+        _E("/deowner <nick>", "Remove owner (-q)")
         _C("")
         _H("Users & Status")
         _E("/nick <newnick>",               "Change your nickname")
@@ -22073,27 +22077,23 @@ class TUI:
         _E("/unignore <nick>",              "Stop ignoring nick")
         _E("/away [message]",               "Set away status with optional message")
         _E("/back",                         "Remove away status")
-        _E("/seen <nick>",                  "Show when a nick was last seen in this session")
-        _E("/tell <nick> <text>",           "Queue a message for delivery when nick next speaks")
-        _E("/monitor + nick[,…] | - | list | clear | status","Watch nicks for online/offline notifications")
-        _E("/whox [target] [fields]",       "Send a WHOX query with extended fields")
         _E("/cluster <nick>",               "Show a nick's social circle (adjacency + targets)")
         _E("/graph <nick> [depth]",          "Relationship graph: who nick talks to, mutual connections")
+        _E("/idle <nick>",                  "24h activity heatmap for a user")
+        _E("/together <n1> <n2>",           "Compare two users' channel overlap")
+        _E("/adjacent <nick>",              "Show who speaks before/after a user")
+        _E("/targets <nick>",               "Show who a user addresses most")
+        _E("/chain [nick]",                 "Show recent message chain for current window")
         _C("")
         _H("Productivity")
         _E("/todo [add <text> @priority #due +tag]", "Todo list: add/done/undo/remove/edit/list/clear")
-        _E("/todo done <id>",                       "Mark a todo as completed")
-        _E("/todo list [completed]",                "List todos (optionally include completed)")
         _E("/pomodoro start|stop|status|config",    "Pomodoro timer: 25/5/15 min work/break cycles")
-        _E("/pomo start|stop",                      "Alias for /pomodoro")
-        _E("/note [add <text> [cat]]",              "Scratchpad: add/edit/remove/list/search/pin/unpin/categories")
-        _E("/memo <text>",                          "Alias for /note add")
+        _E("/note [add <text> [cat]]",              "Scratchpad: add/edit/remove/list/search/pin/categories")
         _E("/bookmark [add <target> [desc] type:X +tag]","Bookmarks: add/remove/list/search (channel/nick/url)")
-        _E("/bm <target>",                          "Alias for /bookmark")
         _E("/timer <duration> [name]",               "Countdown timer: 5m tea, 30s break, 1h meeting")
-        _E("/timer list|cancel <id>",               "List or cancel active timers")
         _E("/remind in 30m <msg>",                   "Set a reminder (in Xm, at HH:MM, tomorrow)")
         _E("/watch <nick> [channel]",                "Alert when a nick joins/speaks/mentions")
+        _E("/unwatch <nick>",                        "Stop watching a nick")
         _E("/snippet add|remove|list|<name>",         "Text snippets for quick insertion")
         _E("/chstats [channel]",                     "Channel activity stats: top talkers, heatmap")
         _E("/rss add|remove|list|poll",              "RSS feed bridge to IRC channels")
@@ -22101,13 +22101,14 @@ class TUI:
         _H("Services & CTCP")
         _E("/ns <command>",                 "Send command to NickServ  (e.g. /ns identify pw)")
         _E("/cs <command>",                 "Send command to ChanServ")
-        _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
-        _E("/ctcpmode normal|off|spoof",   "CTCP leak protection: off=silent, spoof=fake replies")
+        _E("/cap <list|req|ack|end>",       "Manage IRCv3 capabilities")
+        _E("/sasl <mechanism>",             "Configure SASL authentication")
         _C("")
         _H("AI Detection")
         _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
         _E("/topai",                        "All scored users in current channel, ranked by AI%")
         _E("/bot <nick>",                   "Mark nick as confirmed bot/AI; builds typing fingerprint")
+        _E("/botcmd <nick>",                "Show bot command registry for a nick")
         _E("/unbot <nick>",                 "Remove confirmed-bot status and fingerprint for nick")
         _E("/aitoggle",                     "Enable or disable AI scoring (detection)")
         _E("/logtoggle",                    "Enable or disable AI detection logging to disk (default: on)")
@@ -22116,81 +22117,91 @@ class TUI:
         _E("/scan_watermark [text]",        "Scan recent msgs or text for LLM watermark patterns")
         _E("/fingerprint <nick> [min_sim]", "Compare a nick's linguistic fingerprint against all others")
         _E("/feedback <ai|human> <nick>",   "Confirm AI/bot or human to tune detection weights")
-        _E("/aicalibrate [status|reset|threshold]", "Inspect/adjust AI detection calibration from feedback")
-        _E("/aivai [pair <n1> <n2>]",          "Detect AI-vs-AI conversation pairs (mutual high scores)")
-        _E("/saicorr <nick|channel|anomaly>",  "Sentiment-AI score correlation analysis")
-        _E("/biometrics",                      "Show your typing cadence, response latency, and human likelihood")
-        _E("/llmfp <nick|list|status>",        "LLM fingerprinting: detect generation patterns per user")
-        _E("/deepfake <nick|chains|status>",   "Deepfake relay detection: detect relay-style AI patterns")
-        _E("/astroturf [channel]",             "Detect coordinated astroturfing campaigns")
-        _E("/personality <nick>",              "Big Five personality traits from linguistic patterns")
-        _E("/predict <context>",               "Predictive reply suggestions based on channel history")
-        _E("/stance <nick> [topic]",           "Track user positions on topics with contradiction detection")
-        _E("/flow next|state [channel]",       "Conversation flow prediction: next speaker, state")
+        _E("/biometrics",                   "Show your typing cadence, response latency, and human likelihood")
+        _E("/llmfp <nick|list|status>",     "LLM fingerprinting: detect generation patterns per user")
+        _E("/deepfake <nick|chains|status>","Deepfake relay detection: detect relay-style AI patterns")
+        _E("/astroturf [channel]",          "Detect coordinated astroturfing campaigns")
+        _E("/personality <nick>",           "Big Five personality traits from linguistic patterns")
+        _E("/predict <context>",            "Predictive reply suggestions based on channel history")
+        _E("/stance <nick> [topic]",        "Track user positions on topics with contradiction detection")
+        _E("/flow next|state [channel]",    "Conversation flow prediction: next speaker, state")
         _E("/contagion mood|influencers|cascades","Sentiment contagion map: mood spread and influencers")
-        _E("/swarm list|status",               "Bot swarm detection: coordinated bot accounts")
-        _E("/factcheck <claim|log|add>",       "Real-time fact checking against Wikipedia and known facts")
-        _E("/research enable|status|recent",   "Autonomous research agent: identifies knowledge gaps")
+        _E("/swarm list|status",            "Bot swarm detection: coordinated bot accounts")
+        _E("/factcheck <claim|log|add>",    "Real-time fact checking against Wikipedia and known facts")
+        _E("/research enable|status|recent","Autonomous research agent: identifies knowledge gaps")
         _E("/agent on|off|personality|nick|rate","Conversational agent: LLM-powered natural participant")
         _E("/banevasion track|check|list|matches","Ban evasion detection: catch banned users returning")
-        _E("/roles [nick|channel]",            "Role inference: classify users by behavior patterns")
-        _E("/debate <n1> <n2> [channel]",      "Debate analyzer: score argument quality and fallacies")
-        _E("/echo [channel|list]",             "Echo chamber detector: measure opinion homogeneity")
-        _E("/badges [nick|list|leaderboard]",  "Achievement badges: track user accomplishments")
-        _E("/sarcasm <nick|recent|channel>",   "Sarcasm detector: sentiment-text mismatch analysis")
-        _E("/emotion <nick|compare|summary>",  "Emotion arc: track emotional journey over time")
+        _E("/roles [nick|channel]",         "Role inference: classify users by behavior patterns")
+        _E("/debate <n1> <n2> [channel]",   "Debate analyzer: score argument quality and fallacies")
+        _E("/echo [channel|list]",          "Echo chamber detector: measure opinion homogeneity")
+        _E("/badges [nick|list|leaderboard]","Achievement badges: track user accomplishments")
+        _E("/achievements",                 "Toggle achievement tracking on/off")
+        _E("/sarcasm <nick|recent|channel>","Sarcasm detector: sentiment-text mismatch analysis")
+        _E("/emotion <nick|compare|summary>","Emotion arc: track emotional journey over time")
+        _E("/sentiment [channel|nick]",     "Analyze sentiment trends in channel or for user")
+        _E("/anomaly <nick>",               "Behavioral anomaly detection for a user")
+        _E("/similar <text>",               "Find semantically similar messages in history")
+        _E("/threads [active]",             "List or view active conversation threads")
+        _E("/crosschannel [nick]",          "Cross-channel bot detection and activity")
+        _E("/savefp",                       "Save all bot fingerprints to disk")
+        _E("/behavior <nick>",              "Show behavioral patterns and habits for a user")
+        _E("/aistatus",                     "Show AI pipeline status and active detectors")
         _C("")
         _H("Automation & Integration")
-        _E("/trigger add|list|remove",         "Auto-respond to patterns with custom actions")
+        _E("/trigger add|list|remove",      "Auto-respond to patterns with custom actions")
         _E("/automod add|list|remove|whitelist","Auto-moderation rules: flood, caps, regex, links")
-        _E("/webhook add|list|remove",         "Forward IRC events to external webhooks")
-        _E("/github add|list|remove|check",    "Track GitHub repos for issues/PRs/releases")
+        _E("/webhook add|list|remove",      "Forward IRC events to external webhooks")
+        _E("/github add|list|remove|check", "Track GitHub repos for issues/PRs/releases")
         _E("/import <file> [window] [format]", "Import chat logs from HexChat, WeeChat, irssi")
         _C("")
         _H("Networking & Analytics")
-        _E("/dns <host|cache|clear>",          "Async DNS resolution with caching")
-        _E("/latency [server]",                "Connection latency stats with jitter and p95/p99")
-        _E("/heatmap [channel]",               "Channel activity heatmap (day × hour)")
-        _E("/network topology|uptime|status",  "Network topology, uptime, and connection stats")
-        _E("/i2p on|off|strict|nostrict|status","Route IRC through I2P hidden services")
+        _E("/dns <host|cache|clear>",       "Async DNS resolution with caching")
+        _E("/latency [server]",             "Connection latency stats with jitter and p95/p99")
+        _E("/heatmap [channel]",            "Channel activity heatmap (day × hour)")
+        _E("/network topology|uptime|status","Network topology, uptime, and connection stats")
+        _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
+        _E("/i2p on|off|strict|nostrict|status", "Route IRC through I2P hidden services")
         _C("")
         _H("AI Integration  (Claude + OpenAI + Gemini + Ollama + llama.cpp)")
-        _E("/askai [model] <question>",   "Ask AI a question; answer shown in dashboard")
-        _E("/summarize [n] [model]",      "Summarize last n msgs in current window (default 50)")
-        _E("/brief [channel]",            "AI one-paragraph summary of unread messages in channel")
-        _E("/model [key]",                "Set/list AI models: opus sonnet haiku gpt4o gpt4 gpt35 gemini gpro")
-        _E("/vibe <channel> [n] [model]", "Analyze channel culture using AI")
-        _E("/explain <nick> [model]",     "Analyze a user's behavior using AI")
-        _E("/api",                        "Show AI provider key status (Claude/OpenAI/Gemini/Ollama)")
-        _E("/api <VAR_NAME> <value>",     "Set an API key in environment: ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OLLAMA_URL")
+        _E("/askai [model] <question>",     "Ask AI a question; answer shown in dashboard")
+        _E("/summarize [n] [model]",        "Summarize last n msgs in current window (default 50)")
+        _E("/model [key]",                  "Set/list AI models: opus sonnet haiku gpt4o gpt4 gpt35 gemini gpro")
+        _E("/api",                          "Show AI provider key status (Claude/OpenAI/Gemini/Ollama)")
+        _E("/api <VAR_NAME> <value>",       "Set an API key in environment")
         _spec = AI_MODELS.get(self.ai_chat_model, {})
         _C(f"  Current model: {self.ai_chat_model}  ({_spec.get('label','?')}  [{_spec.get('provider','?')}])")
         _C("")
         _H("Translation")
-        _E("/autotranslate",               "Toggle auto CJK → English translation (on by default)")
+        _E("/autotranslate",                "Toggle auto CJK → English translation (on by default)")
         _C("")
         _H("Connection")
-        _E("/server [-ssl] <host> [port]", "Add a parallel server connection (SSL with -ssl, else plain)")
-        _E("/reconnect",                   "Drop and re-establish (uses draft/resume token if available)")
-        _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
-        _E("/replay [on|off|n|before|after|between <ts>]", "Request chat history via CHATHISTORY (needs /replay on)")
-        _E("/register <account|*> <email> <pw>","Register an account via draft/account-registration")
-        _E("/pem [/path/to.pem]",          "Generate NIST P-256 key pair for SASL ECDSA auth")
-        _E("/certfp status|generate|fingerprint", "Auto-generate CertFP for SASL EXTERNAL auth")
-        _E("/tlsinfo [history]",             "Show TLS cert fingerprint for server; alert on cert changes")
+        _E("/server [-ssl] <host> [port]",  "Add a parallel server connection (SSL with -ssl, else plain)")
+        _E("/reconnect",                    "Drop and re-establish (uses draft/resume token if available)")
+        _E("/replay [on|off|n|before|after|between <ts>]", "Request chat history via CHATHISTORY")
+        _E("/tlsinfo [history]",            "Show TLS cert fingerprint for server; alert on cert changes")
+        _E("/umode [+/-]modes",             "Set or view your user modes")
+        _E("/oper <user> <pass>",           "IRC operator login")
+        _E("/raw <command>",                "Send raw IRC command to server")
+        _E("/chghost <nick> <user> <host>", "Change a user's host (requires oper)")
+        _E("/setname <realname>",           "Change your realname (IRCv3)")
         _C("")
         _H("Windows & Navigation")
         _C("  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread  N = count  S = suspect")
-        _E("/win <n>",    "Switch to window n; clears its unread marker")
-        _E("/close  (or /wc)", "Close current window; focus moves to previous")
-        _E("/clear",     "Clear messages in the current window")
-        _E("/alias [name] [expansion]", "List, set or remove command alias (/alias -<name> to remove)")
-        _E("/links [n]", "Show last n links shared in this channel (default 20)")
-        _E("/list [pattern]","Fetch and display the server's channel list")
-        _E("/lf [keyword|min=<n>]","Locally filter cached /list results by keyword or min users")
-        _E("/theme <1-12>","Switch colour theme: Classic Hacker Ocean Sunset Neon Nord Dracula Monokai Solarized Gruvbox Tokyo Catppuccin")
-        _E("/userlist",   "Toggle the user list panel on/off")
-        _E("/znc <cmd>",  "Send a command to ZNC's *status (e.g. /znc play *chan 60)")
+        _E("/win <n>",                      "Switch to window n; clears its unread marker")
+        _E("/close  (or /wc)",              "Close current window; focus moves to previous")
+        _E("/clear",                        "Clear messages in the current window")
+        _E("/alias [name] [expansion]",     "List, set or remove command alias (/alias -<name> to remove)")
+        _E("/links [n]",                    "Show last n links shared in this channel (default 20)")
+        _E("/list [pattern]",               "Fetch and display the server's channel list")
+        _E("/lf [keyword|min=<n>]",         "Locally filter cached /list results by keyword or min users")
+        _E("/theme <1-12>",                 "Switch colour theme: Classic Hacker Ocean Sunset Neon Nord Dracula Monokai Solarized Gruvbox Tokyo Catppuccin")
+        _E("/userlist",                     "Toggle the user list panel on/off")
+        _E("/znc <cmd>",                    "Send a command to ZNC's *status (e.g. /znc play *chan 60)")
+        _E("/soju <cmd>",                   "Send a command to soju bouncer")
+        _E("/bouncer on|off|detach|attach|replay|limit|filter|clear","Built-in bouncer: buffer msgs when detached, replay on attach")
+        _E("/pgp key|encrypt|decrypt|sign|verify|list","GPG encryption and signing commands")
+        _E("/jitsi",                        "Generate a Jitsi Meet link and send it in the current PM")
+        _E("/redraw",                       "Force a full TUI redraw")
         _C("  Ctrl+N  next window    Tab/Shift+Tab  nick or command completion")
         _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
         _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
@@ -22198,25 +22209,6 @@ class TUI:
         _C("  Ctrl+T  toggle link preview    Ctrl+Z  clear input    Esc  clear/close/reset dashboard")
         _C("  Left-click nick → /query    Left-click header → switch channel    Wheel → scroll")
         _C("")
-        _H("BNC & GPG & Tor")
-        _E("/bouncer on|off|status|detach|attach|replay","Built-in bouncer: buffer msgs when detached, replay on attach")
-        _E("/bouncer replay [N]",                 "Replay buffered msgs (optional limit N)")
-        _E("/bouncer limit [N]",                  "Set max msgs to replay on attach (0 = unlimited)")
-        _E("/bouncer filter [all|highlights|dms]","Filter mode: all msgs, only highlights, or only DMs")
-        _E("/bouncer clear",                      "Clear the message buffer without replaying")
-        _E("/detach",                         "Shortcut for /bouncer detach")
-        _E("/attach",                         "Shortcut for /bouncer attach")
-        _E("/pgp key [fp]",                   "Set signing key; with no arg, show current key")
-        _E("/pgp encrypt <nick> <msg>",       "Encrypt a message for nick's GPG key")
-        _E("/pgp decrypt <b64>",              "Decrypt a base64-encoded GPG message")
-        _E("/pgp sign <msg>",                 "Sign a message with your GPG key")
-        _E("/pgp verify <msg> <sig>",         "Verify a detached signature")
-        _E("/pgp list",                       "List GPG public keys in your keyring")
-        _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
-        _C("")
-        _H("Soju Bouncer Integration")
-        _E("/soju networks",                   "List soju bouncer networks")
-        _E("/soju add <name> host=<h> [k=v]",  "Add a network to the soju bouncer")
         _E("/soju del <name>",                  "Remove a network from the soju bouncer")
         _E("/soju update <name> k=v …",         "Change network attributes (nick, host, port)")
         _E("/soju replay [N]",                  "Request CHATHISTORY replay for current channel")
@@ -22242,6 +22234,8 @@ class TUI:
         _E("/dcc <sub>",      "DCC: send|tsend|resume|chat|trust|untrust|trusted|status — file/chat transfers")
         _E("/dccchat close|list", "Manage DCC CHAT connections")
         _C("")
+        self._chat_dirty = True
+        self.dirty = True
         self.current_window_index = 0
         self._chat_dirty = True
         self.dirty = True
@@ -24466,7 +24460,7 @@ def main():
     if _saved.get("port"):          DEFAULT_PORT       = int(_saved["port"])
     if _saved.get("nick"):          DEFAULT_NICK       = _saved["nick"]
     if _saved.get("channel"):       DEFAULT_CHANNEL    = _saved["channel"]
-    if _saved.get("sasl_mechanism"):SASL_MECHANISM     = _saved["sasl_mechanism"].upper()
+    if "sasl_mechanism" in _saved:  SASL_MECHANISM     = _saved["sasl_mechanism"].upper() if _saved["sasl_mechanism"] else ""
     if _saved.get("sasl_cert"):     SASL_CERT          = _saved["sasl_cert"]
     if _saved.get("sasl_key"):      SASL_KEY           = _saved["sasl_key"]
     if _saved.get("nickserv_password"): NICKSERV_PASSWORD = _saved["nickserv_password"]
@@ -24610,11 +24604,23 @@ def main():
 
     _section("AUTHENTICATION")
 
-    _mech_hint = f"{_DIM}PLAIN | SCRAM-SHA-256 | EXTERNAL | ECDSA-NIST256P-CHALLENGE{_RST}" if _TTY else "PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
-    _mech_disp = f"{_B_CY}{SASL_MECHANISM}{_RST}" if _TTY else SASL_MECHANISM
-    raw = _input(f"  {_B_GR}SASL{_RST}     {_mech_disp} {_mech_hint} : ").strip().upper()
-    if raw:
-        SASL_MECHANISM = raw
+    _sasl_enabled = SASL_MECHANISM != "" and SASL_MECHANISM != "NONE"
+    _sasl_status = f"{_B_GN}enabled ({SASL_MECHANISM}){_RST}" if _sasl_enabled else f"{_DIM}disabled{_RST}"
+    raw = _input(f"  {_B_GR}SASL{_RST}     {_sasl_status} {_DIM}(yes/no){_RST} : ").strip().lower()
+    if raw == "no" or raw == "n":
+        SASL_MECHANISM = ""
+    elif raw == "yes" or raw == "y":
+        if not SASL_MECHANISM or SASL_MECHANISM == "":
+            _mech_hint = f"{_DIM}PLAIN | SCRAM-SHA-256 | EXTERNAL | ECDSA-NIST256P-CHALLENGE{_RST}" if _TTY else "PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
+            raw = _input(f"  {_B_GR}Mechanism{_RST} {_mech_hint} : ").strip().upper()
+            if raw:
+                SASL_MECHANISM = raw
+            else:
+                SASL_MECHANISM = "PLAIN"
+        _mech_disp = f"{_B_CY}{SASL_MECHANISM}{_RST}" if _TTY else SASL_MECHANISM
+        raw = _input(f"  {_B_GR}Change mech?{_RST} {_mech_disp} {_DIM}(Enter to keep){_RST} : ").strip().upper()
+        if raw:
+            SASL_MECHANISM = raw
 
     _pw_hint = f"{_B_GN}[configured]{_RST}" if NICKSERV_PASSWORD else f"{_DIM}blank to skip{_RST}"
     try:
@@ -24723,7 +24729,7 @@ def main():
             _rows.append(_row("Auto-join", ", ".join(_aj_sorted[:5]) + ("..." if len(_aj_sorted) > 5 else "")))
         _rows += [
             _sec("AUTH"),
-            _row("SASL",    SASL_MECHANISM),
+            _row("SASL",    SASL_MECHANISM if SASL_MECHANISM else "disabled"),
             _pw_row("Password", _pw_show),
         ]
         if SASL_MECHANISM in ("EXTERNAL", "ECDSA-NIST256P-CHALLENGE"):
