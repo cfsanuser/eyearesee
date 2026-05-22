@@ -294,6 +294,53 @@ def _save_autojoin_config() -> None:
     cfg["autojoin"] = sorted(_AUTOJOIN_CHANNELS)
     save_irc_config(cfg)
 
+def _save_tui_settings(tui) -> None:
+    """Persist TUI preferences and state to irc_config.json."""
+    cfg = load_irc_config()
+    p = getattr(tui, '_persisted_settings', set())
+    if "theme" in p:
+        cfg["theme"] = tui.current_theme
+    if "userlist" in p:
+        cfg["userlist_visible"] = tui._show_userlist
+    if "stats" in p:
+        cfg["stats_panel_visible"] = tui._show_stats_panel
+    if "autotranslate" in p:
+        cfg["autotranslate"] = tui.auto_translate
+    if "linkpreview" in p:
+        cfg["linkpreview"] = tui.link_preview_enabled
+    if "mute" in p:
+        cfg["mention_beep_muted"] = tui.mention_beep_muted
+    if "model" in p:
+        cfg["ai_model"] = tui.ai_chat_model
+    if "achievements" in p:
+        cfg["achievements_enabled"] = tui._active_client().scoring.achievements_enabled
+    if "ai_scoring" in p:
+        cfg["ai_scoring_enabled"] = tui._active_client().scoring.ai_detector.enabled
+    if "ctcp_mode" in p:
+        cfg["ctcp_mode"] = tui._active_client()._ctcp_mode
+    if "silence" in p:
+        cfg["silenced_channels"] = sorted(tui._silenced_channels)
+    if "aliases" in p and hasattr(tui, '_aliases'):
+        cfg["aliases"] = dict(tui._aliases)
+    if "triggers" in p and hasattr(tui, '_triggers'):
+        cfg["triggers"] = [t.to_dict() for t in tui._triggers]
+    if "automod" in p and hasattr(tui, '_automod_rules'):
+        cfg["automod_rules"] = [r.to_dict() for r in tui._automod_rules]
+    if "watch" in p and hasattr(tui, '_watch_list'):
+        cfg["watch_list"] = list(tui._watch_list)
+    if "snippets" in p and hasattr(tui, '_snippets'):
+        cfg["snippets"] = dict(tui._snippets)
+    if "ignore" in p and hasattr(tui, '_ignore_nicks'):
+        cfg["ignore_list"] = sorted(tui._ignore_nicks)
+    if "todos" in p and hasattr(tui, '_todos'):
+        cfg["todos"] = [t.to_dict() for t in tui._todos]
+    if "notes" in p and hasattr(tui, '_notes'):
+        cfg["notes"] = [n.to_dict() for n in tui._notes]
+    if "bookmarks" in p and hasattr(tui, '_bookmarks'):
+        cfg["bookmarks"] = [b.to_dict() for b in tui._bookmarks]
+    cfg["persisted_settings"] = sorted(tui._persisted_settings)
+    save_irc_config(cfg)
+
 def load_input_history() -> List[str]:
     """Return up to INPUT_HISTORY_MAX lines, most-recent first."""
     try:
@@ -13718,6 +13765,54 @@ class TUI:
         # Connection task reference (set by main_curses, used by /reconnect)
         self._conn_task = None
 
+        # Load persisted settings
+        _cfg = load_irc_config()
+        self._persisted_settings = set(_cfg.get("persisted_settings", [
+            "theme", "userlist", "stats", "autotranslate", "linkpreview",
+            "mute", "model", "achievements", "ai_scoring", "ctcp_mode",
+            "silence", "aliases", "snippets", "ignore"
+        ]))
+        p = self._persisted_settings
+        if "userlist" in p:
+            self._show_userlist = _cfg.get("userlist_visible", True)
+        if "stats" in p:
+            self._show_stats_panel = _cfg.get("stats_panel_visible", False)
+        if "autotranslate" in p:
+            self.auto_translate = _cfg.get("autotranslate", True)
+        if "linkpreview" in p:
+            self.link_preview_enabled = _cfg.get("linkpreview", True)
+        if "mute" in p:
+            self.mention_beep_muted = _cfg.get("mention_beep_muted", False)
+        if "model" in p:
+            self.ai_chat_model = _cfg.get("ai_model", self.ai_chat_model)
+        if "theme" in p:
+            self.current_theme = _cfg.get("theme", 1)
+        if "silence" in p:
+            self._silenced_channels = set(_cfg.get("silenced_channels", []))
+        if "aliases" in p:
+            self._aliases = _cfg.get("aliases", {})
+        if "snippets" in p:
+            self._snippets = _cfg.get("snippets", {})
+        if "ignore" in p:
+            self._ignore_nicks = set(_cfg.get("ignore_list", []))
+
+        # Apply loaded settings to scoring engine
+        if hasattr(client, 'scoring'):
+            if "achievements" in p:
+                client.scoring.achievements_enabled = _cfg.get("achievements_enabled", False)
+            if "ai_scoring" in p:
+                client.scoring.ai_detector.enabled = _cfg.get("ai_scoring_enabled", True)
+            if "ctcp_mode" in p:
+                client._ctcp_mode = _cfg.get("ctcp_mode", "normal")
+
+        # Load complex data structures
+        self._triggers = []
+        self._automod_rules = []
+        self._watch_list = set()
+        self._todos = []
+        self._notes = []
+        self._bookmarks = []
+
         self.windows: List[ChatWindow] = []
         self.window_by_name: Dict[str, ChatWindow] = {}
         _psid = self._primary_server_id
@@ -16660,6 +16755,7 @@ class TUI:
         h["dccchat"]      = self._slash_dccchat
         h["userlist"]     = self._slash_userlist
         h["silence"]      = self._slash_silence
+        h["persist"]      = self._slash_persist
         h["znc"]          = self._slash_znc
         h["jitsi"]        = self._slash_jitsi
         h["chain"]        = self._slash_chain
@@ -17197,13 +17293,12 @@ class TUI:
         det_state = "ENABLED" if detector.enabled else "DISABLED"
         log_state = "log:ON" if _ai_logging_enabled else "log:OFF"
         await self.ui_queue.put(("status", f"AI detection {det_state}  ({log_state})"))
+        _save_tui_settings(self)
 
     async def _slash_logtoggle(self, args, extra, line):
         if _NO_AI:
             await self.ui_queue.put(("status", "[logtoggle] disabled by --no-ai")); return
         global _ai_logging_enabled
-        # Write a final "disabled" record before we stop writing, or a "enabled" record
-        # immediately after we start — so the log gap is bounded and auditable.
         if _ai_logging_enabled:
             log_toggle_event(enabled=False, nick=self._active_client().nick)
         _ai_logging_enabled = not _ai_logging_enabled
@@ -17218,6 +17313,7 @@ class TUI:
         scoring.achievements_enabled = not scoring.achievements_enabled
         state = "ENABLED" if scoring.achievements_enabled else "DISABLED"
         await self.ui_queue.put(("status", f"Achievements {state}"))
+        _save_tui_settings(self)
 
     async def _slash_feedback(self, args, extra, line):
         """Provide feedback on AI detection to tune weights dynamically.
@@ -20805,6 +20901,7 @@ class TUI:
     async def _slash_theme(self, args, extra, line):
         if args.isdigit() and 1 <= int(args) <= len(THEMES):
             self.apply_theme(int(args))
+            _save_tui_settings(self)
         else:
             names = "  ".join(f"[{i+1}] {t[0]}" for i, t in enumerate(THEMES))
             await self.ui_queue.put(("status",
@@ -21233,6 +21330,7 @@ class TUI:
             await self.ui_queue.put(("status",
                 f"AI model set to {key}  ({spec['label']}  {spec['id']})  [{spec['provider']}]"
                 f"  — also active for AI detection"))
+            _save_tui_settings(self)
         else:
             keys = "  ".join(AI_MODELS)
             await self.ui_queue.put(("status",
@@ -22044,16 +22142,19 @@ class TUI:
         self.mention_beep_muted = not self.mention_beep_muted
         state = "muted" if self.mention_beep_muted else "unmuted"
         await self.ui_queue.put(("status", f"Mention beep {state} (highlight still active)"))
+        _save_tui_settings(self)
 
     async def _slash_autotranslate(self, args, extra, line):
         self.auto_translate = not self.auto_translate
         state = "ON" if self.auto_translate else "OFF"
         await self.ui_queue.put(("status", f"Auto-translate CJK → English: {state}"))
+        _save_tui_settings(self)
 
     async def _slash_linkpreview(self, args, extra, line):
         self.link_preview_enabled = not self.link_preview_enabled
         state = "ON" if self.link_preview_enabled else "OFF"
         await self.ui_queue.put(("status", f"Link preview {state}"))
+        _save_tui_settings(self)
 
     async def _slash_autojoin(self, args, extra, line):
         global _AUTOJOIN_CHANNELS
@@ -22270,6 +22371,7 @@ class TUI:
         _E("/theme <1-12>",                 "Switch colour theme: Classic Hacker Ocean Sunset Neon Nord Dracula Monokai Solarized Gruvbox Tokyo Catppuccin")
         _E("/userlist",                     "Toggle the user list panel on/off")
         _E("/silence",                      "Toggle join/part/quit message visibility in current channel")
+        _E("/persist [add|remove|all|none]", "Manage which settings persist across restarts")
         _E("/znc <cmd>",                    "Send a command to ZNC's *status (e.g. /znc play *chan 60)")
         _E("/soju <cmd>",                   "Send a command to soju bouncer")
         _E("/bouncer on|off|detach|attach|replay|limit|filter|clear","Built-in bouncer: buffer msgs when detached, replay on attach")
@@ -22407,6 +22509,7 @@ class TUI:
         self._resize_windows()
         state = "shown" if self._show_userlist else "hidden"
         await self.ui_queue.put(("status", f"Userlist {state}"))
+        _save_tui_settings(self)
 
     async def _slash_silence(self, args, extra, line):
         """Hide or show join/part/quit messages in the current channel."""
@@ -22421,6 +22524,56 @@ class TUI:
         else:
             self._silenced_channels.add(ch)
             await self.ui_queue.put(("status", f"Silence ON for {ch} — join/part/quit messages hidden"))
+        _save_tui_settings(self)
+
+    async def _slash_persist(self, args, extra, line):
+        """Manage which settings are persisted across restarts."""
+        parts = (args + " " + extra).strip().split()
+        if not parts:
+            sw = self._status_win()
+            sw.add_line("── Persisted Settings ──")
+            for k in sorted(self._persisted_settings):
+                sw.add_line(f"  ✓ {k}")
+            sw.add_line(f"── {len(self._persisted_settings)} settings persisted ──")
+            sw.add_line("Usage: /persist [add|remove|all|none] <setting>")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        sub = parts[0].lower()
+        if sub == "all":
+            self._persisted_settings.update([
+                "theme", "userlist", "stats", "autotranslate", "linkpreview",
+                "mute", "model", "achievements", "ai_scoring", "ctcp_mode",
+                "silence", "aliases", "snippets", "ignore", "triggers",
+                "automod", "watch", "todos", "notes", "bookmarks"
+            ])
+            await self.ui_queue.put(("status", "All settings will now be persisted"))
+            _save_tui_settings(self)
+            return
+        if sub == "none":
+            self._persisted_settings.clear()
+            await self.ui_queue.put(("status", "No settings will be persisted"))
+            _save_tui_settings(self)
+            return
+
+        target = parts[1] if len(parts) > 1 else ""
+        if sub == "add":
+            if not target:
+                await self.ui_queue.put(("status", "Usage: /persist add <setting>"))
+                return
+            self._persisted_settings.add(target)
+            await self.ui_queue.put(("status", f"Added '{target}' to persistence"))
+            _save_tui_settings(self)
+        elif sub == "remove":
+            if not target:
+                await self.ui_queue.put(("status", "Usage: /persist remove <setting>"))
+                return
+            self._persisted_settings.discard(target)
+            await self.ui_queue.put(("status", f"Removed '{target}' from persistence"))
+            _save_tui_settings(self)
+        else:
+            await self.ui_queue.put(("status", f"Unknown subcommand: {sub}. Use add, remove, all, or none"))
 
     async def _slash_lf(self, args, extra, line):
         """Locally filter the cached channel list by keyword or min users."""
