@@ -36,6 +36,7 @@ from typing import Optional, Dict, List, Tuple, Callable, Any
 _NO_AI:         bool = "--no-ai"              in sys.argv
 _NO_INSTALL:    bool = "--no-install"         in sys.argv
 _REQUIRE_VENV:  bool = "--require-virtualenv" in sys.argv
+_DISABLE_MOUSE: bool = "--disable-mouse"      in sys.argv
 
 # =========================
 # Anthropic (optional)
@@ -24270,6 +24271,8 @@ class TUI:
                     disp_ch = None
 
                 if my == 0 and disp_ch:
+                    if _DISABLE_MOUSE:
+                        return False
                     # Click on header → switch to that channel window
                     # Reset dashboard state when navigating away
                     prev_win = self.get_current_window()
@@ -24284,6 +24287,8 @@ class TUI:
                             self.dirty = True
                             return True
                 elif my >= 1 and disp_ch:
+                    if _DISABLE_MOUSE:
+                        return False
                     # Click on a nick → open /query
                     # Reset dashboard state when navigating away
                     prev_win = self.get_current_window()
@@ -24329,6 +24334,8 @@ class TUI:
                 self._chat_dirty = True
                 self.dirty = True
             else:
+                if _DISABLE_MOUSE:
+                    return False
                 # No URL — check if click is on a nick in the line → open /query
                 line_text = win.wrapped_cache[line_idx]
                 nick_match = re.match(
