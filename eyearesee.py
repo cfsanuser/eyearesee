@@ -23,6 +23,7 @@ import struct
 import time
 import os
 import random
+import traceback
 import uuid
 import warnings
 from collections import Counter, deque, OrderedDict
@@ -10697,7 +10698,7 @@ class IRCClient:
         self._identified = False
         self._waiting_for_nickserv = False
         self._pending_joins: list = []
-        self.joined_channels: set = {DEFAULT_CHANNEL} if DEFAULT_CHANNEL else set()
+        self.joined_channels: set = set()
         self._ctcp_times: Dict[str, deque] = {}  # rate-limit CTCP replies
         self._cap_ls_caps: set = set()           # accumulated caps across multiline CAP LS
         self._cap_ls_values: dict = {}           # cap name → advertised value (e.g. sts=...)
@@ -11832,6 +11833,13 @@ class IRCClient:
                 asyncio.create_task(self._delayed_nickserv_identify())
                 await self.ui_queue.put(("status", "Waiting for NickServ authentication before joining channels..."))
             else:
+                # Queue default + auto-join channels
+                for ch in sorted(self.joined_channels):
+                    if ch not in self._pending_joins:
+                        self._pending_joins.append(ch)
+                for ch in sorted(_AUTOJOIN_CHANNELS):
+                    if self._irc_lower(ch) not in (self._irc_lower(c) for c in self._pending_joins):
+                        self._pending_joins.append(ch)
                 await self._join_pending_channels()
         if not self.current_channel and DEFAULT_CHANNEL:
             self.current_channel = DEFAULT_CHANNEL
@@ -24830,6 +24838,13 @@ class RichTUI(TUI):
         return text
 
     def _build_chat_panel(self) -> _RichPanel:
+        try:
+            return self._build_chat_panel_impl()
+        except Exception as e:
+            return _RichPanel(_RichText(f"chat render error: {e}"), title="error",
+                              border_style="red", box=_RichBoxMinimal)
+
+    def _build_chat_panel_impl(self) -> _RichPanel:
         current = self.get_current_window()
         self._wrap_window(current)
         wrapped = current.wrapped_cache
@@ -25172,8 +25187,11 @@ class RichTUI(TUI):
                         try:
                             await self.handle_event(event)
                         except Exception as _ev_exc:
+                            _tb = traceback.format_exc()
                             self.window_by_name["*status*"].add_line(
                                 f"[err] event handler crashed: {_ev_exc}")
+                            self.window_by_name["*status*"].add_line(
+                                f"[err] traceback: {_tb.split(chr(10))[-2].strip()}")
                             self._chat_dirty = True
                             self.dirty = True
                         n += 1
@@ -25221,7 +25239,14 @@ class RichTUI(TUI):
 
                 # ── 5. Redraw ────────────────────────────────────────────────
                 if self.dirty:
-                    self.redraw()
+                    try:
+                        self.redraw()
+                    except Exception as _draw_exc:
+                        _tb = traceback.format_exc()
+                        self.window_by_name["*status*"].add_line(
+                            f"[err] render crashed: {_draw_exc}")
+                        self.window_by_name["*status*"].add_line(
+                            f"[err] {_tb.split(chr(10))[-2].strip()}")
                     self.dirty = False
 
                 # ── 6. Sleep ─────────────────────────────────────────────────
