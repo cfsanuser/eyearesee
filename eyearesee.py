@@ -37,6 +37,7 @@ _NO_AI:         bool = "--no-ai"              in sys.argv
 _NO_INSTALL:    bool = "--no-install"         in sys.argv
 _REQUIRE_VENV:  bool = "--require-virtualenv" in sys.argv
 _DISABLE_MOUSE: bool = "--disable-mouse"      in sys.argv
+_RICH:          bool = "--rich"               in sys.argv
 
 # =========================
 # Anthropic (optional)
@@ -118,6 +119,26 @@ except ModuleNotFoundError:
         print("windows-curses not found — installing...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "windows-curses"])
     import curses
+
+# =========================
+# Rich (optional — alternative TUI with --rich)
+# =========================
+RICH_AVAILABLE: bool = False
+if _RICH:
+    try:
+        from rich.live import Live as _RichLive
+        from rich.layout import Layout as _RichLayout
+        from rich.panel import Panel as _RichPanel
+        from rich.text import Text as _RichText
+        from rich.table import Table as _RichTable
+        from rich.console import Console as _RichConsole
+        from rich.box import MINIMAL as _RichBoxMinimal
+        RICH_AVAILABLE = True
+    except ImportError:
+        pass
+
+import threading as _threading_mod
+import queue as _queue_mod
 
 # =========================
 # Config
@@ -24699,6 +24720,514 @@ class TUI:
             # immediately — keeping the loop hot during active typing or floods.
             await asyncio.sleep(0.001 if (had_key or n > 0) else 0.016)
 
+
+# =========================
+# Rich TUI (--rich) — Rich-based alternative rendering backend
+# =========================
+
+class _RichWindow:
+    """Mock curses window that captures nothing but satisfies internal TUI calls."""
+    __slots__ = ('_h', '_w', '_y', '_x')
+    def __init__(self, h=1, w=1, y=0, x=0):
+        self._h, self._w, self._y, self._x = h, w, y, x
+    def addstr(self, *a, **kw): pass
+    def addch(self, *a, **kw): pass
+    def erase(self): pass
+    def bkgd(self, *a, **kw): pass
+    def noutrefresh(self): pass
+    def refresh(self): pass
+    def clear(self): pass
+    def attron(self, *a, **kw): pass
+    def attroff(self, *a, **kw): pass
+    def instr(self, *a, **kw): return b''
+    def subwin(self, *a, **kw): return _RichWindow(*a[:2])
+    def getmaxyx(self): return (self._h, self._w)
+    def resize(self, h, w): self._h, self._w = h, w
+    def mvwin(self, y, x): self._y, self._x = y, x
+
+class _RichStdscr(_RichWindow):
+    def nodelay(self, v): pass
+    def keypad(self, v): pass
+    def getch(self): return -1
+
+
+class RichTUI(TUI):
+    """Drop-in replacement for TUI that renders via the Rich library."""
+
+    def __init__(self, ui_queue: asyncio.Queue, client):
+        if not RICH_AVAILABLE:
+            sys.exit("--rich requires the 'rich' package. Install: pip install rich")
+
+        stdscr = _RichStdscr(40, 120)
+        # ── Monkey-patch curses window-creation / colour functions so TUI.__init__
+        #    doesn't try to create real curses windows ──────────────────────────
+        import curses as _cmod
+        _saved = (_cmod.newwin, _cmod.start_color, _cmod.use_default_colors,
+                  _cmod.init_pair, _cmod.curs_set, _cmod.mouseinterval,
+                  _cmod.mousemask)
+        _cmod.newwin = lambda h, w, y=0, x=0: _RichWindow(h, w, y, x)
+        _cmod.start_color = lambda: None
+        _cmod.use_default_colors = lambda: None
+        _cmod.init_pair = lambda *a: None
+        _cmod.curs_set = lambda *a: None
+        _cmod.mouseinterval = lambda *a: None
+        _cmod.mousemask = lambda *a: (0, 0)
+        try:
+            super().__init__(stdscr, ui_queue, client)
+        finally:
+            (_cmod.newwin, _cmod.start_color, _cmod.use_default_colors,
+             _cmod.init_pair, _cmod.curs_set, _cmod.mouseinterval,
+             _cmod.mousemask) = _saved
+
+        # ── Rich rendering state ─────────────────────────────────────────────
+        self._console = _RichConsole()
+        self._live = None
+        self._rich_key_queue: deque = deque()
+        self._rich_key_lock = _threading_mod.Lock()
+        self._rich_input_thread = None
+        self._rich_running = False
+
+    # ── Override rendering methods ───────────────────────────────────────────
+
+    def _create_windows(self) -> None:
+        h, w = self.stdscr.getmaxyx()
+        self.chat_win  = _RichWindow(self.chat_height,
+                                      max(1, w - self.userlist_width), 0, 0)
+        self.user_win  = _RichWindow(self.chat_height, self.userlist_width,
+                                     0, max(0, w - self.userlist_width))
+        self.input_win = _RichWindow(4, max(1, w), max(0, h - 4), 0)
+        self._stats_win = None
+
+    def _resize_windows(self) -> None:
+        h, w = self.height, self.width
+        self._tw = max(1, w - self.userlist_width - 1)
+        self._uw = max(1, self.userlist_width - 2)
+        self._input_w = max(1, w - 4)
+        self._content_height = max(1, self.chat_height - 1)
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
+
+    def apply_theme(self, theme_idx: int, announce: bool = True) -> None:
+        self.current_theme = theme_idx
+
+    def _render_line_to_rich(self, line: str) -> _RichText:
+        """Parse IRC formatting and convert to Rich Text."""
+        segments = irc_parse_formatting(line)
+        text = _RichText()
+        for seg_text, fmt_attr in segments:
+            style = ""
+            if fmt_attr & 1:    style += "bold "
+            if fmt_attr & 2:    style += "reverse "
+            if fmt_attr & 4:    style += "underline "
+            if fmt_attr & 8:    style += "italic "
+            if fmt_attr & 9:    style += "dim "
+            # Color pairs: 1=cyan 2=magenta 3=yellow 4=green 5=white 6=blue 7=red 8=green
+            cp = (fmt_attr >> 8) & 0xFF
+            color_map = {1: "cyan", 2: "magenta", 3: "yellow", 4: "green",
+                         5: "white", 6: "blue", 7: "red", 8: "green"}
+            if cp in color_map:
+                style += color_map[cp] + " "
+            text.append(seg_text, style=style.strip() if style.strip() else None)
+        return text
+
+    def _build_chat_panel(self) -> _RichPanel:
+        current = self.get_current_window()
+        self._wrap_window(current)
+        wrapped = current.wrapped_cache
+        total = len(wrapped)
+        offset = current.scroll_offset
+        h = self._content_height
+        end_idx = total - offset
+        # Reserve a row for typing indicator
+        _typing_names = self._get_typing_names(current)
+        if _typing_names:
+            h = max(1, h - 1)
+        start_idx = max(0, end_idx - h + 1)
+        visible = wrapped[start_idx:end_idx + 1]
+
+        # Suspect regex (cached)
+        sn = self._suspect_nicks
+        if sn != self._suspect_re_nicks:
+            self._suspect_re = (
+                re.compile("|".join(re.escape(n) for n in sn))
+                if sn else None
+            )
+            self._suspect_re_nicks = frozenset(sn)
+        _sr = self._suspect_re
+        _mention_re = self._mention_re
+        url_map = current.url_map
+        _action_match = _ACTION_LINE_RE.match
+        our_nick = self._active_client().nick
+        if our_nick != self._mention_re_nick:
+            self._mention_re = (
+                re.compile(
+                    r'\[\d{2}:\d{2}\] (?:<[^>]+>|\* \S+) .*\b'
+                    + re.escape(our_nick) + r'\b',
+                    re.IGNORECASE,
+                )
+                if our_nick else None
+            )
+            self._mention_re_nick = our_nick
+
+        def _line_style(i: int, line: str) -> str:
+            real_idx = start_idx + i
+            if real_idx in url_map:
+                return "bold underline cyan"
+            if _action_match(line):
+                return "italic green"
+            if _mention_re and _mention_re.search(line):
+                return "bold reverse"
+            if _sr and _sr.search(line):
+                return "bold yellow"
+            return ""
+
+        content = _RichText()
+        for i, line in enumerate(visible):
+            if i > 0:
+                content.append("\n")
+            style = _line_style(i, line)
+            content.append(line, style=style if style else None)
+
+        # Typing indicator
+        if _typing_names:
+            if len(_typing_names) == 1:
+                typ = f" {_typing_names[0]} is typing..."
+            elif len(_typing_names) == 2:
+                typ = f" {_typing_names[0]} and {_typing_names[1]} are typing..."
+            else:
+                typ = f" {len(_typing_names)} people are typing..."
+            content.append("\n")
+            content.append(typ, style="dim")
+
+        offset_txt = f" [{offset} lines back]" if offset > 0 else ""
+        title = _RichText(f" {current.name}{offset_txt}", style="bold reverse cyan")
+        return _RichPanel(content, title=title, border_style="blue",
+                          box=_RichBoxMinimal, height=h + 2)
+
+    def _get_typing_names(self, current) -> list:
+        _now = time.monotonic()
+        _key = current.name.lower()
+        _peers = self._typing_peers.get(_key)
+        if not _peers:
+            return []
+        _stale = [_n for _n, _e in _peers.items() if _now > _e[2]]
+        for _n in _stale:
+            del _peers[_n]
+        return [_e[0] for _e in _peers.values()] if _peers else []
+
+    def _build_userlist_panel(self) -> Optional[_RichPanel]:
+        if not self._show_userlist:
+            return None
+        cur = self.get_current_window()
+        if not cur.is_channel or cur.name not in self.channel_users:
+            return _RichPanel("", title="users", border_style="blue",
+                              box=_RichBoxMinimal, height=self._content_height + 2)
+        ch = cur.name
+        if ch not in self._sorted_users:
+            self._sorted_users[ch] = self._sort_users_by_mode(ch)
+        users = self._sorted_users[ch]
+        modes = self.channel_user_modes.get(ch, {})
+        content = _RichText()
+        for i, nick in enumerate(users):
+            if i > 0:
+                content.append("\n")
+            mode = modes.get(nick, "")
+            prefix = ""
+            if mode:
+                prefix_map = {"~": "@", "&": "@", "@": "@", "%": "+", "+": "+"}
+                prefix = prefix_map.get(mode, mode)
+            nick_lower = nick.lower()
+            if nick_lower in self._suspect_nicks:
+                content.append(f"{prefix}{nick}", style="bold yellow")
+            elif prefix:
+                content.append(f"{prefix}{nick}", style="bold cyan")
+            else:
+                content.append(nick)
+        title = _RichText(f" {ch} ({len(users)}) ", style="bold reverse magenta")
+        return _RichPanel(content, title=title, border_style="blue",
+                          box=_RichBoxMinimal, height=self._content_height + 2)
+
+    def _build_input_panel(self) -> _RichPanel:
+        buf = self.input_buffer
+        cursor = self.input_cursor
+        display = _RichText()
+        if cursor > 0:
+            display.append(buf[:cursor], style="default")
+        display.append(" ", style="reverse")  # cursor indicator
+        if cursor < len(buf):
+            display.append(buf[cursor:], style="default")
+        title = _RichText(" input ", style="bold")
+        # Tab bar
+        tab_text = _RichText()
+        tab_text.append(" ")
+        for i, w in enumerate(self.windows):
+            prefix = ""
+            suffix = ""
+            if w.name in self._unread_windows:
+                prefix = "["
+                suffix = "]"
+            if i == self.current_window_index:
+                tab_text.append(f" {prefix}{w.name}{suffix} ", style="reverse bold")
+            else:
+                tab_text.append(f" {prefix}{w.name}{suffix} ")
+            tab_text.append("  ")
+        return _RichPanel(_RichText("\n").append(tab_text).append("\n").append(display),
+                          title=title, border_style="green", box=_RichBoxMinimal,
+                          height=5)
+
+    def _build_stats_panel(self) -> Optional[_RichPanel]:
+        return None  # simplified
+
+    def _build_layout(self) -> _RichLayout:
+        layout = _RichLayout()
+        layout.split_column(
+            _RichLayout(_RichPanel("eyearesee", border_style="cyan",
+                                    box=_RichBoxMinimal), name="header", size=1),
+            _RichLayout(name="body", ratio=1),
+            _RichLayout(name="input", size=5),
+        )
+        chat = self._build_chat_panel()
+        users = self._build_userlist_panel()
+        if users:
+            layout["body"].split_row(
+                _RichLayout(chat, name="chat", ratio=1),
+                _RichLayout(users, name="users", size=self.userlist_width),
+            )
+        else:
+            layout["body"].split_row(
+                _RichLayout(chat, name="chat", ratio=1),
+            )
+        layout["input"].update(self._build_input_panel())
+        return layout
+
+    def redraw(self) -> bool:
+        if time.monotonic() - self.last_redraw < 0.033:
+            return False
+        self.last_redraw = time.monotonic()
+
+        h, w = self._console.size.height, self._console.size.width
+        self.height, self.width = h, w - 1
+        self.chat_height = max(1, h - 5)
+        self._resize_windows()
+
+        self._sync_draw_ctx()
+        if self._live:
+            try:
+                self._live.update(self._build_layout())
+            except Exception:
+                pass
+        return True
+
+    # ── Keyboard input (threaded) ────────────────────────────────────────────
+    def _start_input_thread(self) -> None:
+        def _reader():
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    while self._rich_running:
+                        if msvcrt.kbhit():
+                            ch = msvcrt.getwch()
+                            with self._rich_key_lock:
+                                self._rich_key_queue.append(ch)
+                        else:
+                            time.sleep(0.005)
+                else:
+                    import termios, tty, select as _sel
+                    fd = sys.stdin.fileno()
+                    old = termios.tcgetattr(fd)
+                    try:
+                        tty.setraw(fd)
+                        while self._rich_running:
+                            r, _, _ = _sel.select([sys.stdin], [], [], 0.05)
+                            if r:
+                                ch = sys.stdin.read(1)
+                                if ch == '\x1b':
+                                    # Read escape sequence
+                                    extra = sys.stdin.read(2)
+                                    ch += extra
+                                with self._rich_key_lock:
+                                    self._rich_key_queue.append(ch)
+                    finally:
+                        try:
+                            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        self._rich_running = True
+        self._rich_input_thread = _threading_mod.Thread(target=_reader, daemon=True)
+        self._rich_input_thread.start()
+
+    def _stop_input_thread(self) -> None:
+        self._rich_running = False
+
+    def _get_rich_key(self) -> Optional[str]:
+        with self._rich_key_lock:
+            if self._rich_key_queue:
+                return self._rich_key_queue.popleft()
+        return None
+
+    @staticmethod
+    def _key_to_curses(ch: str) -> int:
+        import curses as _kc
+        if ch == '\n' or ch == '\r':
+            return _kc.KEY_ENTER if hasattr(_kc, 'KEY_ENTER') else 10
+        if ch == '\x08' or ch == '\x7f':
+            return _kc.KEY_BACKSPACE if hasattr(_kc, 'KEY_BACKSPACE') else 127
+        if ch == '\x1b[A':
+            return _kc.KEY_UP if hasattr(_kc, 'KEY_UP') else 259
+        if ch == '\x1b[B':
+            return _kc.KEY_DOWN if hasattr(_kc, 'KEY_DOWN') else 258
+        if ch == '\x1b[C':
+            return _kc.KEY_RIGHT if hasattr(_kc, 'KEY_RIGHT') else 261
+        if ch == '\x1b[D':
+            return _kc.KEY_LEFT if hasattr(_kc, 'KEY_LEFT') else 260
+        if ch == '\x1b[H':
+            return _kc.KEY_HOME if hasattr(_kc, 'KEY_HOME') else 262
+        if ch == '\x1b[F':
+            return _kc.KEY_END if hasattr(_kc, 'KEY_END') else 360
+        if ch == '\x1b[5~':
+            return _kc.KEY_PPAGE if hasattr(_kc, 'KEY_PPAGE') else 339
+        if ch == '\x1b[6~':
+            return _kc.KEY_NPAGE if hasattr(_kc, 'KEY_NPAGE') else 338
+        if ch == '\x1b[3~':
+            return _kc.KEY_DC if hasattr(_kc, 'KEY_DC') else 330
+        if ch == '\x1b[Z':
+            return _kc.KEY_BTAB if hasattr(_kc, 'KEY_BTAB') else 353
+        if ch == '\x03':
+            raise SystemExit
+        if len(ch) == 1:
+            return ord(ch)
+        return -1
+
+    # ── Main event loop ──────────────────────────────────────────────────────
+    async def run(self) -> None:
+        asyncio.create_task(self._periodic_reminder_checker())
+        asyncio.create_task(self._periodic_rss_poller())
+        asyncio.create_task(self._periodic_github_poller())
+        asyncio.create_task(self._periodic_topology_updater())
+        try:
+            await self._rich_run_loop()
+        except (SystemExit, asyncio.CancelledError, KeyboardInterrupt):
+            pass
+        finally:
+            self._stop_input_thread()
+
+    async def _rich_run_loop(self) -> None:
+        self._start_input_thread()
+        with _RichLive(self._build_layout(), console=self._console,
+                        screen=True, refresh_per_second=30) as live:
+            self._live = live
+            while True:
+                # ── 1. Keyboard ──────────────────────────────────────────────
+                had_key = False
+                while True:
+                    ch_str = self._get_rich_key()
+                    if ch_str is None:
+                        break
+                    had_key = True
+                    ch = self._key_to_curses(ch_str)
+                    if ch == -1:
+                        continue
+                    try:
+                        is_enter = self._handle_key(ch)
+                    except Exception:
+                        is_enter = False
+                    if is_enter:
+                        if self._typing_out_state in ("active", "paused"):
+                            self._send_typing("done")
+                        line = self.input_buffer
+                        if line.strip():
+                            self.input_history.appendleft(line)
+                            save_input_history_line(line)
+                        self.history_index = -1
+                        self._history_draft = ""
+                        await self.handle_input_line(line)
+                        self.input_buffer = ""
+                        self.input_cursor = 0
+                        self.completion_state = None
+                        self._input_dirty = True
+                        break
+
+                # ── 1b. Typing notifications ───────────────────────────────
+                if had_key:
+                    _new_tgt = self._typing_chat_target()
+                    if _new_tgt != self._typing_out_target and self._typing_out_state in ("active", "paused"):
+                        self._send_typing("done")
+                    if self.input_buffer.strip() and _new_tgt:
+                        self._typing_last_key = time.monotonic()
+                        if time.monotonic() - self._typing_out_last >= 3.0:
+                            self._send_typing("active")
+                    elif not self.input_buffer.strip() and self._typing_out_state in ("active", "paused"):
+                        self._send_typing("done")
+
+                # ── 2. Network events ────────────────────────────────────────
+                n = 0
+                try:
+                    while n < 64:
+                        event = self.ui_queue.get_nowait()
+                        if self._bouncer_detached and self._bouncer_enabled:
+                            if self._should_buffer_event(event):
+                                self._bouncer_buffer.append(*event)
+                        try:
+                            await self.handle_event(event)
+                        except Exception as _ev_exc:
+                            self.window_by_name["*status*"].add_line(
+                                f"[err] event handler crashed: {_ev_exc}")
+                            self._chat_dirty = True
+                            self.dirty = True
+                        n += 1
+                except asyncio.QueueEmpty:
+                    pass
+
+                # ── 3. Typing state ─────────────────────────────────────────
+                if (self._typing_out_state == "active"
+                        and self._typing_out_target
+                        and self.input_buffer.strip()
+                        and time.monotonic() - self._typing_last_key >= 5.0):
+                    self._send_typing("paused")
+
+                if self._bouncer_detached and self._bouncer_enabled:
+                    await asyncio.sleep(0.016)
+                    continue
+
+                # ── 4. Dashboard ─────────────────────────────────────────────
+                now = time.monotonic()
+                on_dashboard = (self.get_current_window().name == "*dashboard*")
+                if on_dashboard and not self._prev_on_dashboard and self._dashboard_mode == "profile":
+                    if self._dashboard_profile_locked:
+                        self._dashboard_profile_locked = False
+                    else:
+                        self._dashboard_mode = "suspects"
+                        self._dashboard_dirty = True
+                if self._dashboard_mode == "profile" and now - self._dashboard_last_update >= 30.0:
+                    self._dashboard_mode = "suspects"
+                    self._dashboard_dirty = True
+                self._prev_on_dashboard = on_dashboard
+                if self._dashboard_mode == "suspects":
+                    if self._dashboard_dirty:
+                        await self.update_dashboard()
+                        self._dashboard_dirty = False
+                        self._dashboard_last_update = now
+                        if on_dashboard:
+                            self._chat_dirty = True
+                            self.dirty = True
+                    elif on_dashboard and now - self._dashboard_last_update >= self._dashboard_ota_interval:
+                        await self.update_dashboard()
+                        self._dashboard_dirty = False
+                        self._dashboard_last_update = now
+                        self._chat_dirty = True
+                        self.dirty = True
+
+                # ── 5. Redraw ────────────────────────────────────────────────
+                if self.dirty:
+                    self.redraw()
+                    self.dirty = False
+
+                # ── 6. Sleep ─────────────────────────────────────────────────
+                await asyncio.sleep(0.001 if (had_key or n > 0) else 0.016)
+
+
 # =========================
 # Main
 # =========================
@@ -24773,6 +25302,59 @@ async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
                 except Exception:
                     pass
 
+async def main_rich(ai_detector: EnsembleAIDetector):
+    ui_queue: asyncio.Queue = asyncio.Queue()
+    scoring_engine = ScoringEngine(ai_detector)
+    _tor_cfg = load_irc_config().get("tor", {})
+    _use_tor = _tor_cfg.get("enabled", False)
+    _tor_strict = _tor_cfg.get("strict", False)
+    _ctcp_mode = load_irc_config().get("ctcp_mode", "normal")
+    _resume_cfg = load_irc_config().get("resume", {})
+    client = IRCClient(DEFAULT_SERVER, DEFAULT_PORT, DEFAULT_NICK, ui_queue, scoring_engine,
+                       use_tor=_use_tor)
+    client.tor_strict = _tor_strict
+    client._ctcp_mode = _ctcp_mode
+    client._resume_token = _resume_cfg.get("token", "")
+    client._resume_ts = _resume_cfg.get("ts", "")
+    tui = RichTUI(ui_queue, client)
+
+    await tui.update_dashboard()
+
+    tasks = [
+        asyncio.create_task(client.run_connection()),
+        asyncio.create_task(tui.run()),
+    ]
+    tui._conn_task = tasks[0]
+
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except (SystemExit, asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        for ctx in tui.servers.values():
+            c = ctx.client
+            c.running = False
+            if c.writer:
+                try:
+                    c.send_raw("QUIT :Client exiting")
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(c.writer.drain()), timeout=0.4)
+                    except Exception:
+                        pass
+                    c.writer.close()
+                    try:
+                        await asyncio.wait_for(c.writer.wait_closed(), timeout=0.4)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
 def _in_virtualenv() -> bool:
     """Return True if the interpreter is running inside a virtual environment."""
     return hasattr(sys, "real_prefix") or (
@@ -24796,6 +25378,10 @@ def _ensure_deps() -> bool:
         ("openai",              "openai",                 "OpenAI API client  (/askai, /summarize with GPT models)"),
         ("google.genai", "google-genai",    "Google AI SDK  (/askai, /summarize with Gemini)"),
     ]
+    if _RICH:
+        wanted += [
+            ("rich", "rich", "Rich TUI library  (fancy terminal UI with --rich)"),
+        ]
     if not _NO_AI:
         wanted += [
             ("transformers", "transformers",   "AI text detection  (HuggingFace)"),
@@ -25290,7 +25876,10 @@ def main():
     print()
 
     try:
-        curses.wrapper(lambda stdscr: asyncio.run(main_curses(stdscr, ai_detector)))
+        if _RICH and RICH_AVAILABLE:
+            asyncio.run(main_rich(ai_detector))
+        else:
+            curses.wrapper(lambda stdscr: asyncio.run(main_curses(stdscr, ai_detector)))
     except (KeyboardInterrupt, SystemExit):
         pass
 
