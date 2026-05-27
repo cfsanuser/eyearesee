@@ -1,0 +1,214 @@
+Complete Slash Commands List — eyearesee IRC Client
+Commands are registered at eyearesee.py:16856 in TUI._build_slash_handlers(). Aliases are shown after the /.
+Messaging
+Command	Aliases	Description
+/me	/action	Send an action line (/me waves)
+/msg	/m	Send a private message; opens DM window
+/query	 	Open a DM window with optional first message
+/notice	 	Send a notice
+/reply	 	Reply to a specific message via +draft/reply message-tags
+/react	 	React to a specific message via +draft/react message-tags
+/redact	 	Redact a message (IRCv3)
+/multiline	/ml	Multiline input mode
+/tagmsg	 	Send a tagged message
+Channels
+Command	Aliases	Description
+/join	 	Join a channel
+/part	 	Leave a channel with optional message
+/topic	 	View or set channel topic
+/names	 	List users in a channel
+/invite	 	Invite a user to a channel
+/kick	 	Kick a user from a channel
+/mode	 	Get or set channel modes
+/autojoin	 	Manage auto-join channels (+chan, -chan, list, clear)
+/ban	 	Ban a user
+/unban	 	Unban a mask
+/quiet	/chanmute	Quiet/mute a user (extended ban ~q)
+/unquiet	/chanunmute	Remove quiet
+/quietlist	 	List current quiet masks
+Channel Operator
+Command	 	Command
+/op	/deop	/voice
+/hop	/dehop	/halfop
+/admin	/deadmin	/owner
+User & Status
+Command	Aliases	Description
+/nick	 	Change nickname
+/whois	 	Query user information
+/whowas	 	Query past user information
+/who	 	WHO query (channel/wildcard)
+/whox	 	WHOX extended query
+/away	 	Set away status
+/back	 	Return from away
+/ignore	 	Ignore a user
+/unignore	 	Unignore a user
+/names	 	List channel occupants
+/idle	 	Show idle times for users
+/seen	 	When a user was last seen
+/tell	 	Leave a message for an offline user
+/monitor	 	MONITOR online/offline tracking
+/mute	 	Toggle mention beep mute
+Services & Registration
+Command	Aliases	Description
+/ns	/nickserv	Send command to NickServ
+/cs	/chanserv	Send command to ChanServ
+/register	 	Register (services)
+/cap	 	IRCv3 CAP negotiation (ls, req, ack, nak, end)
+/sasl	 	Configure SASL mechanism
+/certfp	 	Manage CertFP for SASL EXTERNAL
+/setname	 	Set realname (IRCv3 setname)
+/umode	 	Set user mode
+/chghost	 	Change host (requires oper)
+/oper	 	IRC operator login
+/raw	 	Send raw IRC line to server
+Connection & Multi-Server
+Command	Aliases	Description
+/server	 	Add server connection ([-ssl] <host> [port])
+/reconnect	 	Reconnect to current server
+/disconnect	 	Disconnect from current server
+/all	 	Reconnect all servers and rejoin channels
+/ping	 	Ping server
+/redraw	 	Force full TUI redraw
+Networking & Analytics
+Command	Aliases	Description
+/dns	/resolve	Async DNS resolution with caching
+/latency	 	Connection latency with jitter & percentiles
+/heatmap	 	Activity heatmap (day x hour)
+/network	 	Network topology & uptime
+/stats	 	Per-channel statistics (top talkers)
+/chstats	 	Channel activity statistics
+/uptime	 	Uptime display
+UI / Windows
+Command	Aliases	Description
+/win	/window	Switch to window by number
+/close	/wc	Close current window
+/clear	 	Clear current window
+/theme	 	Switch colour theme (1-12)
+/userlist	 	Toggle userlist panel visibility
+/silence	 	Toggle join/part/quit message hiding
+/persist	 	Manage which settings persist
+/autotranslate	 	Toggle CJK auto-translation
+/linkpreview	 	Toggle URL link preview
+/links	 	View link history
+/list	 	List channels
+/lf	 	List files
+/alias	 	Manage user-defined command aliases
+/redraw	 	Force screen redraw
+AI / LLM Integration
+Command	Aliases	Description
+/askai	 	Ask an AI question; answer in dashboard
+/summarize	/summarise, /summerize	Summarize last N messages
+/brief	 	Summarize unread messages per channel
+/vibe	 	AI-generated channel "vibe" analysis
+/explain	 	AI explains what a user is talking about
+/model	 	Set or list active AI model
+/api	 	Show or set API key environment variables
+/agent	/convo	Conversational agent management
+/research	 	Autonomous research agent
+AI Detection Pipeline
+Command	Aliases	Description
+/ai	 	Full AI score profile for a nick
+/topai	 	All users ranked by AI% in current channel
+/aitoggle	 	Enable/disable AI scoring
+/logtoggle	 	Toggle AI score logging to disk
+/aistatus	/aipipeline	AI detection pipeline status & config
+/aicalibrate	 	Calibrate AI detection thresholds
+/feedback	 	Give AI/human feedback to tune weights
+/learn_tell	/ltell	Teach an AI tell-phrase
+/forget_tell	/ftell	Forget a tell-phrase
+/scan_watermark	/watermark	Scan for LLM watermark patterns
+/fingerprint	/fp	Compare linguistic fingerprint
+/savefp	 	Save bot fingerprints to disk
+/llmfp	 	LLM fingerprint analysis
+/deepfake	/relay	Deepfake relay detection
+/aivai	 	Detect AI-vs-AI conversations
+/saicorr	 	Sentiment-AI correlation analysis
+Behavioral & Social Analysis
+Command	Aliases	Description
+/sentiment	/mood	Sentiment analysis & channel mood
+/anomaly	 	Behavioral anomaly detection
+/biometrics	 	Typing biometrics (cadence, latency)
+/behavior	 	Behavioral analysis
+/personality	 	Big Five (OCEAN) personality profiling
+/roles	/role	Social role inference (10 roles)
+/stance	 	Topic stance tracking & contradictions
+/flow	 	Conversation flow prediction
+/contagion	 	Sentiment contagion mapping
+/sarcasm	 	Sarcasm detection
+/emotion	/emotions	Emotion arc tracking (7 emotions)
+/debate	 	Debate analysis (10 fallacy types)
+/echo	/echamber	Echo chamber detection
+/predict	 	Predictive reply suggestions
+/similar	 	Semantic similarity search
+/threads	/thread	Conversation thread tracking
+/topics	 	Semantic channel topic search
+/astroturf	 	Astroturfing coordination detection
+/swarm	 	Bot swarm detection
+/banevasion	/banev	Ban evasion detection
+/factcheck	 	Real-time fact checking (Wikipedia)
+/crosschannel	/xchan	Cross-channel bot activity detection
+Social Graphing
+Command	Aliases	Description
+/graph	 	Relationship graph (who talks to whom)
+/cluster	 	Social cluster analysis
+/together	 	Channel overlap comparison
+/adjacent	 	Adjacent speaker analysis
+/targets	 	Who a user addresses most
+/chain	 	Recent message chain for a nick
+Productivity
+Command	Aliases	Description
+/todo	/todos, /task	Todo list (add, done, undo, edit, list, clear)
+/pomodoro	/pomo	Pomodoro timer (start, stop, status, config)
+/note	/notes, /memo	Notes (add, edit, remove, list, search, pin)
+/bookmark	/bm, /bookmarks	Bookmarks (channel/nick/URL, type, tags)
+/timer	 	Countdown timer (name, duration)
+/remind	/reminder	Reminders ("in 30m", "at 14:30", "tomorrow")
+/watch	 	Watch nick for join/speak/mention alerts
+/unwatch	 	Stop watching a nick
+/snippet	/snippets	Text snippets for quick insertion
+/rss	 	RSS feed to IRC channel bridge
+/github	 	GitHub repo tracking (issues, PRs, releases)
+Moderation & Automation
+Command	Aliases	Description
+/bot	 	Mark nick as confirmed bot
+/unbot	 	Remove bot status
+/botcmd	 	Bot command registry
+/trigger	 	Auto-respond trigger rules
+/automod	 	Auto-moderation rules (flood, caps, regex, links)
+/webhook	 	Forward IRC events to webhooks
+DCC, Bouncer & File Transfer
+Command	Aliases	Description
+/dcc	 	DCC file transfer (send, tsend, resume, chat, trust)
+/dccchat	 	DCC direct chat management
+/bouncer	/bnc	Built-in BNC bouncer (on, off, detach, attach, replay)
+/detach	 	Detach bouncer (buffer while away)
+/attach	 	Attach bouncer (replay missed messages)
+/replay	 	Replay bouncer-buffered messages
+/soju	 	soju bouncer integration
+/znc	 	ZNC bouncer integration
+/x0	 	Upload file to x0.at
+/import	 	Import chat logs (HexChat, WeeChat, irssi)
+Privacy & Security
+Command	Aliases	Description
+/pgp	 	GPG encryption/signing/verification
+/tor	 	Tor SOCKS5 routing (on, off, strict)
+/ctcpmode	 	CTCP privacy mode (normal, off, spoof)
+/tlsinfo	 	TLS certificate fingerprint history
+/pem	 	PEM key management
+Plugin & Script System
+Command	Aliases	Description
+/loadplugin	 	Load a .py plugin
+/unloadplugin	 	Unload a plugin
+/reloadplugin	 	Hot-reload a plugin
+/plugins	 	List loaded plugins
+/script	 	Manage Python/Lua scripts (load, unload, reload, list)
+Achievements
+Command	Aliases	Description
+/achievements	/ach	View achievement progress
+/badges	/badge	Awarded badge display
+Misc
+Command	Aliases	Description
+/jitsi	 	Generate Jitsi Meet link for PM
+/commands	/help	Show all available commands
+/quit	/exit	Quit the client
+Total: ~164 unique primary commands (~199 including all aliases), plus plugin/script commands registered at runtime. Any unrecognized /command is sent as a raw IRC line to the server.
