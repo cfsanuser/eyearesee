@@ -120,11 +120,6 @@ except ModuleNotFoundError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "windows-curses"])
     import curses
 
-
-
-import threading as _threading_mod
-import queue as _queue_mod
-
 # =========================
 # Config
 # =========================
