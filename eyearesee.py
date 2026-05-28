@@ -38,7 +38,6 @@ _NO_AI:         bool = "--no-ai"              in sys.argv
 _NO_INSTALL:    bool = "--no-install"         in sys.argv
 _REQUIRE_VENV:  bool = "--require-virtualenv" in sys.argv
 _DISABLE_MOUSE: bool = "--disable-mouse"      in sys.argv
-_RICH:          bool = "--rich"               in sys.argv
 
 # =========================
 # Anthropic (optional)
