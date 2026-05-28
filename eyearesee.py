@@ -121,6 +121,26 @@ except ModuleNotFoundError:
     import curses
 
 # =========================
+# Rich (optional — alternative TUI with --rich)
+# =========================
+RICH_AVAILABLE: bool = False
+if _RICH:
+    try:
+        from rich.live import Live as _RichLive
+        from rich.layout import Layout as _RichLayout
+        from rich.panel import Panel as _RichPanel
+        from rich.text import Text as _RichText
+        from rich.table import Table as _RichTable
+        from rich.console import Console as _RichConsole
+        from rich.box import MINIMAL as _RichBoxMinimal
+        RICH_AVAILABLE = True
+    except ImportError:
+        pass
+
+import threading as _threading_mod
+import queue as _queue_mod
+
+# =========================
 # Config
 # =========================
 DEFAULT_SERVER = "irc.libera.chat"
