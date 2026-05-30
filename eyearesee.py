@@ -1123,6 +1123,36 @@ except ImportError:
 
 _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif"})
 
+_SCREENSHOT_DIR = os.path.join(_SCRIPT_DIR, "screenshots")
+
+
+def _save_clipboard_image() -> Optional[str]:
+    """Grab an image from the system clipboard and save it to screenshots/.
+
+    Returns the file path on success, or None if no image is on the clipboard
+    or the operation fails.
+    """
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        from PIL import ImageGrab as _ImageGrab
+        img = _ImageGrab.grabclipboard()
+        if img is None:
+            return None
+        if not isinstance(img, _PILImage.Image):
+            return None
+        os.makedirs(_SCREENSHOT_DIR, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        fname = f"screenshot_{ts}.png"
+        fpath = os.path.join(_SCREENSHOT_DIR, fname)
+        # Convert RGBA/P to RGB before saving as PNG
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGBA")
+        img.save(fpath, "PNG")
+        return fpath
+    except Exception:
+        return None
+
 def _compress_image(filepath: str, max_size: int = 1920, quality: int = 85) -> Optional[bytes]:
     """Compress an image file. Returns compressed JPEG bytes or None on failure."""
     if not PIL_AVAILABLE:
@@ -14770,6 +14800,7 @@ class TUI:
         h["lf"]           = self._slash_lf
         h["dcc"]          = self._slash_dcc
         h["dccchat"]      = self._slash_dccchat
+        h["paste"] = h["screenshot"] = self._slash_paste
         h["userlist"]     = self._slash_userlist
         h["silence"]      = self._slash_silence
         h["persist"]      = self._slash_persist
@@ -20669,6 +20700,8 @@ class TUI:
         _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
         _E("/dcc [chat|send <nick> <file>]", "Direct Client-to-Client chat or file transfer")
         _E("/dccchat",                      "Open DCC CHAT window with current nick")
+        _E("/paste [upload]",               "Save clipboard image, send path or upload to x0.at")
+        _E("/x0 <path>",                    "Upload an image file to x0.at and get the URL")
         _C("")
         _H("Channels")
         _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
@@ -20792,6 +20825,7 @@ class TUI:
         _E("/dns <host|cache|clear>",       "Async DNS resolution with caching")
         _E("/latency [server]",             "Connection latency stats with jitter and p95/p99")
         _E("/heatmap [channel]",            "Channel activity heatmap (day × hour)")
+        _E("/export dossier|channel|ai <target> [fmt]", "Export reports to HTML/MD/JSON files")
         _E("/network topology|uptime|status","Network topology, uptime, and connection stats")
         _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
         _E("/i2p on|off|strict|nostrict|status", "Route IRC through I2P hidden services")
@@ -20810,6 +20844,8 @@ class TUI:
         _C("")
         _H("Connection")
         _E("/server [-ssl] <host> [port]",  "Add a parallel server connection (SSL with -ssl, else plain)")
+        _E("/servers",                      "List all connected IRC servers with status and channels")
+        _E("/v3test  (or /v3)",             "Test server IRCv3 compatibility — scored as percentile")
         _E("/reconnect",                    "Reconnect to server; rejoins auto-join and startup channels")
         _E("/disconnect [message]",         "Disconnect from server without closing windows")
         _E("/all",                          "Reconnect all servers and rejoin all channels")
@@ -20934,6 +20970,7 @@ class TUI:
             "  /remind in 30m <msg>  /watch <nick>  /snippet add|list|<name>  /chstats  /rss",
             "── Connection ─────────────────────────────────────────────",
             "  /server [-ssl] <host> [port]  (parallel; -ssl for TLS)  /reconnect",
+            "  /servers  list all connections  /v3test  IRCv3 compatibility score",
             "  /certfp generate|fingerprint|status  CertFP for SASL EXTERNAL",
             "  /tlsinfo [history]  TLS cert pinning + MITM change alerts",
             "── BNC & GPG & Tor ─────────────────────────────────────────",
@@ -20948,6 +20985,7 @@ class TUI:
             "  /alias [name] [expansion]  list/set/remove command aliases",
             "  /chain [nick]  message tree for current window  /jitsi  video call",
             "  /theme <1-5>  /font [n]  /userlist  Ctrl+N next window  /dcc send|tsend|resume|trust|chat|status",
+            "  /paste [upload]  screenshot from clipboard  /export dossier|channel|ai <t> [fmt]",
             "  Tab/Shift+Tab nick-complete  PgUp/Dn scroll",
             "  Left-click a highlighted URL line to open it in the browser",
             "  Left-click a nick in userlist or chat to open a DM /query",
@@ -22254,6 +22292,44 @@ class TUI:
             await self.ui_queue.put(("status", f"Uploaded: {url}"))
         else:
             await self.ui_queue.put(("status", "x0.at upload failed."))
+
+    async def _slash_paste(self, args, extra, line):
+        """Paste an image from the clipboard, save to screenshots/, and send.
+
+        Usage:
+          /paste           — save clipboard image, send the file path
+          /paste upload    — save clipboard image, upload to x0.at, send URL
+
+        Requires PIL/Pillow:  pip install Pillow
+        """
+        if not PIL_AVAILABLE:
+            await self.ui_queue.put(("status",
+                "PIL/Pillow not installed — run: pip install Pillow"))
+            return
+
+        loop = asyncio.get_event_loop()
+        fpath = await loop.run_in_executor(_IO_EXECUTOR, _save_clipboard_image)
+        if fpath is None:
+            await self.ui_queue.put(("status",
+                "No image found on clipboard. Copy a screenshot/image first."))
+            return
+
+        sub = (args or "").strip().lower()
+        if sub == "upload":
+            await self.ui_queue.put(("status", f"Pasted & uploading to x0.at: {fpath}"))
+            url = await loop.run_in_executor(_IO_EXECUTOR, _upload_to_x0, fpath)
+            if url:
+                await self._send_plain_text(url)
+                await self.ui_queue.put(("status", f"Sent: {url}"))
+            else:
+                await self.ui_queue.put(("status", "x0.at upload failed, sending path instead."))
+                await self._send_plain_text(fpath)
+        else:
+            await self.ui_queue.put(("status", f"Pasted: {fpath}"))
+            await self._send_plain_text(fpath)
+
+        self._chat_dirty = True
+        self.dirty = True
 
     def _handle_key(self, ch: int) -> bool:
         """Process a single keycode synchronously.  Returns True if the key was
