@@ -1,30 +1,14 @@
-"""Analyzers Plugin Package — auto-discovered analytics modules.
+"""Analyzers Plugin Package — modular IRC analytics subsystem.
 
-Place any `.py` file in this directory to have it auto-loaded as an analyzer
-plugin.  Each module must export a top-level `setup(api)` function (sync or async)
-receiving a `PluginAPI` instance.
+Each `.py` file in this directory contains a single analyzer class that is
+auto-discovered and loaded as a plugin.  The classes themselves can also be
+imported directly for use in ScoringEngine and other core modules.
 
-Optional module-level metadata:
-    __plugin_name__    = "My Analyzer"
-    __plugin_version__ = "1.0"
-    __plugin_author__  = "Author"
-    __plugin_desc__    = "Description"
-
-Analyzers can register slash commands, event hooks, keybindings, and
-background tasks.  See the PluginAPI class for the full interface.
-
-Built-in analyzers (shipped alongside the package):
-    echo_chamber.py       — EchoChamberDetector slash commands
-    astroturfing.py       — AstroturfingDetector slash commands
-    debate_quality.py     — DebateAnalyzer slash commands
-    sentiment_influence.py— Sentiment contagion & influence commands
-    role_classifier.py    — RoleInference slash commands
-    user_dossier.py       — Unified social dossier reporting
-    threat_score.py       — Cross-analyzer threat assessment
-    activity_heatmap.py   — Visual activity heatmap in stats panel
+Usage:
+    from analyzers import PersonalityProfiler, StanceTracker, ...
+    from analyzers import load_all  # plugin auto-loader
 """
 
-import importlib
 import importlib.util as _importlib_util
 import logging
 import os
@@ -34,10 +18,111 @@ from typing import Callable, Dict, Any, Optional
 
 _log = logging.getLogger(__name__)
 
-_loaded_modules: Dict[str, Any] = {}
-_registry: Dict[str, Dict[str, Any]] = {}
+# ── Class exports ───────────────────────────────────────────────────────────
+# Import each analyzer class so they are accessible as analyzers.ClassName.
+# Each import is wrapped in try/except so missing optional analyzer files
+# don't prevent the rest from loading.
+
+try:
+    from .astroturfing import AstroturfingDetector
+except ImportError:
+    AstroturfingDetector = None
+
+try:
+    from .personality import PersonalityProfiler
+except ImportError:
+    PersonalityProfiler = None
+
+try:
+    from .predictive_reply import PredictiveReplyEngine
+except ImportError:
+    PredictiveReplyEngine = None
+
+try:
+    from .stance_tracker import StanceTracker
+except ImportError:
+    StanceTracker = None
+
+try:
+    from .conversation_flow import ConversationFlowPredictor
+except ImportError:
+    ConversationFlowPredictor = None
+
+try:
+    from .sentiment_contagion import SentimentContagionMap
+except ImportError:
+    SentimentContagionMap = None
+
+try:
+    from .bot_swarm import BotSwarmDetector
+except ImportError:
+    BotSwarmDetector = None
+
+try:
+    from .role_inference import RoleInference
+except ImportError:
+    RoleInference = None
+
+try:
+    from .debate_analyzer import DebateAnalyzer
+except ImportError:
+    DebateAnalyzer = None
+
+try:
+    from .echo_chamber import EchoChamberDetector
+except ImportError:
+    EchoChamberDetector = None
+
+try:
+    from .achievements import AchievementBadges
+except ImportError:
+    AchievementBadges = None
+
+try:
+    from .sarcasm import SarcasmDetector
+except ImportError:
+    SarcasmDetector = None
+
+try:
+    from .emotion_arc import EmotionArc
+except ImportError:
+    EmotionArc = None
+
+try:
+    from .ban_evasion import BanEvasionDetector
+except ImportError:
+    BanEvasionDetector = None
+
+try:
+    from .fact_checker import RealtimeFactChecker
+except ImportError:
+    RealtimeFactChecker = None
+
+try:
+    from .research_agent import AutonomousResearchAgent
+except ImportError:
+    AutonomousResearchAgent = None
+
+try:
+    from .conversational_agent import ConversationalAgent
+except ImportError:
+    ConversationalAgent = None
+
+try:
+    from .aivsai import AIVsAIDetector
+except ImportError:
+    AIVsAIDetector = None
+
+try:
+    from .sentiment_ai_corr import SentimentAICorrelator
+except ImportError:
+    SentimentAICorrelator = None
+
 
 ANALYZER_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_loaded_modules: Dict[str, Any] = {}
+_registry: Dict[str, Dict[str, Any]] = {}
 
 
 def discover() -> Dict[str, str]:
@@ -62,14 +147,7 @@ def discover() -> Dict[str, str]:
 
 
 def load(name: str, tui: Any = None, PluginAPI: Optional[type] = None) -> Optional[Any]:
-    """Load a single analyzer plugin by name.
-
-    Args:
-        name: The analyzer name (stem of the .py file in this directory).
-        tui: The TUI instance (or None for headless usage).
-        PluginAPI: The PluginAPI class (avoids circular import).
-    Returns the PluginAPI instance on success, or None.
-    """
+    """Load a single analyzer plugin by name."""
     global _loaded_modules, _registry
 
     path = os.path.join(ANALYZER_DIR, name + ".py")
@@ -95,14 +173,15 @@ def load(name: str, tui: Any = None, PluginAPI: Optional[type] = None) -> Option
 
     setup_fn = getattr(mod, "setup", None)
     if not callable(setup_fn):
-        _log.warning("Analyzer %s has no setup(api) function", name)
         return None
 
     if PluginAPI is None:
-        import eyearesee as _eya
-        PluginAPI = getattr(_eya, "PluginAPI", None)
+        try:
+            import eyearesee as _eya
+            PluginAPI = getattr(_eya, "PluginAPI", None)
+        except Exception:
+            pass
         if PluginAPI is None:
-            _log.warning("PluginAPI class not found in eyearesee module")
             return None
 
     api = PluginAPI(f"analyzer:{name}", tui)
@@ -154,12 +233,10 @@ def unload(name: str) -> bool:
 
 
 def get_registry() -> Dict[str, Dict[str, Any]]:
-    """Return the registry of loaded analyzer metadata."""
     return dict(_registry)
 
 
 def get_commands(tui: Any = None) -> Dict[str, tuple]:
-    """Return {command_name: (api, handler)} for all loaded analyzers."""
     cmds: Dict[str, tuple] = {}
     for name, api in _loaded_modules.items():
         for cmd_name, handler in api._commands.items():
