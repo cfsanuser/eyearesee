@@ -8128,6 +8128,7 @@ class IRCClient:
         self.joined_channels: set = set()
         self._ctcp_times: Dict[str, deque] = {}  # rate-limit CTCP replies
         self._cap_ls_caps: set = set()           # accumulated caps across multiline CAP LS
+        self._cap_ls_advertised: set = set()    # snapshot of all advertised caps (preserved after clear)
         self._cap_ls_values: dict = {}           # cap name → advertised value (e.g. sts=...)
         self._active_caps: set = set()           # currently ACKed/enabled caps
         self._batch_buffer: dict = {}            # batch ref → [(cmd,nick,params,prefix,tags)]
@@ -8893,6 +8894,8 @@ class IRCClient:
                 self.send_raw(f"CAP REQ :{' '.join(want)}" if want else "CAP END")
                 if not want:
                     self._finish_registration()
+                # Preserve the full advertised-capability snapshot for /v3test and /cap ls
+                self._cap_ls_advertised = set(self._cap_ls_caps)
                 self._cap_ls_caps.clear()
         elif subcmd == "ACK":
             acked = set((params[-1] if params else "").lower().split())
@@ -8927,6 +8930,9 @@ class IRCClient:
                 new_avail[cname.lower()] = cval
                 if cval:
                     self._cap_ls_values[cname.lower()] = cval
+            # Update the advertised-capability snapshot so /v3test and /cap ls
+            # remain accurate after dynamic announcements.
+            self._cap_ls_advertised |= set(new_avail.keys())
             if "sts" in new_avail and not self.use_ssl:
                 self._handle_sts(new_avail["sts"])
             want = [c for c in self._WANT_CAPS
@@ -14653,6 +14659,7 @@ class TUI:
         h["owner"]      = self._slash_owner
         h["deowner"]    = self._slash_deowner
         h["cap"]        = self._slash_cap
+        h["v3test"] = h["v3"] = self._slash_v3test
         h["sasl"]       = self._slash_sasl
         h["chghost"]    = self._slash_chghost
         h["setname"]    = self._slash_setname
@@ -17164,7 +17171,7 @@ class TUI:
             else:
                 await self.ui_queue.put(("status", "No capabilities active"))
         elif sub == "ls":
-            available = sorted(client._cap_ls_caps)
+            available = sorted(client._cap_ls_advertised)
             if available:
                 sw = self._status_win()
                 sw.add_line(f"Server offers {len(available)} capabilities:")
@@ -17186,6 +17193,168 @@ class TUI:
         else:
             await self.ui_queue.put(("status",
                 "Usage: /cap [list|ls|req <cap>]"))
+
+    # ── IRCv3 compatibility test catalog ────────────────────────────────────
+    # Each entry: capability name → (spec_name, category, weight)
+    # Weight: 10 = required/core, 5 = recommended, 3 = nice-to-have, 1 = draft/niche
+    _V3_CATALOG: Dict[str, Tuple[str, str, int]] = {
+        # ── Core Protocol (CAP LS 302, STS, SASL variants) ──────────────
+        "cap-notify":           ("CAP Notify",              "Core", 10),
+        "cap-3.2":              ("CAP 3.2",                 "Core", 10),
+        "sasl":                 ("SASL (generic)",          "Core", 10),
+        "sasl=PLAIN":           ("SASL PLAIN",              "Core", 10),
+        "sasl=SCRAM-SHA-256":   ("SASL SCRAM-SHA-256",      "Core", 5),
+        "sasl=EXTERNAL":        ("SASL EXTERNAL",            "Core", 5),
+        "sasl=ECDSA-NIST256P-CHALLENGE": ("SASL ECDSA",     "Core", 3),
+        "sts":                  ("STS (Strict Transport)",  "Core", 10),
+        # ── Message Tags ─────────────────────────────────────────────────
+        "message-tags":         ("Message Tags",            "Messaging", 10),
+        "draft/message-tags-0.2": ("Message Tags (draft)",  "Messaging", 3),
+        "server-time":          ("Server Time",             "Messaging", 8),
+        "echo-message":         ("Echo Message",            "Messaging", 5),
+        "labeled-response":     ("Labeled Response",        "Messaging", 5),
+        "batch":                ("Batches",                 "Messaging", 8),
+        "draft/multiline":      ("Multiline Messages",      "Messaging", 5),
+        "draft/multiline-concat": ("Multiline Concat",      "Messaging", 3),
+        "draft/multiline-max-bytes": ("Multiline Max Bytes","Messaging", 2),
+        "draft/multiline-max-lines": ("Multiline Max Lines","Messaging", 2),
+        # ── Account & Authentication ─────────────────────────────────────
+        "account-tag":          ("Account Tag",             "Account", 8),
+        "account-notify":       ("Account Notify",          "Account", 8),
+        "extended-join":        ("Extended Join",           "Account", 8),
+        "draft/account-registration": ("Account Registration","Account", 3),
+        "draft/account-registration-email": ("Reg w/ Email","Account", 2),
+        # ── Identity ─────────────────────────────────────────────────────
+        "chghost":              ("Change Host",             "Identity", 5),
+        "setname":              ("Set Name",                "Identity", 5),
+        "draft/setname":        ("Set Name (draft)",        "Identity", 3),
+        # ── Channel Features ─────────────────────────────────────────────
+        "away-notify":          ("Away Notify",             "Channel", 8),
+        "invite-notify":        ("Invite Notify",           "Channel", 5),
+        "userhost-in-names":    ("Userhost in Names",       "Channel", 3),
+        "multi-prefix":         ("Multi-Prefix",            "Channel", 5),
+        "draft/channel-rename": ("Channel Rename",          "Channel", 2),
+        # ── Chat History ─────────────────────────────────────────────────
+        "chathistory":          ("Chat History",            "History", 5),
+        "draft/chathistory":    ("Chat History (draft)",    "History", 5),
+        "draft/chathistory-max":("Chat History Max",        "History", 3),
+        "draft/event-playback": ("Event Playback",          "History", 2),
+        # ── Monitoring ───────────────────────────────────────────────────
+        "monitor":              ("MONITOR",                 "Monitoring", 8),
+        "whox":                 ("WHOX",                    "Monitoring", 5),
+        # ── User Interaction ─────────────────────────────────────────────
+        "draft/typing":         ("Typing Indicators",       "Interaction", 5),
+        "draft/thread":         ("Message Threads",         "Interaction", 5),
+        "draft/react":          ("Message Reactions",       "Interaction", 5),
+        "draft/reply":          ("Message Replies",         "Interaction", 5),
+        "read-marker":          ("Read Markers",            "Interaction", 5),
+        # ── Connection ───────────────────────────────────────────────────
+        "draft/resume":         ("Connection Resumption",   "Connection", 3),
+        "draft/ping":           ("PING Latency",            "Connection", 3),
+        "draft/webirc":         ("WebIRC Gateway",          "Connection", 2),
+        "draft/rate-limit":     ("Rate Limiting",           "Connection", 2),
+        "draft/standard-replies":("Standard Replies",       "Connection", 5),
+        # ── Bouncer / Server-Side ────────────────────────────────────────
+        "soju.im/bouncer-networks": ("Soju Bouncer",        "Bouncer", 3),
+        "znc.in/playback":      ("ZNC Playback",            "Bouncer", 3),
+        "znc.in/self-message":  ("ZNC Self Message",        "Bouncer", 2),
+        "znc.in/server-time-iso":("ZNC Server Time ISO",   "Bouncer", 2),
+    }
+
+    async def _slash_v3test(self, args, extra, line):
+        """Test IRCv3 compatibility of the current server.
+
+        Usage: /v3test  or  /v3
+
+        Scores the server's advertised IRCv3 capabilities against a catalog
+        of ~55 known specs weighted by importance (core=10, recommended=5,
+        nice-to-have=3, draft/niche=1).  Outputs an overall percentile and a
+        per-category breakdown.
+        """
+        client = self._active_client()
+        caps = client._cap_ls_advertised
+        active = client._active_caps
+
+        if not caps:
+            await self.ui_queue.put(("status",
+                "No capabilities advertised yet. "
+                "Run /v3test after connecting (CAP LS must complete first)."))
+            return
+
+        sw = self._status_win()
+        sw.add_line(f"=== IRCv3 Compatibility: {client.server}:{client.port} ===")
+        sw.add_line("")
+
+        # ── Compute scores per category ──────────────────────────────────
+        cat_available: Dict[str, int] = {}
+        cat_total: Dict[str, int] = {}
+        overall_available = 0
+        overall_total = 0
+        details: List[Tuple[str, str, int, bool]] = []
+
+        for cap_key, (spec_name, category, weight) in sorted(self._V3_CATALOG.items()):
+            is_present = cap_key in caps
+            is_active = cap_key in active
+            cat_available[category] = cat_available.get(category, 0) + (weight if is_present else 0)
+            cat_total[category] = cat_total.get(category, 0) + weight
+            overall_available += weight if is_present else 0
+            overall_total += weight
+            details.append((spec_name, category, weight, is_present, is_active))
+
+        overall_pct = round(overall_available / overall_total * 100, 1)
+
+        # ── Overall score bar ────────────────────────────────────────────
+        bar_len = 40
+        filled = int(overall_pct / 100 * bar_len)
+        bar = '▓' * filled + '░' * (bar_len - filled)
+        sw.add_line(f"  Overall: {overall_pct:5.1f}%  [{bar}]")
+        sw.add_line(f"  Active : {len(active)} of {len(caps)} advertised ({len(active)}/{len(self._V3_CATALOG)} known)")
+        sw.add_line("")
+
+        # ── Category breakdown ───────────────────────────────────────────
+        category_order = ["Core", "Messaging", "Account", "Identity",
+                         "Channel", "History", "Monitoring", "Interaction",
+                         "Connection", "Bouncer"]
+        for cat in category_order:
+            if cat not in cat_total:
+                continue
+            av = cat_available.get(cat, 0)
+            tot = cat_total[cat]
+            pct = round(av / tot * 100, 1)
+            bar_filled = int(pct / 100 * 20)
+            bar_str = '▓' * bar_filled + '░' * (20 - bar_filled)
+            sw.add_line(f"  {cat:<14} {pct:5.1f}%  [{bar_str}]")
+
+        sw.add_line("")
+
+        # ── Missing important caps ───────────────────────────────────────
+        missing_core = [(n, w) for n, _, w, p, _ in details
+                        if not p and w >= 8]
+        if missing_core:
+            sw.add_line("  Notable gaps (high-weight missing):")
+            for name, w in sorted(missing_core, key=lambda x: -x[1]):
+                sw.add_line(f"    ✗ {name}  (weight {w})")
+
+        # ── Grade ───────────────────────────────────────────────────────
+        if overall_pct >= 85:
+            grade = "A+ Outstanding"
+        elif overall_pct >= 70:
+            grade = "A  Excellent"
+        elif overall_pct >= 55:
+            grade = "B  Good"
+        elif overall_pct >= 40:
+            grade = "C  Average"
+        elif overall_pct >= 25:
+            grade = "D  Below Average"
+        else:
+            grade = "F  Minimal"
+
+        sw.add_line(f"  Grade: {grade}")
+        sw.add_line("")
+        sw.add_line("  Legend: " + "▓ supported  ░ not advertised")
+        sw.add_line("  Use /cap ls for the full advertised capability list.")
+        self._chat_dirty = True
+        self.dirty = True
 
     async def _slash_sasl(self, args, extra, line):
         """View or configure SASL authentication.
