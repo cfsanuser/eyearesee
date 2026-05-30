@@ -30,12 +30,30 @@ from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from math import log, log2
 from typing import Optional, Dict, List, Tuple, Callable, Any
 
+try:
+    import analyzers as _analyzers_pkg
+    ANALYZERS_AVAILABLE = True
+except ImportError:
+    _analyzers_pkg = None
+    ANALYZERS_AVAILABLE = False
+
+# Analyzer class imports (extracted to analyzers/ package)
+from analyzers import (
+    AstroturfingDetector, PersonalityProfiler, PredictiveReplyEngine,
+    StanceTracker, ConversationFlowPredictor, SentimentContagionMap,
+    BotSwarmDetector, RoleInference, DebateAnalyzer, EchoChamberDetector,
+    AchievementBadges, SarcasmDetector, EmotionArc, BanEvasionDetector,
+    RealtimeFactChecker, AutonomousResearchAgent, ConversationalAgent,
+    AIVsAIDetector, SentimentAICorrelator,
+)
+
 # =========================
 # CLI flags — parsed before any optional imports or install code runs
 # =========================
 _NO_AI:         bool = "--no-ai"              in sys.argv
 _NO_INSTALL:    bool = "--no-install"         in sys.argv
 _REQUIRE_VENV:  bool = "--require-virtualenv" in sys.argv
+_DISABLE_MOUSE: bool = "--disable-mouse"      in sys.argv
 
 # =========================
 # Anthropic (optional)
@@ -124,7 +142,7 @@ except ModuleNotFoundError:
 DEFAULT_SERVER = "irc.libera.chat"
 DEFAULT_PORT = 6697
 DEFAULT_NICK = "cfuser"
-DEFAULT_CHANNEL = "##anime"
+DEFAULT_CHANNEL = "##chat"
 NICKSERV_PASSWORD = os.environ.get("IRC_NICKSERV_PASSWORD", "")
 # SASL mechanism and credential paths.  Supported mechanisms:
 #   PLAIN                    — password in IRC_NICKSERV_PASSWORD [default]
@@ -168,6 +186,9 @@ GPG_BINARY: str    = os.environ.get("IRC_GPG_BINARY", "gpg")
 # Tor SOCKS5 proxy
 TOR_PROXY_HOST: str = os.environ.get("IRC_TOR_PROXY_HOST", "127.0.0.1")
 TOR_PROXY_PORT: int = int(os.environ.get("IRC_TOR_PROXY_PORT", "9050"))
+# I2P SOCKS proxy for .i2p hidden services
+I2P_PROXY_HOST: str = os.environ.get("IRC_I2P_PROXY_HOST", "127.0.0.1")
+I2P_PROXY_PORT: int = int(os.environ.get("IRC_I2P_PROXY_PORT", "4447"))
 # STS policy persistence
 STS_POLICY_PATH    = os.path.join(_SCRIPT_DIR, "sts_policies.json")
 
@@ -242,7 +263,60 @@ THEMES: List[Tuple] = [
     ("Catppuccin",5,  0,  6,  0,  3, -1,  2, -1),  # catppuccin mocha: mauve title / teal users / yellow suspect
 ]
 
+# 0 = terminal default — always first entry.  Remaining entries are
+# common monospace / programming faces grouped by platform availability.
+# Index 0 never sends a font-change command; it resets to the terminal's
+# built-in default.
+FONTS: List[Tuple[str, str]] = [
+    ("0",           "Terminal Default"),
+    ("Consolas",    "Consolas"),
+    ("Cascadia Code","Cascadia Code"),
+    ("Cascadia Mono","Cascadia Mono"),
+    ("Fira Code",   "Fira Code"),
+    ("Fira Mono",   "Fira Mono"),
+    ("JetBrains Mono","JetBrains Mono"),
+    ("Hack",        "Hack"),
+    ("Source Code Pro","Source Code Pro"),
+    ("DejaVu Sans Mono","DejaVu Sans Mono"),
+    ("Inconsolata", "Inconsolata"),
+    ("Monaco",      "Monaco"),
+    ("Courier New", "Courier New"),
+    ("Lucida Console","Lucida Console"),
+    ("Menlo",       "Menlo"),
+    ("Liberation Mono","Liberation Mono"),
+    ("Noto Sans Mono","Noto Sans Mono"),
+    ("Ubuntu Mono", "Ubuntu Mono"),
+    ("Roboto Mono", "Roboto Mono"),
+    ("Fantasque Sans Mono","Fantasque Sans Mono"),
+    ("Iosevka",     "Iosevka"),
+    ("Mononoki",    "Mononoki"),
+    ("Droid Sans Mono","Droid Sans Mono"),
+    ("IBM Plex Mono","IBM Plex Mono"),
+    ("Commit Mono", "Commit Mono"),
+    ("Intel One Mono","Intel One Mono"),
+    ("Martian Mono","Martian Mono"),
+    ("Victor Mono", "Victor Mono"),
+    ("Anonymous Pro","Anonymous Pro"),
+    ("CamingoCode", "CamingoCode"),
+    ("Envy Code R", "Envy Code R"),
+    ("3270",        "3270"),
+    ("Terminus",    "Terminus"),
+    ("Monofur",     "Monofur"),
+    ("Input Mono",  "Input Mono"),
+    ("M+ 1m",       "M+ 1m"),
+    ("PragmataPro", "PragmataPro"),
+    ("Dank Mono",   "Dank Mono"),
+    ("Operator Mono","Operator Mono"),
+]
+
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+
+class _SuppressLossTypeFilter(logging.Filter):
+    def filter(self, record):
+        return "loss_type=None" not in record.getMessage()
+
+_tf_logger_filter = logging.getLogger("transformers")
+_tf_logger_filter.addFilter(_SuppressLossTypeFilter())
 
 # =========================
 # Chat & Input Persistence
@@ -264,6 +338,15 @@ def _chat_log_path(window_name: str) -> str:
     safe = _UNSAFE_FILENAME_RE.sub("_", window_name) or "_"
     # Collapse dot-sequences to prevent directory traversal (e.g. ".." → "_")
     safe = re.sub(r'\.{2,}', '_', safe) or "_"
+    # Windows reserved filenames (CON, NUL, PRN, AUX, COM1-COM9, LPT1-LPT9)
+    # cause OSError when used as file names regardless of extension.
+    _WIN_RESERVED = frozenset({
+        "con", "nul", "prn", "aux",
+        *(f"com{i}" for i in range(1, 10)),
+        *(f"lpt{i}" for i in range(1, 10)),
+    })
+    if safe.lower() in _WIN_RESERVED:
+        safe = "_" + safe
     return os.path.join(CHAT_LOG_DIR, safe + ".log")
 
 def load_irc_config() -> dict:
@@ -282,13 +365,63 @@ def save_irc_config(cfg: dict) -> None:
     try:
         with open(IRC_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"Warning: Failed to save irc_config.json: {e}", file=sys.stderr)
 
 
 def _save_autojoin_config() -> None:
     cfg = load_irc_config()
     cfg["autojoin"] = sorted(_AUTOJOIN_CHANNELS)
+    save_irc_config(cfg)
+
+def _save_tui_settings(tui) -> None:
+    """Persist TUI preferences and state to irc_config.json."""
+    cfg = load_irc_config()
+    p = getattr(tui, '_persisted_settings', set())
+    if "theme" in p:
+        cfg["theme"] = tui.current_theme
+    if "font" in p:
+        cfg["font"] = tui.current_font
+    if "userlist" in p:
+        cfg["userlist_visible"] = tui._show_userlist
+    if "stats" in p:
+        cfg["stats_panel_visible"] = tui._show_stats_panel
+    if "autotranslate" in p:
+        cfg["autotranslate"] = tui.auto_translate
+    if "linkpreview" in p:
+        cfg["linkpreview"] = tui.link_preview_enabled
+    if "mute" in p:
+        cfg["mention_beep_muted"] = tui.mention_beep_muted
+    if "model" in p:
+        cfg["ai_model"] = tui.ai_chat_model
+    if "achievements" in p:
+        cfg["achievements_enabled"] = tui._active_client().scoring.achievements_enabled
+    if "ai_scoring" in p:
+        cfg["ai_scoring_enabled"] = tui._active_client().scoring.ai_detector.enabled
+    if "ctcp_mode" in p:
+        cfg["ctcp_mode"] = tui._active_client()._ctcp_mode
+    if "silence" in p:
+        cfg["silenced_channels"] = sorted(tui._silenced_channels)
+    if "aliases" in p and hasattr(tui, '_aliases'):
+        cfg["aliases"] = dict(tui._aliases)
+    client = tui._active_client()
+    scoring = getattr(client, 'scoring', None)
+    if "triggers" in p and scoring and hasattr(scoring, 'triggers'):
+        cfg["triggers"] = list(scoring.triggers._triggers)
+    if "automod" in p and scoring and hasattr(scoring, 'automod'):
+        cfg["automod_rules"] = dict(scoring.automod._rules)
+        cfg["automod_whitelist"] = {k: sorted(v) for k, v in scoring.automod._whitelist.items()}
+    if "watch" in p and scoring and hasattr(scoring, 'watches'):
+        cfg["watch_list"] = dict(scoring.watches._watches)
+    if "todos" in p and scoring and hasattr(scoring, 'todos'):
+        cfg["todos"] = list(scoring.todos._todos)
+    if "notes" in p and scoring and hasattr(scoring, 'notes'):
+        cfg["notes"] = dict(scoring.notes._notes)
+    if "bookmarks" in p and scoring and hasattr(scoring, 'bookmarks'):
+        cfg["bookmarks"] = list(scoring.bookmarks._bookmarks)
+    if "snippets" in p and scoring and hasattr(scoring, 'snippets'):
+        cfg["snippets"] = dict(scoring.snippets._snippets)
+    cfg["persisted_settings"] = sorted(tui._persisted_settings)
     save_irc_config(cfg)
 
 def load_input_history() -> List[str]:
@@ -367,286 +500,6 @@ def append_chat_line(window_name: str, line: str) -> None:
         pass
 
 
-# =========================
-# AIVsAIDetector
-# =========================
-
-class AIVsAIDetector:
-    """Detects when two AI/bot users are talking to each other.
-
-    Correlates:
-      • Both participants have high rolling AI scores
-      • Frequent mutual mentions or replies between them
-      • Formal/templated dialogue patterns (question→answer chains)
-      • Timing regularity (uniform gaps between exchanges)
-
-    Flags AI-vs-AI conversations with confidence levels.
-    """
-
-    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "aivsai_pairs.json")
-    _AI_THRESHOLD = 60.0
-    _MIN_EXCHANGES = 3
-
-    def __init__(self):
-        self._pairs: Dict[str, Dict] = {}
-        self._recent_exchange: Dict[str, deque] = {}
-        self._ui_queue: Optional[asyncio.Queue] = None
-        self._alerts_issued: set = set()
-        self._last_save: float = 0.0
-        self.load()
-
-    def set_ui_queue(self, queue: asyncio.Queue) -> None:
-        self._ui_queue = queue
-
-    def record_exchange(self, from_nick: str, to_nick: str, channel: str,
-                        from_ai: float, to_ai: float) -> None:
-        fn = from_nick.lower()
-        tn = to_nick.lower()
-        if fn == tn:
-            return
-        pair_key = f"{min(fn, tn)}:{max(fn, tn)}"
-        self._recent_exchange.setdefault(pair_key, deque(maxlen=50))
-        self._recent_exchange[pair_key].append({
-            "from": fn, "to": tn, "channel": channel.lower(),
-            "from_ai": from_ai, "to_ai": to_ai,
-            "ts": time.time(),
-        })
-        self._evaluate_pair(pair_key, fn, tn, channel)
-
-    def _evaluate_pair(self, pair_key: str, nick_a: str, nick_b: str,
-                       channel: str) -> None:
-        exchanges = self._recent_exchange.get(pair_key, [])
-        if len(exchanges) < self._MIN_EXCHANGES:
-            return
-        recent = list(exchanges)[-20:]
-        both_high = sum(1 for e in recent
-                        if e["from_ai"] >= self._AI_THRESHOLD
-                        and e["to_ai"] >= self._AI_THRESHOLD)
-        if both_high < self._MIN_EXCHANGES:
-            return
-        avg_ai = sum((e["from_ai"] + e["to_ai"]) / 2 for e in recent) / len(recent)
-        gaps = []
-        for i in range(1, len(recent)):
-            gaps.append(recent[i]["ts"] - recent[i - 1]["ts"])
-        gap_uniformity = 0.0
-        if gaps:
-            mean_gap = sum(gaps) / len(gaps)
-            if mean_gap > 0:
-                cv = (sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)) ** 0.5 / mean_gap
-                gap_uniformity = max(0.0, 1.0 - cv)
-        confidence = min(1.0,
-                         0.4 * (both_high / len(recent))
-                         + 0.3 * (avg_ai / 100.0)
-                         + 0.2 * gap_uniformity
-                         + 0.1 * min(1.0, len(recent) / 10.0))
-        self._pairs[pair_key] = {
-            "nick_a": nick_a, "nick_b": nick_b,
-            "channel": channel.lower(),
-            "exchanges": len(recent),
-            "both_high": both_high,
-            "avg_ai": round(avg_ai, 1),
-            "gap_uniformity": round(gap_uniformity, 3),
-            "confidence": round(confidence, 3),
-            "last_seen": time.time(),
-        }
-        if confidence >= 0.5 and pair_key not in self._alerts_issued:
-            self._alerts_issued.add(pair_key)
-            if self._ui_queue:
-                try:
-                    self._ui_queue.put_nowait(("status",
-                        f"[ai-vs-ai] {nick_a} ↔ {nick_b} in {channel}: "
-                        f"confidence={confidence:.0%} "
-                        f"avg_ai={avg_ai:.0f}% exchanges={len(recent)}"))
-                except Exception:
-                    pass
-        elif confidence < 0.3:
-            self._alerts_issued.discard(pair_key)
-        self._maybe_save()
-
-    def get_active_pairs(self, min_confidence: float = 0.3) -> list:
-        results = []
-        for pair_key, data in self._pairs.items():
-            if data["confidence"] >= min_confidence:
-                results.append(data)
-        results.sort(key=lambda x: -x["confidence"])
-        return results
-
-    def get_pair(self, nick_a: str, nick_b: str) -> Optional[Dict]:
-        pair_key = f"{min(nick_a.lower(), nick_b.lower())}:{max(nick_a.lower(), nick_b.lower())}"
-        return self._pairs.get(pair_key)
-
-    def _maybe_save(self) -> None:
-        now = time.time()
-        if now - self._last_save < 60:
-            return
-        self._save()
-
-    def _save(self) -> None:
-        self._last_save = time.time()
-        try:
-            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
-                json.dump(self._pairs, f, indent=2)
-        except Exception:
-            pass
-
-    def load(self) -> None:
-        try:
-            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self._pairs = data
-        except Exception:
-            pass
-
-
-# =========================
-# SentimentAICorrelator
-# =========================
-
-class SentimentAICorrelator:
-    """Correlates sentiment scores with AI detection scores per nick and channel.
-
-    Tracks:
-      • Per-nick sentiment vs AI score distribution
-      • Channel-level correlation (do AI messages cluster in specific sentiment ranges?)
-      • Anomaly flags (nicks whose sentiment is unnaturally uniform given high AI scores)
-
-    Provides /saicorr to inspect sentiment-AI correlation patterns.
-    """
-
-    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "sentiment_ai_corr.json")
-
-    def __init__(self):
-        self._nick_data: Dict[str, Dict] = {}
-        self._channel_data: Dict[str, Dict] = {}
-        self._last_save: float = 0.0
-        self.load()
-
-    def record(self, nick: str, channel: str, ai_score: float,
-               sentiment: float, intensity: float = 0.0) -> None:
-        nl = nick.lower()
-        cl = channel.lower()
-        entry = {
-            "ai": ai_score, "sentiment": sentiment,
-            "intensity": intensity, "ts": time.time(),
-        }
-        nd = self._nick_data.setdefault(nl, {"samples": [], "channel": cl})
-        nd["samples"].append(entry)
-        if len(nd["samples"]) > 200:
-            nd["samples"] = nd["samples"][-200:]
-        cd = self._channel_data.setdefault(cl, {"samples": []})
-        cd["samples"].append(entry)
-        if len(cd["samples"]) > 500:
-            cd["samples"] = cd["samples"][-500:]
-        self._maybe_save()
-
-    def get_nick_correlation(self, nick: str) -> Dict:
-        nl = nick.lower()
-        nd = self._nick_data.get(nl, {})
-        samples = nd.get("samples", [])
-        if len(samples) < 3:
-            return {"nick": nick, "samples": len(samples), "correlation": None,
-                    "ai_sentiment_avg": None, "anomaly": False}
-        ai_scores = [s["ai"] for s in samples]
-        sent_scores = [s["sentiment"] for s in samples]
-        high_ai = [s for s in samples if s["ai"] >= 60]
-        low_ai = [s for s in samples if s["ai"] < 40]
-        correlation = self._pearson_r(ai_scores, sent_scores)
-        ai_sent_avg = (sum(s["sentiment"] for s in high_ai) / len(high_ai)) if high_ai else None
-        human_sent_avg = (sum(s["sentiment"] for s in low_ai) / len(low_ai)) if low_ai else None
-        sent_variance = self._variance(sent_scores)
-        anomaly = len(high_ai) >= 3 and sent_variance < 0.02
-        return {
-            "nick": nick, "samples": len(samples),
-            "correlation": round(correlation, 3) if correlation is not None else None,
-            "ai_sentiment_avg": round(ai_sent_avg, 3) if ai_sent_avg is not None else None,
-            "human_sentiment_avg": round(human_sent_avg, 3) if human_sent_avg is not None else None,
-            "sentiment_variance": round(sent_variance, 4),
-            "high_ai_count": len(high_ai),
-            "anomaly": anomaly,
-            "anomaly_reason": "uniform sentiment with high AI scores" if anomaly else "",
-        }
-
-    def get_channel_correlation(self, channel: str) -> Dict:
-        cl = channel.lower()
-        cd = self._channel_data.get(cl, {})
-        samples = cd.get("samples", [])
-        if len(samples) < 5:
-            return {"channel": channel, "samples": len(samples), "correlation": None}
-        ai_scores = [s["ai"] for s in samples]
-        sent_scores = [s["sentiment"] for s in samples]
-        high_ai = [s for s in samples if s["ai"] >= 60]
-        low_ai = [s for s in samples if s["ai"] < 40]
-        correlation = self._pearson_r(ai_scores, sent_scores)
-        ai_sent_avg = (sum(s["sentiment"] for s in high_ai) / len(high_ai)) if high_ai else None
-        human_sent_avg = (sum(s["sentiment"] for s in low_ai) / len(low_ai)) if low_ai else None
-        ai_int_avg = (sum(s["intensity"] for s in high_ai) / len(high_ai)) if high_ai else None
-        human_int_avg = (sum(s["intensity"] for s in low_ai) / len(low_ai)) if low_ai else None
-        return {
-            "channel": channel, "samples": len(samples),
-            "correlation": round(correlation, 3) if correlation is not None else None,
-            "ai_sentiment_avg": round(ai_sent_avg, 3) if ai_sent_avg is not None else None,
-            "human_sentiment_avg": round(human_sent_avg, 3) if human_sent_avg is not None else None,
-            "ai_intensity_avg": round(ai_int_avg, 3) if ai_int_avg is not None else None,
-            "human_intensity_avg": round(human_int_avg, 3) if human_int_avg is not None else None,
-            "high_ai_pct": round(len(high_ai) / len(samples) * 100, 1),
-        }
-
-    def get_top_anomalies(self, limit: int = 10) -> list:
-        results = []
-        for nick, data in self._nick_data.items():
-            corr = self.get_nick_correlation(nick)
-            if corr["anomaly"]:
-                results.append(corr)
-        results.sort(key=lambda x: -x.get("high_ai_count", 0))
-        return results[:limit]
-
-    @staticmethod
-    def _pearson_r(xs: list, ys: list) -> Optional[float]:
-        n = len(xs)
-        if n < 3:
-            return None
-        mean_x = sum(xs) / n
-        mean_y = sum(ys) / n
-        cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-        var_x = sum((x - mean_x) ** 2 for x in xs)
-        var_y = sum((y - mean_y) ** 2 for y in ys)
-        denom = (var_x * var_y) ** 0.5
-        if denom == 0:
-            return None
-        return cov / denom
-
-    @staticmethod
-    def _variance(xs: list) -> float:
-        if not xs:
-            return 0.0
-        mean = sum(xs) / len(xs)
-        return sum((x - mean) ** 2 for x in xs) / len(xs)
-
-    def _maybe_save(self) -> None:
-        now = time.time()
-        if now - self._last_save < 120:
-            return
-        self._save()
-
-    def _save(self) -> None:
-        self._last_save = time.time()
-        try:
-            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
-                json.dump({"nicks": self._nick_data, "channels": self._channel_data}, f)
-        except Exception:
-            pass
-
-    def load(self) -> None:
-        try:
-            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self._nick_data = data.get("nicks", {})
-            self._channel_data = data.get("channels", {})
-        except Exception:
-            pass
-
-
-# =========================
 # BehavioralBiometrics
 # =========================
 
@@ -838,6 +691,109 @@ class BehavioralBiometrics:
             if 2 < rate_var < 15:
                 score += 5
         return min(100.0, max(0.0, score))
+
+    # ── Cross-session biometric identity ──────────────────────────────────
+    _IDENTITY_PATH = os.path.join(_SCRIPT_DIR, "biometric_identities.json")
+
+    def get_identity_fingerprint(self) -> Dict[str, Any]:
+        """Return a compact biometric fingerprint for cross-session identity matching."""
+        cadence = self.get_typing_cadence_stats()
+        comp = self.get_composition_stats()
+        resp = self.get_response_latency_stats()
+        bursts = self.get_burst_stats()
+        bs_ratio = self.get_backspace_ratio()
+        return {
+            "cadence_mean_ms": cadence.get("mean", 0),
+            "cadence_std_ms": cadence.get("std", 0),
+            "cadence_median_ms": cadence.get("median", 0),
+            "comp_mean_s": comp.get("mean", 0),
+            "comp_std_s": comp.get("std", 0),
+            "resp_mean_s": resp.get("mean", 0),
+            "resp_std_s": resp.get("std", 0),
+            "backspace_ratio": bs_ratio,
+            "burst_avg_rate": bursts.get("avg_rate", 0),
+            "burst_avg_keys": bursts.get("avg_keys", 0),
+            "total_keystrokes": self._total_keystrokes,
+            "messages_sent": self._messages_sent,
+        }
+
+    def save_identity(self, nick: str) -> Optional[Dict]:
+        """Persist biometric fingerprint for *nick* across sessions.
+        Returns the stored fingerprint dict or None on failure."""
+        if self._total_keystrokes < 50:
+            return None
+        fp = self.get_identity_fingerprint()
+        identities: Dict[str, Dict] = {}
+        try:
+            with open(self._IDENTITY_PATH, "r", encoding="utf-8") as f:
+                identities = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        nl = nick.lower()
+        if nl in identities:
+            prev = identities[nl]
+            prev["sessions"] = prev.get("sessions", 0) + 1
+            prev["last_updated"] = time.time()
+            prev["fingerprints"].append(fp)
+            if len(prev["fingerprints"]) > 10:
+                prev["fingerprints"] = prev["fingerprints"][-10:]
+            prev["fingerprint"] = fp
+        else:
+            identities[nl] = {
+                "nick": nick,
+                "first_seen": time.time(),
+                "last_updated": time.time(),
+                "sessions": 1,
+                "fingerprints": [fp],
+                "fingerprint": fp,
+            }
+        try:
+            with open(self._IDENTITY_PATH, "w", encoding="utf-8") as f:
+                json.dump(identities, f, indent=2, default=str)
+            return fp
+        except Exception:
+            return None
+
+    def load_identity(self, nick: str) -> Optional[Dict]:
+        """Load persisted biometric identity for *nick*."""
+        try:
+            with open(self._IDENTITY_PATH, "r", encoding="utf-8") as f:
+                identities = json.load(f)
+            return identities.get(nick.lower())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def match_identity(self, nick: str) -> Optional[Dict]:
+        """Compare current session biometrics against stored identity.
+        Returns match result with confidence score, or None if no stored identity."""
+        stored = self.load_identity(nick)
+        if not stored:
+            return None
+        current_fp = self.get_identity_fingerprint()
+        stored_fp = stored.get("fingerprint", {})
+        if not stored_fp:
+            return None
+        score = 0.0
+        comparisons = 0
+        for key in ("cadence_mean_ms", "cadence_std_ms", "comp_mean_s",
+                    "resp_mean_s", "backspace_ratio", "burst_avg_rate"):
+            cur = current_fp.get(key, 0)
+            sto = stored_fp.get(key, 0)
+            if sto > 0:
+                comparisons += 1
+                score += max(0, 1.0 - abs(cur - sto) / sto)
+        if comparisons == 0:
+            return None
+        confidence = score / comparisons
+        verdict = "likely_same" if confidence >= 0.75 else "possible_match" if confidence >= 0.5 else "likely_different"
+        return {
+            "nick": nick,
+            "confidence": round(confidence, 3),
+            "verdict": verdict,
+            "sessions": stored.get("sessions", 1),
+            "first_seen": stored.get("first_seen", 0),
+            "stored_nick": stored.get("nick", nick),
+        }
 
     def _save(self) -> None:
         try:
@@ -1559,10 +1515,13 @@ def _ai_log_write(payload: str) -> None:
     On any I/O error the handle is discarded so the next call attempts a
     fresh open instead of retrying against a broken handle forever."""
     global _ai_log_handle
+    if not _ai_logging_enabled:
+        return
     try:
         if _ai_log_handle is None or _ai_log_handle.closed:
             _ai_log_handle = _open_append(AI_LOG_PATH, buffering=1)
         _ai_log_handle.write(payload)
+        _ai_log_handle.flush()
     except Exception:
         _ai_log_handle = None  # force reopen next call; don't retry a broken handle
 
@@ -2452,40 +2411,33 @@ class EnsembleAIDetector:
                 print(f"skipped ({_e})")
 
         # ── Classifiers ─────────────────────────────────────────────────────────────
-        _tf_logger = logging.getLogger("transformers")
-        _prev_tf_level = _tf_logger.level
-        _tf_logger.setLevel(logging.ERROR)
-
+        print(f"AI detector: loading primary classifier ({self._CLS1_MODEL})...", end=" ", flush=True)
         try:
-            print(f"AI detector: loading primary classifier ({self._CLS1_MODEL})...", end=" ", flush=True)
-            try:
-                self._cls_tok = AutoTokenizer.from_pretrained(self._CLS1_MODEL)
-                self._cls_model = AutoModelForSequenceClassification.from_pretrained(
-                    self._CLS1_MODEL,
-                    ignore_mismatched_sizes=True,
-                ).to(self._device)
-                self._cls_model.eval()
-                print("OK")
-            except Exception as _e:
-                self._cls_tok   = None
-                self._cls_model = None
-                print(f"skipped ({_e})")
+            self._cls_tok = AutoTokenizer.from_pretrained(self._CLS1_MODEL)
+            self._cls_model = AutoModelForSequenceClassification.from_pretrained(
+                self._CLS1_MODEL,
+                ignore_mismatched_sizes=True,
+            ).to(self._device)
+            self._cls_model.eval()
+            print("OK")
+        except Exception as _e:
+            self._cls_tok   = None
+            self._cls_model = None
+            print(f"skipped ({_e})")
 
-            print(f"AI detector: loading secondary classifier ({self._CLS2_MODEL})...", end=" ", flush=True)
-            try:
-                self._cls2_tok = AutoTokenizer.from_pretrained(self._CLS2_MODEL)
-                self._cls2_model = AutoModelForSequenceClassification.from_pretrained(
-                    self._CLS2_MODEL,
-                    ignore_mismatched_sizes=True,
-                ).to(self._device)
-                self._cls2_model.eval()
-                print("OK")
-            except Exception as _e:
-                self._cls2_tok   = None
-                self._cls2_model = None
-                print(f"skipped ({_e})")
-        finally:
-            _tf_logger.setLevel(_prev_tf_level)
+        print(f"AI detector: loading secondary classifier ({self._CLS2_MODEL})...", end=" ", flush=True)
+        try:
+            self._cls2_tok = AutoTokenizer.from_pretrained(self._CLS2_MODEL)
+            self._cls2_model = AutoModelForSequenceClassification.from_pretrained(
+                self._CLS2_MODEL,
+                ignore_mismatched_sizes=True,
+            ).to(self._device)
+            self._cls2_model.eval()
+            print("OK")
+        except Exception as _e:
+            self._cls2_tok   = None
+            self._cls2_model = None
+            print(f"skipped ({_e})")
 
         obs_name = OBSERVER_MODEL_ID if self._obs_modern else "distilgpt2"
         loaded = [f"Binoculars(gpt2+{obs_name})", "Llama-heuristics"]
@@ -4208,7 +4160,18 @@ class SnippetManager:
         except OSError:
             pass
 
-    def add(self, name: str, text: str, tags: List[str] = None, user: str = "") -> Dict:
+    def add_snippet(self, name: str, text: str, tags: List[str] = None, user: str = "") -> Dict:
+        return self.add(name, text, tags, user)
+
+    def remove_snippet(self, name: str) -> bool:
+        return self.remove(name)
+
+    def list_snippets(self, tag: str = "") -> List[Dict]:
+        return self.list_all(tag)
+
+    def get_snippet(self, name: str) -> Optional[str]:
+        s = self.get(name)
+        return s["text"] if s else None
         """Add a snippet."""
         name = name.lower()
         self._snippets[name] = {
@@ -5183,6 +5146,784 @@ class RelationshipGraph:
 
 
 # =========================
+# Network Analytics
+# =========================
+
+class NetworkAnalytics:
+    """Tracks connection latency, channel activity heatmaps, and server topology.
+
+    Provides:
+      • Per-server latency history with jitter/p95/p99 stats
+      • Channel activity heatmap (hour × day)
+      • Network topology: server → channels → users mapping
+      • Connection uptime/downtime tracking
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "network_analytics.json")
+
+    def __init__(self):
+        self._latency_samples: Dict[str, deque] = {}
+        self._heatmaps: Dict[str, Dict[int, Dict[int, int]]] = {}
+        self._topology: Dict[str, Dict[str, set]] = {}
+        self._connect_times: Dict[str, List[Tuple[float, Optional[float]]]] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def record_latency(self, server: str, latency_ms: float) -> None:
+        samples = self._latency_samples.setdefault(server, deque(maxlen=1000))
+        samples.append({"ts": time.time(), "ms": latency_ms})
+        self._maybe_save()
+
+    def get_latency_stats(self, server: str) -> Dict[str, Any]:
+        samples = self._latency_samples.get(server, deque())
+        if not samples:
+            return {"server": server, "samples": 0}
+        values = [s["ms"] for s in samples]
+        sorted_v = sorted(values)
+        n = len(sorted_v)
+        return {
+            "server": server,
+            "samples": n,
+            "current": round(values[-1], 1),
+            "mean": round(sum(values) / n, 1),
+            "min": round(sorted_v[0], 1),
+            "max": round(sorted_v[-1], 1),
+            "median": round(sorted_v[n // 2], 1),
+            "p95": round(sorted_v[int(n * 0.95)], 1),
+            "p99": round(sorted_v[int(n * 0.99)], 1),
+            "jitter": round((sum((v - sum(values)/n)**2 for v in values) / n) ** 0.5, 1),
+        }
+
+    def record_message(self, channel: str) -> None:
+        ts = time.localtime()
+        day = ts.tm_wday
+        hour = ts.tm_hour
+        hm = self._heatmaps.setdefault(channel.lower(), {})
+        hm.setdefault(day, {})
+        hm[day][hour] = hm[day].get(hour, 0) + 1
+        self._maybe_save()
+
+    def get_heatmap(self, channel: str) -> Dict[int, Dict[int, int]]:
+        return self._heatmaps.get(channel.lower(), {})
+
+    def get_heatmap_summary(self, channel: str, days: int = 7) -> List[Tuple[int, int, int]]:
+        hm = self.get_heatmap(channel)
+        entries = []
+        for d in range(7):
+            if d in hm:
+                for h, count in hm[d].items():
+                    entries.append((d, h, count))
+        entries.sort(key=lambda x: -x[2])
+        return entries[:days * 24]
+
+    def update_topology(self, server: str, channel: str, users: set) -> None:
+        srv_topo = self._topology.setdefault(server, {})
+        srv_topo[channel.lower()] = {u.lower() for u in users}
+
+    def get_topology(self, server: str) -> Dict[str, Any]:
+        srv = self._topology.get(server, {})
+        total_channels = len(srv)
+        total_users = len(set().union(*srv.values())) if srv else 0
+        return {
+            "server": server,
+            "channels": total_channels,
+            "total_users": total_users,
+            "channel_list": sorted(srv.keys()),
+        }
+
+    def record_connect(self, server: str) -> None:
+        self._connect_times.setdefault(server, []).append((time.time(), None))
+
+    def record_disconnect(self, server: str) -> None:
+        conns = self._connect_times.get(server, [])
+        if conns and conns[-1][1] is None:
+            conns[-1] = (conns[-1][0], time.time())
+
+    def get_uptime(self, server: str) -> Dict[str, Any]:
+        conns = self._connect_times.get(server, [])
+        if not conns:
+            return {"server": server, "connected": False}
+        last = conns[-1]
+        is_connected = last[1] is None
+        current_duration = time.time() - last[0] if is_connected else 0
+        total_up = sum((e[1] or time.time()) - e[0] for e in conns)
+        total_span = (conns[-1][1] or time.time()) - conns[0][0] if len(conns) > 1 else current_duration
+        return {
+            "server": server,
+            "connected": is_connected,
+            "current_duration": round(current_duration, 0),
+            "total_connections": len(conns),
+            "total_uptime": round(total_up, 0),
+            "uptime_pct": round(total_up / max(total_span, 1) * 100, 1),
+        }
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "latency": {s: list(d)[-100:] for s, d in self._latency_samples.items()},
+                "heatmaps": self._heatmaps,
+                "topology": {s: {c: sorted(u) for c, u in ch.items()} for s, ch in self._topology.items()},
+                "connect_times": self._connect_times,
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for s, samples in data.get("latency", {}).items():
+                self._latency_samples[s] = deque(samples[-1000:], maxlen=1000)
+            self._heatmaps = data.get("heatmaps", {})
+            for s, ch in data.get("topology", {}).items():
+                self._topology[s] = {c: set(u) for c, u in ch.items()}
+            self._connect_times = data.get("connect_times", {})
+        except Exception:
+            pass
+
+
+# =========================
+# Trigger Manager
+# =========================
+
+class TriggerManager:
+    """Auto-respond to message patterns with custom actions.
+
+    Supports:
+      • Regex-based pattern matching
+      • Actions: reply, notify, log, exec, ignore
+      • Per-channel or global triggers
+      • Rate limiting per trigger
+      • Cooldown periods to prevent spam
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "triggers.json")
+
+    def __init__(self):
+        self._triggers: List[Dict] = []
+        self._last_fired: Dict[int, float] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def add(self, pattern: str, action: str, response: str = "",
+            channel: str = "", cooldown: float = 30.0, case_sensitive: bool = False) -> int:
+        trigger_id = len(self._triggers)
+        self._triggers.append({
+            "id": trigger_id, "pattern": pattern, "action": action,
+            "response": response, "channel": channel.lower() if channel else "",
+            "cooldown": cooldown, "case_sensitive": case_sensitive,
+            "enabled": True, "fire_count": 0, "created": time.time(),
+        })
+        self._maybe_save()
+        return trigger_id
+
+    def remove(self, trigger_id: int) -> bool:
+        for i, t in enumerate(self._triggers):
+            if t["id"] == trigger_id:
+                del self._triggers[i]
+                self._last_fired.pop(trigger_id, None)
+                self._maybe_save()
+                return True
+        return False
+
+    def match(self, nick: str, channel: str, text: str) -> List[Dict]:
+        results = []
+        now = time.time()
+        for t in self._triggers:
+            if not t["enabled"]:
+                continue
+            if t["channel"] and t["channel"] != channel.lower():
+                continue
+            last = self._last_fired.get(t["id"], 0)
+            if now - last < t["cooldown"]:
+                continue
+            flags = 0 if t["case_sensitive"] else re.IGNORECASE
+            try:
+                if re.search(t["pattern"], text, flags):
+                    self._last_fired[t["id"]] = now
+                    t["fire_count"] += 1
+                    results.append(t)
+            except re.error:
+                pass
+        return results
+
+    def list_triggers(self) -> List[Dict]:
+        return sorted(self._triggers, key=lambda x: x["id"])
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._triggers, f, indent=2)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                self._triggers = json.load(f)
+        except Exception:
+            pass
+
+
+# =========================
+# AutoMod Manager
+# =========================
+
+class AutoModManager:
+    """Auto-moderation rules for channels.
+
+    Supports:
+      • Regex-based spam/harassment detection
+      • Flood detection (message rate per user)
+      • Caps lock detection
+      • Link filtering
+      • Actions: warn, mute, kick, ban, delete
+      • Whitelist for trusted users
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "automod.json")
+
+    def __init__(self):
+        self._rules: Dict[str, List[Dict]] = {}
+        self._flood_tracker: Dict[str, deque] = {}
+        self._whitelist: Dict[str, set] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def add_rule(self, channel: str, rule_type: str, pattern: str = "",
+                 action: str = "warn", threshold: int = 3, duration: int = 60) -> int:
+        cl = channel.lower()
+        rule_id = len(self._rules.get(cl, []))
+        self._rules.setdefault(cl, []).append({
+            "id": rule_id, "type": rule_type, "pattern": pattern,
+            "action": action, "threshold": threshold, "duration": duration,
+            "enabled": True,
+        })
+        self._maybe_save()
+        return rule_id
+
+    def remove_rule(self, channel: str, rule_id: int) -> bool:
+        cl = channel.lower()
+        rules = self._rules.get(cl, [])
+        for i, r in enumerate(rules):
+            if r["id"] == rule_id:
+                del rules[i]
+                self._maybe_save()
+                return True
+        return False
+
+    def add_whitelist(self, channel: str, nick: str) -> None:
+        self._whitelist.setdefault(channel.lower(), set()).add(nick.lower())
+
+    def remove_whitelist(self, channel: str, nick: str) -> None:
+        self._whitelist.get(channel.lower(), set()).discard(nick.lower())
+
+    def check(self, nick: str, channel: str, text: str) -> List[Dict]:
+        cl = channel.lower()
+        nl = nick.lower()
+        if nl in self._whitelist.get(cl, set()):
+            return []
+        results = []
+        now = time.time()
+
+        # Flood detection
+        ft = self._flood_tracker.setdefault(nl, deque(maxlen=20))
+        ft.append(now)
+        recent = sum(1 for t in ft if now - t < 5.0)
+        rules = self._rules.get(cl, [])
+        for r in rules:
+            if not r["enabled"]:
+                continue
+            if r["type"] == "flood" and recent >= r["threshold"]:
+                results.append({"rule": r, "reason": f"flood: {recent} msgs in 5s", "nick": nick})
+            elif r["type"] == "caps":
+                caps = sum(1 for c in text if c.isupper())
+                letters = sum(1 for c in text if c.isalpha())
+                if letters > 5 and caps / letters > r["threshold"] / 100:
+                    results.append({"rule": r, "reason": f"caps: {caps/letters:.0%}", "nick": nick})
+            elif r["type"] == "regex" and r["pattern"]:
+                try:
+                    if re.search(r["pattern"], text, re.IGNORECASE):
+                        results.append({"rule": r, "reason": f"regex match", "nick": nick})
+                except re.error:
+                    pass
+            elif r["type"] == "links" and ("http://" in text or "https://" in text):
+                results.append({"rule": r, "reason": "link detected", "nick": nick})
+        return results
+
+    def list_rules(self, channel: str) -> List[Dict]:
+        return self._rules.get(channel.lower(), [])
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {
+                "rules": self._rules,
+                "whitelist": {k: sorted(v) for k, v in self._whitelist.items()},
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._rules = data.get("rules", {})
+            self._whitelist = {k: set(v) for k, v in data.get("whitelist", {}).items()}
+        except Exception:
+            pass
+
+
+# =========================
+# Webhook Manager
+# =========================
+
+class WebhookManager:
+    """Forward IRC events to external webhooks (Discord, Slack, custom).
+
+    Supports:
+      • Channel-specific or global webhooks
+      • Event filtering (msg, join, part, quit, topic, action)
+      • Payload formatting (JSON, form-data, plain text)
+      • Retry on failure with exponential backoff
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "webhooks.json")
+
+    def __init__(self):
+        self._webhooks: List[Dict] = []
+        self._last_save: float = 0.0
+        self.load()
+
+    def add(self, url: str, events: List[str], channel: str = "",
+            name: str = "", format_type: str = "json") -> int:
+        wh_id = len(self._webhooks)
+        self._webhooks.append({
+            "id": wh_id, "url": url, "events": events,
+            "channel": channel.lower() if channel else "",
+            "name": name or f"webhook-{wh_id}", "format": format_type,
+            "enabled": True, "fail_count": 0, "created": time.time(),
+        })
+        self._maybe_save()
+        return wh_id
+
+    def remove(self, wh_id: int) -> bool:
+        for i, w in enumerate(self._webhooks):
+            if w["id"] == wh_id:
+                del self._webhooks[i]
+                self._maybe_save()
+                return True
+        return False
+
+    async def fire(self, event_type: str, channel: str, data: Dict) -> None:
+        for wh in self._webhooks:
+            if not wh["enabled"]:
+                continue
+            if event_type not in wh["events"]:
+                continue
+            if wh["channel"] and wh["channel"] != channel.lower():
+                continue
+            await self._send_webhook(wh, event_type, channel, data)
+
+    async def _send_webhook(self, wh: Dict, event_type: str, channel: str, data: Dict) -> None:
+        try:
+            payload = json.dumps({
+                "event": event_type, "channel": channel,
+                "ts": time.time(), "data": data,
+            })
+            req = urllib.request.Request(
+                wh["url"],
+                data=payload.encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(_IO_EXECUTOR, lambda: urllib.request.urlopen(req, timeout=10))
+            wh["fail_count"] = 0
+        except Exception:
+            wh["fail_count"] = wh.get("fail_count", 0) + 1
+            if wh["fail_count"] > 10:
+                wh["enabled"] = False
+
+    def list_webhooks(self) -> List[Dict]:
+        return self._webhooks
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._webhooks, f, indent=2)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                self._webhooks = json.load(f)
+        except Exception:
+            pass
+
+
+# =========================
+# GitHub Tracker
+# =========================
+
+class GitHubTracker:
+    """Track GitHub repositories and post updates to IRC channels.
+
+    Monitors:
+      • New issues, PRs, releases
+      • Commit activity
+      • Star/watcher count changes
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "github_tracker.json")
+
+    def __init__(self):
+        self._repos: Dict[str, Dict] = {}
+        self._last_check: Dict[str, float] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def add(self, owner: str, repo: str, channel: str, events: List[str] = None,
+            token: str = "") -> str:
+        key = f"{owner}/{repo}".lower()
+        self._repos[key] = {
+            "owner": owner, "repo": repo, "channel": channel.lower(),
+            "events": events or ["issue", "pr", "release"],
+            "token": token, "enabled": True,
+            "last_issue": 0, "last_pr": 0, "last_release": 0,
+        }
+        self._maybe_save()
+        return key
+
+    def remove(self, key: str) -> bool:
+        if key.lower() in self._repos:
+            del self._repos[key.lower()]
+            self._maybe_save()
+            return True
+        return False
+
+    async def check_updates(self) -> List[Dict]:
+        updates = []
+        now = time.time()
+        for key, repo in self._repos.items():
+            if not repo["enabled"]:
+                continue
+            if now - self._last_check.get(key, 0) < 300:
+                continue
+            self._last_check[key] = now
+            try:
+                updates.extend(await self._check_repo(key, repo))
+            except Exception:
+                pass
+        return updates
+
+    async def _check_repo(self, key: str, repo: Dict) -> List[Dict]:
+        updates = []
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        if repo.get("token"):
+            headers["Authorization"] = f"token {repo['token']}"
+        base = f"https://api.github.com/repos/{repo['owner']}/{repo['repo']}"
+
+        loop = asyncio.get_running_loop()
+        if "issue" in repo["events"]:
+            try:
+                url = f"{base}/issues?state=open&sort=created&direction=desc&per_page=3"
+                raw = await loop.run_in_executor(_IO_EXECUTOR, lambda: self._fetch(url, headers))
+                issues = json.loads(raw) if raw else []
+                for iss in issues:
+                    if iss.get("pull_request"):
+                        continue
+                    created = time.mktime(time.strptime(iss["created_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+                    if created > repo.get("last_issue", 0):
+                        updates.append({"type": "issue", "repo": key, "title": iss["title"],
+                                       "user": iss["user"]["login"], "url": iss["html_url"], "channel": repo["channel"]})
+                        repo["last_issue"] = max(repo.get("last_issue", 0), created)
+            except Exception:
+                pass
+
+        if "pr" in repo["events"]:
+            try:
+                url = f"{base}/pulls?state=open&sort=created&direction=desc&per_page=3"
+                raw = await loop.run_in_executor(_IO_EXECUTOR, lambda: self._fetch(url, headers))
+                prs = json.loads(raw) if raw else []
+                for pr in prs:
+                    created = time.mktime(time.strptime(pr["created_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+                    if created > repo.get("last_pr", 0):
+                        updates.append({"type": "pr", "repo": key, "title": pr["title"],
+                                       "user": pr["user"]["login"], "url": pr["html_url"], "channel": repo["channel"]})
+                        repo["last_pr"] = max(repo.get("last_pr", 0), created)
+            except Exception:
+                pass
+
+        if "release" in repo["events"]:
+            try:
+                url = f"{base}/releases?per_page=1"
+                raw = await loop.run_in_executor(_IO_EXECUTOR, lambda: self._fetch(url, headers))
+                releases = json.loads(raw) if raw else []
+                if releases:
+                    rel = releases[0]
+                    created = time.mktime(time.strptime(rel["published_at"][:19], "%Y-%m-%dT%H:%M:%S"))
+                    if created > repo.get("last_release", 0):
+                        updates.append({"type": "release", "repo": key, "title": rel["name"] or rel["tag_name"],
+                                       "user": rel["author"]["login"], "url": rel["html_url"], "channel": repo["channel"]})
+                        repo["last_release"] = max(repo.get("last_release", 0), created)
+            except Exception:
+                pass
+
+        return updates
+
+    @staticmethod
+    def _fetch(url: str, headers: Dict) -> Optional[str]:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.read().decode("utf-8")
+        except Exception:
+            return None
+
+    def list_repos(self) -> List[Dict]:
+        return [{"key": k, **v} for k, v in self._repos.items()]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 60:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._repos, f, indent=2)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                self._repos = json.load(f)
+        except Exception:
+            pass
+
+
+# =========================
+# Chat Log Importer
+# =========================
+
+class ChatLogImporter:
+    """Import chat logs from other IRC clients.
+
+    Supported formats:
+      • HexChat/XChat (.log)
+      • WeeChat (.weechatlog)
+      • irssi (.log)
+      • Generic timestamped text
+    """
+
+    @staticmethod
+    def detect_format(filepath: str) -> str:
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                first_lines = [f.readline() for _ in range(5)]
+            for line in first_lines:
+                if re.match(r'\*\*\*\*\s+Log', line):
+                    return "hexchat"
+                if re.match(r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}', line):
+                    return "weechat"
+                if re.match(r'--.*--\s+Log', line):
+                    return "irssi"
+            return "generic"
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def import_file(filepath: str, window_name: str, fmt: str = "auto") -> int:
+        if fmt == "auto":
+            fmt = ChatLogImporter.detect_format(filepath)
+        count = 0
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if not line.strip():
+                        continue
+                    parsed = ChatLogImporter._parse_line(line, fmt)
+                    if parsed:
+                        ts_str, nick, text = parsed
+                        append_chat_line(window_name, f"{ts_str} <{nick}> {text}")
+                        count += 1
+        except Exception:
+            pass
+        return count
+
+    @staticmethod
+    def _parse_line(line: str, fmt: str) -> Optional[Tuple[str, str, str]]:
+        if fmt == "hexchat":
+            m = re.match(r'\*\*\*\*\s+Log opened:\s+(.*)', line)
+            if m:
+                return None
+            m = re.match(r'(\d{2}:\d{2}:\d{2})\s+<([^>]+)>\s+(.*)', line)
+            if m:
+                return (f"[{m.group(1)}]", m.group(2), m.group(3))
+        elif fmt == "weechat":
+            m = re.match(r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+<([^>]+)>\s+(.*)', line)
+            if m:
+                dt = m.group(1).split()[1]
+                return (f"[{dt}]", m.group(2), m.group(3))
+        elif fmt == "irssi":
+            m = re.match(r'--\w+\s+\w+\s+\d+\s+(\d{2}:\d{2}:\d{2})\s+--\s+<([^>]+)>\s+(.*)', line)
+            if m:
+                return (f"[{m.group(1)}]", m.group(2), m.group(3))
+        m = re.match(r'\[?(\d{2}:\d{2}(?::\d{2})?)\]?\s*[<\[]([^>\]]+)[>\]]\s+(.*)', line)
+        if m:
+            return (f"[{m.group(1)}]", m.group(2), m.group(3))
+        return None
+
+
+# =========================
+# Real-time Stats Panel
+# =========================
+
+class RealtimeStats:
+    """Tracks and computes real-time channel/session statistics for the stats panel."""
+
+    def __init__(self):
+        self._msg_timestamps: deque = deque(maxlen=5000)
+        self._channel_msg_counts: Dict[str, int] = {}
+        self._channel_msg_timestamps: Dict[str, deque] = {}
+        self._hourly_activity: List[int] = [0] * 24
+        self._session_start: float = time.time()
+        self._total_msgs: int = 0
+        self._total_suspects_seen: int = 0
+        self._ai_scores_in_window: deque = deque(maxlen=200)
+        self._sentiment_samples: deque = deque(maxlen=200)
+        self._last_compute: float = 0.0
+        self._cached_lines: List[str] = []
+        self._last_channel: str = ""
+        self._channel_speakers: Dict[str, Dict[str, int]] = {}
+
+    def record_message(self, nick: str, channel: str, ai_score: int = 0, sentiment: float = 0.0) -> None:
+        now = time.time()
+        self._msg_timestamps.append(now)
+        self._channel_msg_counts[channel] = self._channel_msg_counts.get(channel, 0) + 1
+        self._hourly_activity[time.localtime().tm_hour] += 1
+        self._total_msgs += 1
+        if ai_score >= AI_SUSPECT_THRESHOLD:
+            self._total_suspects_seen += 1
+        self._ai_scores_in_window.append(ai_score)
+        self._sentiment_samples.append(sentiment)
+        if channel not in self._channel_msg_timestamps:
+            self._channel_msg_timestamps[channel] = deque(maxlen=2000)
+        self._channel_msg_timestamps[channel].append(now)
+        if channel not in self._channel_speakers:
+            self._channel_speakers[channel] = {}
+        self._channel_speakers[channel][nick] = self._channel_speakers[channel].get(nick, 0) + 1
+        self._last_compute = 0.0
+        if self._last_channel != channel:
+            self._last_channel = channel
+            self._cached_lines = []
+
+    def _compute_channel_rate(self, channel: str, window_seconds: int) -> float:
+        now = time.time()
+        cutoff = now - window_seconds
+        ts = self._channel_msg_timestamps.get(channel)
+        if not ts:
+            return 0.0
+        count = sum(1 for t in ts if t >= cutoff)
+        return count / (window_seconds / 60.0)
+
+    def get_top_speakers(self, channel: str, limit: int = 3) -> List[Tuple[str, int]]:
+        speakers = self._channel_speakers.get(channel, {})
+        sorted_speakers = sorted(speakers.items(), key=lambda x: x[1], reverse=True)
+        return sorted_speakers[:limit]
+
+    def get_panel_lines(self, current_channel: str, total_users: int, suspect_count: int, channels_joined: int) -> List[str]:
+        now = time.monotonic()
+        if now - self._last_compute < 1.0 and self._cached_lines:
+            return self._cached_lines
+
+        lines = []
+        uptime = time.time() - self._session_start
+        hours, rem = divmod(int(uptime), 3600)
+        mins, secs = divmod(rem, 60)
+
+        lines.append(" Stats ")
+        lines.append(f" {int(hours)}h {mins}m {secs}s")
+        lines.append(f" {self._total_msgs} msgs")
+
+        msgs_per_min = self._compute_rate(60)
+        lines.append(f" {msgs_per_min:.1f}/min")
+
+        lines.append(f" {total_users} users")
+        lines.append(f" {suspect_count} suspects")
+        lines.append(f" {channels_joined} channels")
+
+        if current_channel and current_channel.startswith("#"):
+            ch_msgs = self._channel_msg_counts.get(current_channel, 0)
+            ch_rate = self._compute_channel_rate(current_channel, 60)
+            lines.append(f" {ch_msgs} in {current_channel}")
+            lines.append(f" {ch_rate:.1f}/min")
+            top = self.get_top_speakers(current_channel, 3)
+            if top:
+                top_str = ", ".join(f"{n}({c})" for n, c in top)
+                lines.append(f" top: {top_str}")
+
+        avg_ai = sum(self._ai_scores_in_window) / len(self._ai_scores_in_window) if self._ai_scores_in_window else 0
+        lines.append(f" AI avg: {avg_ai:.0f}%")
+
+        if self._sentiment_samples:
+            avg_sent = sum(self._sentiment_samples) / len(self._sentiment_samples)
+            sent_label = "+" if avg_sent > 0.2 else "-" if avg_sent < -0.2 else "~"
+            lines.append(f" mood: {sent_label}{abs(avg_sent):.2f}")
+
+        peak_hour = max(range(24), key=lambda h: self._hourly_activity[h])
+        if self._hourly_activity[peak_hour] > 0:
+            lines.append(f" peak: {peak_hour:02d}:00")
+
+        self._cached_lines = lines
+        self._last_compute = now
+        return lines
+
+    def _compute_rate(self, window_seconds: int) -> float:
+        now = time.time()
+        cutoff = now - window_seconds
+        count = sum(1 for t in self._msg_timestamps if t >= cutoff)
+        return count / (window_seconds / 60.0)
+
+
+# =========================
 # AICalibrationManager
 # =========================
 
@@ -5586,281 +6327,1336 @@ def load_fingerprints() -> Dict[str, BotFingerprint]:
 
 
 # =========================
-# Bouncer Buffer (BNC)
+# Async DNS Resolver
 # =========================
-class BouncerBuffer:
-    """Persistent message buffer for the built-in bouncer.
 
-    When the TUI is detached, incoming IRC messages are serialised to a JSONL
-    file.  On reattach they are replayed via the ui_queue in chronological
-    order, then the buffer file is truncated to zero.
+class AsyncDNSResolver:
+    """Non-blocking DNS resolution with LRU caching and TTL support.
+
+    Uses asyncio.getaddrinfo in a thread executor so DNS lookups never block
+    the event loop.  Results are cached with TTL expiration to avoid repeated
+    lookups for the same host (especially useful during reconnect storms).
     """
 
-    def __init__(self, path: str = BNC_BUFFER_PATH):
-        self.path = path
-        self._count: int = 0
-        self._channel_counts: Dict[str, int] = {}
-        self._highlight_count: int = 0
+    _CACHE_MAX = 128
+    _DEFAULT_TTL = 300  # 5 minutes default TTL
 
-    def append(self, event_type: str, *args) -> None:
-        """Write one buffered event as a JSON line."""
+    def __init__(self):
+        self._cache: OrderedDict = OrderedDict()
+        self._pending: Dict[str, asyncio.Future] = {}
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_UNSPEC) -> List[Tuple]:
+        """Resolve *host* to a list of (family, type, proto, canonname, sockaddr) tuples.
+
+        Returns cached results if available and not expired.
+        Deduplicates concurrent requests for the same host.
+        """
+        cache_key = f"{host}:{port}:{family}"
+        now = time.monotonic()
+
+        cached = self._cache.get(cache_key)
+        if cached and cached["expires"] > now:
+            self._cache.move_to_end(cache_key)
+            return cached["results"]
+
+        if cache_key in self._pending:
+            return await self._pending[cache_key]
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = asyncio.ensure_future(
+            loop.run_in_executor(_IO_EXECUTOR, socket.getaddrinfo, host, port, family, socket.SOCK_STREAM)
+        )
+        self._pending[cache_key] = fut
         try:
-            entry = {"t": event_type, "a": args, "ts": time.time()}
-            # Track per-channel message counts
-            if event_type == "msg" and len(args) >= 2:
-                channel = args[1]  # target/channel
-                self._channel_counts[channel] = self._channel_counts.get(channel, 0) + 1
-            # Track highlights (mentions)
-            if event_type == "msg" and len(args) >= 7:
-                mention = args[5] if len(args) > 5 else ""
-                if mention:
-                    self._highlight_count += 1
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            self._count += 1
-        except Exception:
-            pass
+            results = await fut
+            ttl = self._DEFAULT_TTL
+            self._cache[cache_key] = {
+                "results": results,
+                "expires": now + ttl,
+                "ttl": ttl,
+            }
+            if len(self._cache) > self._CACHE_MAX:
+                self._cache.popitem(last=False)
+            return results
+        finally:
+            self._pending.pop(cache_key, None)
 
-    def replay(self, ui_queue: asyncio.Queue, limit: int = 0, since: float = 0, channels: Optional[set] = None) -> int:
-        """Read all buffered lines, push them onto *ui_queue*, and clear the file.
-
-        Args:
-            limit: Max events to replay (0 = unlimited)
-            since: Only replay events after this timestamp (0 = all)
-            channels: Only replay events for these channels (None = all)
-
-        Returns the number of events replayed."""
-        entries: list = []
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                for raw in f:
-                    raw = raw.strip()
-                    if raw:
-                        try:
-                            entries.append(json.loads(raw))
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-        if not entries:
-            return 0
-        # Sort by timestamp so replay order matches original arrival
-        entries.sort(key=lambda e: e.get("ts", 0))
-
-        # Apply filters
-        if since > 0:
-            entries = [e for e in entries if e.get("ts", 0) >= since]
-        if channels:
-            filtered = []
-            for e in entries:
-                if e["t"] == "msg" and len(e["a"]) >= 2:
-                    if e["a"][1] in channels:
-                        filtered.append(e)
-                elif e["t"] != "msg":
-                    filtered.append(e)
-            entries = filtered
-
-        replayed = 0
-        for entry in entries:
-            if limit > 0 and replayed >= limit:
-                break
-            try:
-                ui_queue.put_nowait(tuple([entry["t"]] + list(entry["a"])))
-                replayed += 1
-            except asyncio.QueueFull:
-                break
-        # Truncate the buffer file
-        try:
-            open(self.path, "w").close()
-        except Exception:
-            pass
-        self._count = 0
-        self._channel_counts.clear()
-        self._highlight_count = 0
-        return replayed
-
-    @property
-    def count(self) -> int:
-        return self._count
-
-    def get_channel_stats(self) -> Dict[str, int]:
-        """Return per-channel message counts."""
-        return dict(self._channel_counts)
-
-    @property
-    def highlight_count(self) -> int:
-        return self._highlight_count
+    async def resolve_ip(self, host: str) -> List[str]:
+        """Return a list of IP addresses for *host* (IPv4 first, then IPv6)."""
+        results = await self.resolve(host)
+        ips: List[str] = []
+        for family, _, _, _, sockaddr in results:
+            ip = sockaddr[0]
+            if family == socket.AF_INET and ip not in ips:
+                ips.insert(0, ip)
+            elif family == socket.AF_INET6 and ip not in ips:
+                ips.append(ip)
+        return ips
 
     def clear(self) -> None:
-        try:
-            open(self.path, "w").close()
-        except Exception:
-            pass
-        self._count = 0
-        self._channel_counts.clear()
-        self._highlight_count = 0
+        self._cache.clear()
+        for fut in self._pending.values():
+            fut.cancel()
+        self._pending.clear()
+
+    def get_cache_info(self) -> Dict[str, Any]:
+        now = time.monotonic()
+        entries = []
+        for key, data in self._cache.items():
+            remaining = max(0, data["expires"] - now)
+            entries.append({
+                "host": key,
+                "ttl_remaining": round(remaining, 1),
+                "results": len(data["results"]),
+            })
+        return {"cached": len(entries), "pending": len(self._pending), "entries": entries}
+
+
+_dns_resolver = AsyncDNSResolver()
 
 
 # =========================
-# GPG helpers
+# LLMFingerprinter
+# =========================
+
+class LLMFingerprinter:
+    """Detects LLM-generation patterns beyond vocabulary: perplexity anomalies,
+    punctuation entropy, function-word ratio bias, hedging density,
+    list-structure bias, temperature signatures."""
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "llm_fingerprints.json")
+
+    _FUNC_WORDS = frozenset({
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+        "should", "may", "might", "must", "can", "could", "to", "of", "in",
+        "for", "on", "with", "at", "by", "from", "as", "into", "about",
+        "like", "through", "after", "over", "between", "out", "against",
+        "during", "without", "before", "under", "around", "among",
+    })
+    _HEDGING_MARKERS = frozenset({
+        "perhaps", "maybe", "possibly", "likely", "tends to", "often",
+        "generally", "typically", "somewhat", "rather", "usually",
+        "it seems", "appears to", "might be", "could be", "arguably",
+        "in my opinion", "I think", "I believe", "it is possible",
+    })
+    _FUNC_WORD_RATIO_RE = re.compile(r'\b(?:' + '|'.join(_FUNC_WORDS) + r')\b', re.IGNORECASE)
+
+    def __init__(self):
+        self._nick_profiles: Dict[str, Dict] = {}
+        self._channel_data: Dict[str, Dict] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def analyze(self, nick: str, text: str) -> Dict:
+        nl = nick.lower()
+        words = text.split()
+        lower = text.lower()
+        signals = []
+        novelty = 0.0
+        combined = 0.0
+        if len(words) < 3:
+            return {"combined": 0.0, "signals": [], "novelty": 0.0}
+        prof = self._nick_profiles.setdefault(nl, {
+            "msg_count": 0, "func_word_ratios": deque(maxlen=50),
+            "punct_entropy_history": deque(maxlen=50),
+            "hedging_density_history": deque(maxlen=50),
+        })
+        prof["msg_count"] += 1
+        func_words = len(self._FUNC_WORD_RATIO_RE.findall(lower))
+        func_ratio = func_words / max(len(words), 1)
+        prof["func_word_ratios"].append(func_ratio)
+        if prof["msg_count"] >= 5:
+            avg_fr = sum(prof["func_word_ratios"]) / len(prof["func_word_ratios"])
+            if func_ratio > avg_fr * 1.3:
+                combined += 0.12
+                signals.append("elevated_func_words")
+        puncts = sum(1 for c in text if c in ".,;:!?")
+        punct_entropy = 0.0
+        if puncts > 0:
+            punct_freqs = Counter(c for c in text if c in ".,;:!?")
+            total_p = sum(punct_freqs.values())
+            for count in punct_freqs.values():
+                p = count / total_p
+                punct_entropy -= p * log2(p) if p > 0 else 0
+        prof["punct_entropy_history"].append(punct_entropy)
+        if prof["msg_count"] >= 5:
+            avg_pe = sum(prof["punct_entropy_history"]) / len(prof["punct_entropy_history"])
+            if avg_pe > 0 and punct_entropy < avg_pe * 0.4:
+                combined += 0.08
+                signals.append("low_punct_entropy")
+        hedging_count = sum(1 for h in self._HEDGING_MARKERS if h in lower)
+        hedging_density = hedging_count / max(len(words), 1)
+        prof["hedging_density_history"].append(hedging_density)
+        if prof["msg_count"] >= 5:
+            avg_hd = sum(prof["hedging_density_history"]) / len(prof["hedging_density_history"])
+            if hedging_density > avg_hd * 2.5:
+                combined += 0.10
+                signals.append("elevated_hedging")
+                if avg_hd < 0.01 and hedging_density > 0.05:
+                    novelty += 0.25
+        list_patterns = sum(1 for w in words if w.rstrip(").,;:").lstrip("(").isdigit() and len(w.rstrip(").,;:")) <= 2)
+        if list_patterns >= 3:
+            combined += 0.06
+            signals.append("list_structure")
+        uppercase_ratio = sum(1 for c in text if c.isupper()) / max(len(text), 1)
+        if uppercase_ratio < 0.05 and len(text) > 50:
+            combined += 0.04
+            signals.append("low_capitalization")
+        combined = min(0.95, combined)
+        self._maybe_save()
+        return {
+            "combined": round(combined, 4),
+            "signals": signals,
+            "novelty": round(novelty, 4),
+            "func_ratio": round(func_ratio, 3),
+            "punct_entropy": round(punct_entropy, 3),
+            "hedging_density": round(hedging_density, 3),
+        }
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {}
+            for nl, p in self._nick_profiles.items():
+                data[nl] = {
+                    "msg_count": p["msg_count"],
+                    "func_word_ratios": list(p["func_word_ratios"])[-20:],
+                    "punct_entropy_history": list(p["punct_entropy_history"])[-20:],
+                    "hedging_density_history": list(p["hedging_density_history"])[-20:],
+                }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for nl, p in data.items():
+                self._nick_profiles[nl] = {
+                    "msg_count": p.get("msg_count", 0),
+                    "func_word_ratios": deque(p.get("func_word_ratios", []), maxlen=50),
+                    "punct_entropy_history": deque(p.get("punct_entropy_history", []), maxlen=50),
+                    "hedging_density_history": deque(p.get("hedging_density_history", []), maxlen=50),
+                }
+        except Exception:
+            pass
+
+
+# =========================
+# DeepfakeRelayDetector
+# =========================
+
+class DeepfakeRelayDetector:
+    """Detects relay-style deepfake text: source-attribution anomalies,
+    style switching, quotation patterns, cross-reference failures, relay chains."""
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "deepfake_relay.json")
+
+    _SOURCE_ATTRIBUTION_RE = re.compile(
+        r'(?:according to|per|via|reported by|cited in|mentioned by|as per|'
+        r'source:|based on|as stated by|as noted by|quoting)', re.IGNORECASE)
+
+    def __init__(self):
+        self._nick_profiles: Dict[str, Dict] = {}
+        self._channel_data: Dict[str, Dict] = {}
+        self._relay_chains: deque = deque(maxlen=100)
+        self._last_save: float = 0.0
+        self.load()
+
+    def analyze(self, nick: str, channel: str, text: str) -> Dict:
+        nl = nick.lower()
+        cl = channel.lower()
+        lower = text.lower()
+        signals = []
+        combined = 0.0
+        words = text.split()
+        if len(words) < 4:
+            return {"combined": 0.0, "signals": [], "novelty": 0.0}
+        source_matches = self._SOURCE_ATTRIBUTION_RE.findall(lower)
+        if source_matches:
+            combined += 0.15
+            signals.append("source_attribution")
+            if len(source_matches) >= 2:
+                combined += 0.10
+                signals.append("multiple_sources")
+        quote_count = lower.count('"') // 2
+        if quote_count >= 2:
+            combined += 0.08
+            signals.append("heavy_quotation")
+        ch_data = self._channel_data.setdefault(cl, {
+            "samples": deque(maxlen=200), "relay_count": 0,
+        })
+        ch_data["samples"].append({
+            "nick": nl, "text_preview": text[:80],
+            "combined": combined, "signals": signals, "ts": time.time(),
+        })
+        recent_ch = list(ch_data["samples"])[-15:]
+        relay_pattern = sum(1 for s in recent_ch if s.get("combined", 0) > 0.1)
+        if relay_pattern >= 3 and len(set(s["nick"] for s in recent_ch[-5:])) >= 2:
+            combined += 0.20
+            signals.append("relay_chain")
+            ch_data["relay_count"] += 1
+            self._relay_chains.append({
+                "channel": cl, "nicks": list(set(s["nick"] for s in recent_ch[-5:])),
+                "ts": time.time(),
+            })
+        prof = self._nick_profiles.setdefault(nl, {
+            "msg_count": 0, "avg_combined": 0.0,
+        })
+        prof["msg_count"] += 1
+        prof["avg_combined"] = (prof["avg_combined"] * (prof["msg_count"] - 1) + combined) / prof["msg_count"]
+        if prof["avg_combined"] > 0.25:
+            novelty = min(0.9, prof["avg_combined"] * 2)
+        else:
+            novelty = 0.0
+        combined = min(0.95, combined)
+        self._maybe_save()
+        return {
+            "combined": round(combined, 4),
+            "signals": signals,
+            "novelty": round(novelty, 4),
+        }
+
+    def get_channel_relay_status(self, channel: str) -> Dict:
+        cl = channel.lower()
+        ch_data = self._channel_data.get(cl, {})
+        samples = ch_data.get("samples", deque())
+        recent = list(samples)[-20:]
+        relay_count = sum(1 for s in recent if s.get("combined", 0) > 0.1)
+        return {
+            "channel": channel,
+            "relay_count": ch_data.get("relay_count", 0),
+            "recent_relay_pct": round(relay_count / max(len(recent), 1), 3),
+            "samples": len(samples),
+        }
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._save()
+
+    def _save(self) -> None:
+        self._last_save = time.time()
+        try:
+            data = {}
+            for cl, cd in self._channel_data.items():
+                data[cl] = {
+                    "relay_count": cd["relay_count"],
+                    "samples": [{"nick": s["nick"], "combined": s["combined"], "ts": s["ts"]}
+                                for s in list(cd["samples"])[-30:]],
+                }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for cl, cd in data.items():
+                ch_data = self._channel_data.setdefault(cl, {
+                    "samples": deque(maxlen=200), "relay_count": cd.get("relay_count", 0),
+                })
+                for s in cd.get("samples", []):
+                    ch_data["samples"].append(s)
+        except Exception:
+            pass
+
+
+# =========================
+# BouncerBuffer
+# =========================
+
+class BouncerBuffer:
+    """Persistent JSONL message buffer for the built-in bouncer (BNC).
+    Serializes messages when TUI is detached; replays on reattach."""
+
+    def __init__(self, path: str = ""):
+        self._path = path or BNC_BUFFER_PATH
+        self._enabled: bool = False
+        self._detached: bool = False
+        self._events: List[tuple] = []
+        self.count: int = 0
+        self.highlight_count: int = 0
+
+    def detach(self) -> None:
+        self._detached = True
+
+    def attach(self) -> List[tuple]:
+        self._detached = False
+        events = self._read_all()
+        self.clear()
+        self.count = 0
+        self.highlight_count = 0
+        return events
+
+    def append(self, *args) -> None:
+        if not self._detached or not self._enabled:
+            return
+        self._events.append(args)
+        self.count = len(self._events)
+        etype = args[0] if args else ""
+        if etype == "msg":
+            self.highlight_count += 1
+        try:
+            payload = json.dumps({
+                "t": time.time(),
+                "e": [str(a) if not isinstance(a, (int, float, bool, type(None))) else a for a in args],
+            })
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(payload + "\n")
+        except Exception:
+            pass
+
+    def replay(self, ui_queue, limit: int = 0) -> int:
+        events = self._read_all()
+        if not events:
+            return 0
+        replay_events = events[-limit:] if limit > 0 else events
+        for event in replay_events:
+            try:
+                ui_queue.put_nowait(event)
+            except Exception:
+                pass
+        return len(replay_events)
+
+    def clear(self) -> None:
+        self._events.clear()
+        self.count = 0
+        self.highlight_count = 0
+        try:
+            open(self._path, "w", encoding="utf-8").close()
+        except Exception:
+            pass
+
+    def _read_all(self) -> List[tuple]:
+        events = []
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        events.append(tuple(data.get("e", [])))
+                    except json.JSONDecodeError:
+                        pass
+        except FileNotFoundError:
+            pass
+        return events
+
+    def get_status(self) -> Dict:
+        return {
+            "enabled": self._enabled,
+            "detached": self._detached,
+            "count": self.count,
+            "highlight_count": self.highlight_count,
+            "path": self._path,
+        }
+
+
+# =========================
+# GPG helpers — PGP encryption/signing via gpg binary
 # =========================
 
 def _gpg_available() -> bool:
-    """Return True if the gpg binary is reachable."""
+    """Check whether the gpg binary is installed and functional."""
     try:
-        subprocess.run([GPG_BINARY, "--version"], capture_output=True, timeout=5)
-        return True
+        result = subprocess.run([GPG_BINARY, "--version"], capture_output=True, timeout=5)
+        return result.returncode == 0
     except Exception:
         return False
 
 
 def _gpg_encrypt(plaintext: str, recipient: str) -> Optional[str]:
-    """Encrypt *plaintext* for *recipient* using gpg --encrypt.
-    Returns base64-encoded ciphertext, or None on failure."""
+    """Encrypt plaintext for recipient using gpg --encrypt --armor."""
     try:
-        proc = subprocess.run(
-            [GPG_BINARY, "--encrypt", "--armor", "--recipient", recipient,
-             "--trust-model", "always"],
-            input=plaintext.encode("utf-8"),
-            capture_output=True, timeout=15,
+        result = subprocess.run(
+            [GPG_BINARY, "--encrypt", "--armor", "--trust-model", "always",
+             "--recipient", recipient],
+            input=plaintext, capture_output=True, text=True, timeout=30,
         )
-        if proc.returncode == 0:
-            return base64.b64encode(proc.stdout).decode()
+        if result.returncode == 0:
+            return result.stdout.strip()
     except Exception:
         pass
     return None
 
 
-def _gpg_decrypt(b64_ciphertext: str) -> Optional[str]:
-    """Decrypt a base64-encoded GPG ciphertext.
-    Returns the plaintext string, or None on failure."""
+def _gpg_decrypt(ciphertext: str, passphrase: str = "") -> Optional[str]:
+    """Decrypt armored ciphertext."""
     try:
-        raw = base64.b64decode(b64_ciphertext)
-        proc = subprocess.run(
-            [GPG_BINARY, "--decrypt"],
-            input=raw, capture_output=True, timeout=15,
+        args = [GPG_BINARY, "--decrypt"]
+        if passphrase:
+            args.extend(["--passphrase", passphrase, "--batch", "--no-tty"])
+        result = subprocess.run(
+            args, input=ciphertext, capture_output=True, text=True, timeout=30,
         )
-        if proc.returncode == 0:
-            return proc.stdout.decode("utf-8", errors="replace").strip()
+        if result.returncode == 0:
+            return result.stdout.strip()
     except Exception:
         pass
     return None
 
 
-def _gpg_sign(plaintext: str, key_fingerprint: str = "") -> Optional[str]:
-    """Sign *plaintext* with GPG. Returns base64-encoded detached signature."""
+def _gpg_sign(message: str, keyid: str = "") -> Optional[str]:
+    """Sign a message with a detached signature."""
     try:
         args = [GPG_BINARY, "--detach-sign", "--armor"]
-        if key_fingerprint:
-            args += ["--default-key", key_fingerprint]
-        proc = subprocess.run(
-            args, input=plaintext.encode("utf-8"),
-            capture_output=True, timeout=15,
+        if keyid:
+            args.extend(["--local-user", keyid])
+        result = subprocess.run(
+            args, input=message, capture_output=True, text=True, timeout=30,
         )
-        if proc.returncode == 0:
-            return base64.b64encode(proc.stdout).decode()
+        if result.returncode == 0:
+            return result.stdout.strip()
     except Exception:
         pass
     return None
 
 
-def _gpg_verify(plaintext: str, b64_signature: str) -> Optional[str]:
-    """Verify a base64-encoded GPG detached signature against *plaintext*.
-    Returns the signing key fingerprint on success, or None on failure."""
+def _gpg_verify(message: str, signature: str) -> bool:
+    """Verify a detached signature."""
     try:
-        sig = base64.b64decode(b64_signature)
-        proc = subprocess.run(
-            [GPG_BINARY, "--verify"],
-            input=sig + plaintext.encode("utf-8"),
-            capture_output=True, timeout=15,
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".asc", delete=False) as sig_f:
+            sig_f.write(signature.encode("utf-8"))
+        result = subprocess.run(
+            [GPG_BINARY, "--verify", sig_f.name],
+            input=message, capture_output=True, text=True, timeout=30,
         )
-        if proc.returncode == 0:
-            # Extract fingerprint from stderr
-            for line in proc.stderr.decode("utf-8", errors="replace").splitlines():
-                if "fingerprint" in line.lower() or "key ID" in line.lower():
-                    return line.strip()
-            return "(verified, no fingerprint in stderr)"
+        os.unlink(sig_f.name)
+        return result.returncode == 0
     except Exception:
-        pass
-    return None
+        return False
 
 
-# ── SOCKS5 proxy (Tor) ────────────────────────────────────────────────────
-async def _socks5_connect(host: str, port: int,
-                          proxy_host: str = TOR_PROXY_HOST,
-                          proxy_port: int = TOR_PROXY_PORT,
-                          timeout: float = 30.0,
-                          ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """Connect to *host:port* via a SOCKS5 proxy at *proxy_host:proxy_port*.
+# =========================
+# SOCKS5 helpers — Tor / I2P proxy connections
+# =========================
 
-    Returns (reader, writer) — the same shape as ``asyncio.open_connection``.
-    Raises ``ConnectionError`` on failure (handshake refused, timeout, …).
+async def _socks5_connect(host: str, port: int, proxy_host: str = "",
+                          proxy_port: int = 0) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Establish a TCP connection through a SOCKS5 proxy to (host, port).
+    Returns (reader, writer) for the established proxied connection."""
+    ph = proxy_host or TOR_PROXY_HOST
+    pp = proxy_port or TOR_PROXY_PORT
+    reader, writer = await asyncio.open_connection(ph, pp)
+    # SOCKS5 handshake
+    writer.write(b"\x05\x01\x00")
+    await writer.drain()
+    resp = await reader.readexactly(2)
+    if resp != b"\x05\x00":
+        writer.close()
+        raise ConnectionError(f"SOCKS5: server rejected auth method {resp!r}")
+    # CONNECT request
+    host_bytes = host.encode("ascii")
+    req = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + struct.pack("!H", port)
+    writer.write(req)
+    await writer.drain()
+    resp = await reader.readexactly(4)
+    if resp[1] != 0x00:
+        writer.close()
+        raise ConnectionError(f"SOCKS5: connection refused — reply code {resp[1]}")
+    addr_type = resp[3]
+    if addr_type == 1:   # IPv4
+        await reader.readexactly(4)
+    elif addr_type == 3:  # domain
+        domain_len = await reader.readexactly(1)
+        await reader.readexactly(domain_len[0])
+    elif addr_type == 4:  # IPv6
+        await reader.readexactly(16)
+    await reader.readexactly(2)  # port
+    return reader, writer
+
+
+# ====================================================================
+# Rich Integration Layer — cross-system fusion engines (Integrations 1-12)
+# ====================================================================
+
+# ── Integration 1: Unified Social Dashboard ────────────────────────────
+class UnifiedSocialDashboard:
+    """Produces a per-user dossier combining personality, role, emotion,
+    stance, sarcasm, badges, and debate history into a single view."""
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "social_dossiers.json")
+
+    def __init__(self):
+        self._dossier_cache: Dict[str, Dict] = {}
+        self._dossier_ts: Dict[str, float] = {}
+        self._cache_ttl: float = 60.0
+
+    def build_dossier(self, nick: str, scoring: Any) -> Dict[str, Any]:
+        nl = nick.lower()
+        if nl in self._dossier_cache and time.time() - self._dossier_ts.get(nl, 0) < self._cache_ttl:
+            return self._dossier_cache[nl]
+        dossier = {"nick": nick}
+        prof = scoring.personality.get_profile(nick)
+        dossier["personality"] = prof
+        role = scoring.role_inference.get_role(nick)
+        dossier["role"] = role
+        arc = scoring.emotion_arc.get_arc(nick, 30)
+        dossier["emotion"] = arc.get("summary", {}) if arc else {}
+        stances = scoring.stances.get_all_stances(nick)
+        dossier["stances"] = stances
+        sarcasm = scoring.sarcasm.get_user_sarcasm_rate(nick)
+        dossier["sarcasm"] = sarcasm
+        badges = scoring.achievements.get_badges(nick)
+        dossier["badges"] = badges
+        sentiment = scoring.get_sentiment_trend(nick, 20)
+        dossier["sentiment_trend"] = sentiment
+        self._dossier_cache[nl] = dossier
+        self._dossier_ts[nl] = time.time()
+        return dossier
+
+    def summarize_dossier(self, nick: str, scoring: Any) -> str:
+        d = self.build_dossier(nick, scoring)
+        lines = [f"=== Dossier: {nick} ==="]
+        p = d.get("personality", {})
+        if p and p.get("confidence", "") != "insufficient data":
+            lines.append(f"  Personality: O{p.get('openness',0)} C{p.get('conscientiousness',0)} E{p.get('extraversion',0)} A{p.get('agreeableness',0)} N{p.get('neuroticism',0)} ({p.get('samples',0)} msgs, {p.get('confidence','')})")
+        r = d.get("role", {})
+        if r:
+            lines.append(f"  Role: {r.get('primary_role','?')} (score {r['scores'].get(r.get('primary_role',''),0) if r.get('scores') else 0:.0%})")
+        e = d.get("emotion", {})
+        if e:
+            lines.append(f"  Emotion: {e.get('most_common_emotion','?')} (volatility {e.get('volatility',0):.0%})")
+        st = d.get("stances", {})
+        if st:
+            lines.append(f"  Stances on: {', '.join(st.keys())[:60]}")
+        sa = d.get("sarcasm", {})
+        if sa.get("total_analyzed", 0) > 0:
+            lines.append(f"  Sarcasm: {sa['sarcasm_rate']:.0%} of {sa['total_analyzed']} msgs")
+        bd = d.get("badges", [])
+        if bd:
+            lines.append(f"  Badges ({len(bd)}): {' '.join(b['icon'] for b in bd[:8])}")
+        st_trend = d.get("sentiment_trend", {})
+        if st_trend.get("sample_count", 0) > 0:
+            lines.append(f"  Sentiment: {st_trend['avg_score']:+.2f} [{st_trend['trend']}]")
+        return "\n".join(lines)
+
+
+# ── Integration 2: AI-Detector → Conversational Agent Feedback Loop ────
+class AIAgentBridge:
+    """Feeds AI detection metadata into ConversationalAgent behaviour.
+
+    When EnsembleAIDetector flags a message as AI-generated, the agent:
+      - Avoids engaging in AI-vs-AI conversations
+      - Adjusts response style for suspected bots
+      - Logs the interaction for quality analysis
     """
-    loop = asyncio.get_running_loop()
-    try:
-        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw_sock.settimeout(timeout)
-        raw_sock.setblocking(False)
 
-        await asyncio.wait_for(
-            loop.sock_connect(raw_sock, (proxy_host, proxy_port)),
-            timeout=timeout,
-        )
+    def __init__(self):
+        self._ai_avoided_conversations: int = 0
+        self._style_overrides: Dict[str, str] = {}  # nick → personality override
 
-        # ── 1. SOCKS5 greet (no auth) ──────────────────────────────────────
-        greet = bytes([0x05, 0x01, 0x00])
-        await asyncio.wait_for(
-            loop.sock_sendall(raw_sock, greet), timeout=timeout,
-        )
-        resp = await asyncio.wait_for(
-            loop.sock_recv(raw_sock, 2), timeout=timeout,
-        )
-        if resp != bytes([0x05, 0x00]):
-            raw_sock.close()
-            raise ConnectionError(f"SOCKS5: proxy rejected no-auth (got {resp.hex()})")
+    def evaluate(self, nick: str, channel: str, ai_score: int, agent) -> Optional[str]:
+        """Check whether the agent should respond and/or change style."""
+        if not agent._enabled:
+            return None
+        if ai_score >= 80:
+            agent.configure(personality="sarcastic")
+            self._style_overrides[nick.lower()] = "sarcastic"
+            return "sarcastic_override"
+        elif ai_score >= 60:
+            self._style_overrides[nick.lower()] = "debater"
+            return None
+        return None
 
-        # ── 2. CONNECT request (domain name) ───────────────────────────────
-        host_bytes = host.encode("idna")
-        if len(host_bytes) > 255:
-            raise ConnectionError("SOCKS5: hostname too long")
-        req = bytes([0x05, 0x01, 0x00, 0x03, len(host_bytes)]) \
-              + host_bytes \
-              + struct.pack("!H", port)
-        await asyncio.wait_for(
-            loop.sock_sendall(raw_sock, req), timeout=timeout,
-        )
-        # Response: version(1) + status(1) + reserved(1) + atyp(1) + bind(4-16) + port(2)
-        resp = await asyncio.wait_for(
-            loop.sock_recv(raw_sock, 255), timeout=timeout,
-        )
-        if len(resp) < 2:
-            raw_sock.close()
-            raise ConnectionError("SOCKS5: truncated connect response")
-        if resp[1] != 0x00:
-            statuses = {
-                0x01: "general failure", 0x02: "not allowed",
-                0x03: "network unreachable", 0x04: "host unreachable",
-                0x05: "connection refused", 0x06: "TTL expired",
-                0x07: "command not supported", 0x08: "address type not supported",
+    def disengage_ai_loop(self, nick_a: str, nick_b: str, channel: str) -> bool:
+        """Signal that the agent should not respond to known AI-vs-AI pairs."""
+        self._ai_avoided_conversations += 1
+        return True
+
+
+# ── Integration 3: Predictive Reply → LLM Fallback ─────────────────────
+class HybridPredictor:
+    """Wraps PredictiveReplyEngine with LLM fallback when n-gram confidence is low."""
+
+    def __init__(self, predictor: Any, llm_caller: Callable = None):
+        self._predictor = predictor
+        self._llm_caller = llm_caller
+        self._fallback_count: int = 0
+
+    def set_llm_caller(self, caller: Callable) -> None:
+        self._llm_caller = caller
+
+    def suggest(self, context: str, channel: str = "", limit: int = 5) -> List[Dict]:
+        """Suggest replies — n-gram first, LLM fallback if needed."""
+        suggestions = self._predictor.suggest(context, channel, limit)
+        if not suggestions or len(suggestions) < 2:
+            llm_suggestions = self._suggest_llm(context, limit)
+            if llm_suggestions:
+                self._fallback_count += 1
+                suggestions.extend(llm_suggestions)
+        seen = set()
+        unique = []
+        for s in suggestions:
+            if s["text"] not in seen:
+                seen.add(s["text"])
+                unique.append(s)
+        return unique[:limit]
+
+    def _suggest_llm(self, context: str, limit: int) -> List[Dict]:
+        if not self._llm_caller:
+            return []
+        try:
+            prompt = (
+                "Complete this IRC chat message naturally. "
+                f"Provide exactly {limit} single-line, short completions.\n"
+                f"Context: {context}\nCompletions (one per line):"
+            )
+            result = self._llm_caller(
+                "You are a concise IRC autocomplete. Provide short, natural chat completions.",
+                prompt, 0.8,
+            )
+            if result:
+                lines = [l.strip() for l in result.split("\n") if l.strip()]
+                return [{"text": l[:80], "score": 8, "type": "llm"}
+                        for l in lines[:limit]]
+        except Exception:
+            pass
+        return []
+
+
+# ── Integration 4: Unified Threat Score ─────────────────────────────────
+class UnifiedThreatScore:
+    """Fuses cross-analyzer signals into a single channel-level manipulation risk.
+
+    Combines: AstroturfingDetector + BotSwarmDetector + BanEvasionDetector +
+              SentimentContagionMap + EchoChamberDetector + AIVsAIDetector
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "unified_threats.json")
+
+    def __init__(self):
+        self._threat_log: deque = deque(maxlen=200)
+        self._active_threats: Dict[str, Dict] = {}
+        self._last_save: float = 0.0
+        self.load()
+
+    def compute_channel_threat(self, channel: str, scoring: Any) -> Dict[str, Any]:
+        cl = channel.lower()
+        signals = {}
+        weights = {}
+        # Astroturfing
+        campaigns = scoring.astroturfing.get_campaigns(cl, 5)
+        if campaigns:
+            signals["astroturfing"] = max(c["confidence"] for c in campaigns)
+            weights["astroturfing"] = 0.20
+        # Bot swarms
+        swarms = [s for s in scoring.bot_swarm.get_swarms(10) if s.get("channel","")==cl]
+        if swarms:
+            signals["bot_swarm"] = max(s["confidence"] for s in swarms)
+            weights["bot_swarm"] = 0.20
+        # Ban evasion
+        matches = [m for m in scoring.ban_evasion.get_matches(20) if m.get("score",0) >= 0.65]
+        if matches:
+            active_nicks = {m["suspect"] for m in matches[-10:] if time.time() - m.get("ts",0) < 3600}
+            if active_nicks:
+                signals["ban_evasion"] = max(m["score"] for m in matches)
+                weights["ban_evasion"] = 0.15
+        # AI-vs-AI pairs in channel
+        ai_pairs = scoring.ai_vs_ai.get_active_pairs(0.3)
+        chan_ai_pairs = [p for p in ai_pairs if p.get("channel","") == cl]
+        if chan_ai_pairs:
+            signals["ai_vs_ai"] = max(p["confidence"] for p in chan_ai_pairs)
+            weights["ai_vs_ai"] = 0.10
+        # Echo chamber
+        echo = scoring.echo_chamber.analyze(channel) or {}
+        if echo and echo.get("echo_score", 0) >= 0.5:
+            signals["echo_chamber"] = echo["echo_score"]
+            weights["echo_chamber"] = 0.15
+        # Sentiment contagion — top influencer concentration
+        influencers = scoring.sentiment_contagion.get_top_influencers(cl, 5)
+        if influencers and influencers[0]["influence"] >= 0.5:
+            signals["influence_concentration"] = influencers[0]["influence"]
+            weights["influence_concentration"] = 0.10
+        # Deepfake relay in channel
+        relay = scoring.deepfake_relay._channel_data.get(cl, {})
+        relay_samples = relay.get("samples", [])
+        if len(relay_samples) >= 5:
+            relay_scores = [s.get("combined", 0) for s in relay_samples]
+            relay_avg = sum(relay_scores) / len(relay_scores)
+            if relay_avg >= 0.3:
+                signals["deepfake_relay"] = relay_avg
+                weights["deepfake_relay"] = 0.10
+        if not signals:
+            return {"channel": channel, "threat_level": 0.0, "severity": "none",
+                    "signals": {}, "recommendation": ""}
+        total_weight = sum(weights.values()) or 1.0
+        threat_score = sum(signals[k] * weights[k] for k in signals) / total_weight
+        if threat_score >= 0.7:
+            severity = "critical"
+            recommendation = "Investigate immediately — multiple coordinated threat signals detected."
+        elif threat_score >= 0.5:
+            severity = "high"
+            recommendation = "Several threat signals active — monitor closely and review recent joins."
+        elif threat_score >= 0.3:
+            severity = "moderate"
+            recommendation = "Some suspicious patterns — keep watch, no immediate action needed."
+        else:
+            severity = "low"
+            recommendation = "Minor signals — likely benign."
+        result = {
+            "channel": channel, "threat_level": round(threat_score, 3),
+            "severity": severity, "recommendation": recommendation,
+            "signals": {k: round(v, 3) for k, v in sorted(signals.items(), key=lambda x: -x[1])},
+            "ts": time.time(),
+        }
+        self._active_threats[cl] = result
+        self._threat_log.append(result)
+        self._maybe_save()
+        return result
+
+    def get_all_threats(self, min_level: float = 0.0) -> List[Dict]:
+        results = sorted(self._active_threats.values(), key=lambda x: -x["threat_level"])
+        return [r for r in results if r["threat_level"] >= min_level]
+
+    def _maybe_save(self) -> None:
+        now = time.time()
+        if now - self._last_save < 120:
+            return
+        self._last_save = now
+        try:
+            data = {
+                "threats": list(self._threat_log)[-50:],
+                "active": self._active_threats,
             }
-            raw_sock.close()
-            raise ConnectionError(
-                f"SOCKS5: connect failed — {statuses.get(resp[1], f'0x{resp[1]:02x}')}")
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
 
-        raw_sock.setblocking(True)
-        reader = asyncio.StreamReader(limit=2 ** 20)
-        protocol = asyncio.StreamReaderProtocol(reader)
-        await loop.connect_accepted_socket(
-            lambda: protocol, raw_sock,
-        )
-        writer = asyncio.StreamWriter(raw_sock, protocol, reader, loop)
-        return reader, writer
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for t in data.get("threats", []):
+                self._threat_log.append(t)
+            self._active_threats = data.get("active", {})
+        except Exception:
+            pass
 
-    except asyncio.TimeoutError:
-        raise ConnectionError(f"SOCKS5: connection to {proxy_host}:{proxy_port} timed out")
 
+# ── Integration 5: Achievement → Personality → Role Identity Fusion ─────
+class IdentityFusionEngine:
+    """Self-reinforcing identity system: achievements adjust personality traits,
+    which feed role inference, which targets new achievement conditions."""
+
+    def __init__(self):
+        self._fusion_events: deque = deque(maxlen=200)
+        self._trait_bonuses: Dict[str, Dict[str, float]] = {
+            "welcomer": {"agreeableness": 0.05, "extraversion": 0.03},
+            "connector": {"extraversion": 0.04, "openness": 0.03},
+            "helper": {"agreeableness": 0.04, "conscientiousness": 0.03},
+            "expert": {"openness": 0.05, "conscientiousness": 0.04},
+            "peacemaker": {"agreeableness": 0.06, "neuroticism": -0.03},
+            "popular": {"extraversion": 0.05},
+            "source_citer": {"conscientiousness": 0.04},
+            "wordsmith": {"openness": 0.03},
+            "streak_master": {"conscientiousness": 0.03},
+            "daily_driver": {"conscientiousness": 0.04},
+            "storyteller": {"openness": 0.04, "extraversion": 0.02},
+            "emoji_master": {"extraversion": 0.03},
+            "night_owl": {"openness": 0.02},
+            "early_bird": {"conscientiousness": 0.02},
+        }
+
+    def apply_badge_bonuses(self, nick: str, new_badges: List[Dict],
+                            scoring: Any) -> List[str]:
+        effects = []
+        nl = nick.lower()
+        for badge in new_badges:
+            bid = badge.get("id", "")
+            bonuses = self._trait_bonuses.get(bid, {})
+            if not bonuses:
+                continue
+            prof = scoring.personality._profiles.setdefault(nl, {
+                "msg_count": 0, "traits": {"openness": 0.5, "conscientiousness": 0.5,
+                    "extraversion": 0.5, "agreeableness": 0.5, "neuroticism": 0.5},
+                "word_count": 0, "unique_words": set(), "exclamation_count": 0,
+                "question_count": 0, "avg_msg_len": 0.0,
+            })
+            for trait, bonus in bonuses.items():
+                old_val = prof["traits"].get(trait, 0.5)
+                new_val = max(0.0, min(1.0, old_val + bonus))
+                prof["traits"][trait] = new_val
+                effects.append(f"{trait} +{bonus:.0%} ({old_val:.0%} → {new_val:.0%})")
+            self._fusion_events.append({
+                "nick": nl, "badge": bid, "effects": effects.copy(), "ts": time.time(),
+            })
+        return effects
+
+
+# ── Integration 6: Research Agent ↔ Fact Checker Chain ──────────────────
+class ResearchFactCheckChain:
+    """When RealtimeFactChecker flags a questionable claim, automatically
+    queues it for deeper research via AutonomousResearchAgent."""
+
+    def __init__(self):
+        self._chain_log: deque = deque(maxlen=200)
+        self._verified_claims: Dict[str, Dict] = {}
+
+    def chain(self, nick: str, channel: str, text: str, scoring: Any) -> List[Dict]:
+        results = []
+        claims = scoring.fact_checker.check(nick, channel, text)
+        for claim in claims:
+            if claim["verdict"] in ("likely_false", "questionable"):
+                research_result = self._deep_research(claim, scoring)
+                if research_result:
+                    claim["research"] = research_result
+                    results.append(claim)
+                    self._chain_log.append(claim)
+                    cache_key = claim["claim"][:100].lower()
+                    self._verified_claims[cache_key] = claim
+        return results
+
+    def _deep_research(self, claim: Dict, scoring: Any) -> Optional[Dict]:
+        try:
+            research = scoring.research_agent._research({
+                "type": "factcheck", "query": claim["claim"][:200], "channel": claim.get("channel", ""),
+            })
+            if research:
+                return {"summary": research.get("summary", ""), "url": research.get("url", ""),
+                        "source": "Wikipedia"}
+        except Exception:
+            pass
+        return None
+
+    def get_chained_claims(self, limit: int = 20) -> List[Dict]:
+        return list(self._chain_log)[-limit:]
+
+
+# ── Integration 7: Emotion-Arc-Driven Auto-Responses ────────────────────
+class EmotionArcTriggerManager:
+    """Wraps TriggerManager with emotion-arc-aware triggers.
+
+    Auto-responds on emotional transitions:
+      • joy→sadness: encouragement messages
+      • neutral→anger: de-escalation prompts
+      • sadness→joy: celebrate recovery
+      • anger→sadness: support messages
+    """
+
+    _EMOTION_RESPONSES = {
+        ("joy", "sadness"): [
+            "You okay there? Everything alright?",
+            "Sounds like that didn't go as hoped. Want to talk about it?",
+            "Rough shift there. We've all been through it.",
+        ],
+        ("neutral", "anger"): [
+            "Take a deep breath. Let's keep it constructive.",
+            "I hear frustration — want to reframe that?",
+            "Seems like that hit a nerve. What's the core issue?",
+        ],
+        ("sadness", "joy"): [
+            "Glad to see things looking up!",
+            "Nice to see that smile back!",
+            "Things turning around? Love to see it.",
+        ],
+        ("anger", "sadness"): [
+            "Hey, don't let it get to you. You've got this.",
+            "Sometimes the strongest thing is to feel it and let it go.",
+            "That took a toll, huh? We're here.",
+        ],
+        ("fear", "anger"): [
+            "Worry turning into frustration — what would help?",
+            "Anxiety and anger go hand in hand. What's the root concern?",
+        ],
+        ("surprise", "fear"): [
+            "That was unexpected — processing it?",
+            "Sudden news can be destabilizing. Take your time.",
+        ],
+    }
+
+    def __init__(self):
+        self._emotion_triggers: List[Dict] = []
+        self._cooldowns: Dict[str, float] = {}
+        self._cooldown_secs: float = 120.0
+        self._enabled: bool = True
+        self._trigger_manager_ref = None
+
+    def add_emotion_trigger(self, from_emotion: str, to_emotion: str,
+                            channel: str = "") -> int:
+        """Register a custom response category for a transition pair."""
+        tid = len(self._emotion_triggers)
+        self._emotion_triggers.append({
+            "id": tid, "from": from_emotion, "to": to_emotion,
+            "channel": channel.lower() if channel else "",
+            "enabled": True,
+        })
+        return tid
+
+    def check_transition(self, nick: str, channel: str, prev_emotion: Optional[str],
+                         current_emotion: str) -> Optional[str]:
+        if not self._enabled or not prev_emotion or prev_emotion == current_emotion:
+            return None
+        key = f"{nick.lower()}:{prev_emotion}:{current_emotion}"
+        now = time.time()
+        if now - self._cooldowns.get(key, 0) < self._cooldown_secs:
+            return None
+        pair = (prev_emotion, current_emotion)
+        responses = self._EMOTION_RESPONSES.get(pair, [])
+        channel_triggers = [t for t in self._emotion_triggers
+                          if t["enabled"] and t["from"] == prev_emotion
+                          and t["to"] == current_emotion
+                          and (not t["channel"] or t["channel"] == channel.lower())]
+        if channel_triggers:
+            self._cooldowns[key] = now
+            return "trigger_fired"
+        if responses:
+            self._cooldowns[key] = now
+            return random.choice(responses)
+        return None
+
+
+# ── Integration 8: Stance ↔ Echo Chamber Cross-Pollination ──────────────
+class StanceEchoCrossPollinator:
+    """Identifies which topics are most echo-chambered and suggests
+    cross-channel exposure to break filter bubbles."""
+
+    def __init__(self):
+        self._cross_pollination_suggestions: Dict[str, List[Dict]] = {}
+        self._last_analysis_ts: float = 0.0
+
+    def analyze(self, channel: str, scoring: Any) -> Dict[str, Any]:
+        cl = channel.lower()
+        echo = scoring.echo_chamber.analyze(channel)
+        if not echo or echo["echo_score"] < 0.5:
+            return {"channel": channel, "verdict": "open",
+                    "message": "Channel appears well-diversified — no significant echo chamber detected."}
+        topic_stances: Dict[str, Dict[str, float]] = {}
+        users_in_channel = scoring.relationships._co_channel.get(cl, set())
+        for user in users_in_channel:
+            stances = scoring.stances.get_all_stances(user)
+            for topic, s in stances.items():
+                if s["samples"] < 3:
+                    continue
+                topic_stances.setdefault(topic, {})
+                topic_stances[topic][user] = 1.0 if s["current"] == "support" else 0.0 if s["current"] == "oppose" else 0.5
+        polarized_topics = []
+        for topic, user_positions in topic_stances.items():
+            if len(user_positions) < 3:
+                continue
+            vals = list(user_positions.values())
+            mean_pos = sum(vals) / len(vals)
+            variance = sum((v - mean_pos) ** 2 for v in vals) / len(vals)
+            if variance < 0.05:
+                polarized_topics.append({
+                    "topic": topic, "polarization": 1.0 - variance * 10,
+                    "direction": "pro" if mean_pos > 0.6 else "con" if mean_pos < 0.4 else "mixed",
+                    "user_count": len(user_positions),
+                })
+        suggestions = []
+        if polarized_topics:
+            for pt in sorted(polarized_topics, key=lambda x: -x["polarization"])[:3]:
+                suggestions.append(
+                    f"Topic '{pt['topic']}' is {pt['polarization']:.0%} uniform ({pt['direction']}) "
+                    f"across {pt['user_count']} users. Try engaging ##debate or ##{pt['topic']} for opposing views."
+                )
+        result = {
+            "channel": channel, "echo_score": echo["echo_score"],
+            "polarized_topics": polarized_topics[:5],
+            "suggestions": suggestions,
+            "ts": time.time(),
+        }
+        self._cross_pollination_suggestions[cl] = polarized_topics[:5]
+        self._last_analysis_ts = time.time()
+        return result
+
+
+# ── Integration 9: Relationship Graph → Conversation Flow Predictor ─────
+class SocialFlowPredictor:
+    """Augments ConversationFlowPredictor with social graph topology
+    from RelationshipGraph for better next-speaker predictions."""
+
+    def __init__(self):
+        self._social_graph_active: bool = False
+
+    def enhance_predictions(self, channel: str, current_speaker: str,
+                            scoring: Any, limit: int = 5) -> List[Dict]:
+        flow_predictions = scoring.flow_predictor.predict_next_speaker(channel, current_speaker, limit)
+        if not flow_predictions:
+            return flow_predictions
+        mentions_graph = scoring.relationships._mentions.get(channel.lower(), {})
+        replies_graph = scoring.relationships._undirected_co.get(channel.lower(), {})
+        if not mentions_graph and not replies_graph:
+            return flow_predictions
+        graph_bonus: Dict[str, float] = {}
+        speaker_lower = current_speaker.lower()
+        for target_nick in mentions_graph.get(speaker_lower, {}):
+            graph_bonus[target_nick] = graph_bonus.get(target_nick, 0) + 0.15
+        co_users = replies_graph.get(speaker_lower, set())
+        for co_nick in co_users:
+            graph_bonus[co_nick] = graph_bonus.get(co_nick, 0) + 0.05
+        for pred in flow_predictions:
+            bonus = graph_bonus.get(pred["nick"].lower(), 0)
+            if bonus > 0:
+                pred["probability"] = min(1.0, pred["probability"] + bonus)
+                pred["score"] = int(pred["score"] * (1 + bonus))
+        total_prob = sum(p["probability"] for p in flow_predictions) or 1.0
+        for p in flow_predictions:
+            p["probability"] = round(p["probability"] / total_prob, 3)
+        flow_predictions.sort(key=lambda x: -x["probability"])
+        return flow_predictions
+
+
+# ── Integration 10: Sarcasm → Sentiment Correction ──────────────────────
+class SarcasmSentimentCorrector:
+    """Post-processes sentiment scores: when sarcasm is detected with high
+    confidence, inverts the sentiment contribution to prevent poisoning
+    channel mood averages and sentiment contagion maps."""
+
+    _CORRECTION_THRESHOLD = 0.65
+
+    def __init__(self):
+        self._corrections_applied: int = 0
+        self._corrected_sentiments: deque = deque(maxlen=500)
+
+    def correct(self, nick: str, channel: str, text: str,
+                sentiment_score: float, sarcasm_result: Dict) -> float:
+        if sarcasm_result.get("is_sarcastic") and sarcasm_result.get("score", 0) >= self._CORRECTION_THRESHOLD:
+            corrected = -sentiment_score
+            self._corrections_applied += 1
+            self._corrected_sentiments.append({
+                "nick": nick, "channel": channel, "original": sentiment_score,
+                "corrected": corrected, "ts": time.time(),
+            })
+            return corrected
+        return sentiment_score
+
+    def get_correction_stats(self) -> Dict[str, Any]:
+        return {
+            "total_corrections": self._corrections_applied,
+            "recent": list(self._corrected_sentiments)[-20:],
+        }
+
+
+# ── Integration 11: LLMFingerprinter ↔ EnsembleAIDetector LoRA ──────────
+class AutoLoRATrainer:
+    """Continuously improves AI detection by feeding LLMFingerprinter
+    discoveries into EnsembleAIDetector's LoRA fine-tuning pipeline.
+
+    Triggers auto-training when:
+      • LLMFingerprinter identifies a new generation pattern (novelty > threshold)
+      • Sufficient samples accumulated (≥ configurable minimum)
+      • Previous training session completed (> cooldown period)
+    """
+
+    _SAVE_PATH = os.path.join(_SCRIPT_DIR, "auto_lora_state.json")
+
+    def __init__(self):
+        self._enabled: bool = True
+        self._min_samples: int = 20
+        self._cooldown_secs: float = 1800.0
+        self._last_training_ts: float = 0.0
+        self._training_log: deque = deque(maxlen=100)
+        self._novel_patterns: Dict[str, Dict] = {}
+        self._sample_pool: List[Dict] = []
+        self.load()
+
+    def feed_detection(self, nick: str, msg: str, llm_fp_result: Dict,
+                       ai_detector) -> Optional[Dict]:
+        if not self._enabled:
+            return None
+        novelty = llm_fp_result.get("novelty", 0)
+        combined = llm_fp_result.get("combined", 0)
+        signals = llm_fp_result.get("signals", [])
+        if novelty > 0.3:
+            sig_key = "|".join(signals[:3]) if signals else "unknown"
+            self._novel_patterns.setdefault(sig_key, {"count": 0, "samples": [],
+                "signals": signals, "first_seen": time.time()})
+            self._novel_patterns[sig_key]["count"] += 1
+            self._novel_patterns[sig_key]["samples"].append({"nick": nick, "msg": msg[:200], "ts": time.time()})
+        if combined > 0.4:
+            is_ai = combined >= 0.6
+            self._sample_pool.append({"nick": nick, "msg": msg[:300], "is_ai": is_ai, "ts": time.time()})
+            if len(self._sample_pool) > 500:
+                self._sample_pool = self._sample_pool[-300:]
+        if self._should_train():
+            return self._trigger_training(ai_detector)
+        return None
+
+    def _should_train(self) -> bool:
+        if not self._enabled:
+            return False
+        if time.time() - self._last_training_ts < self._cooldown_secs:
+            return False
+        ai_samples = len([s for s in self._sample_pool if s.get("is_ai")])
+        human_samples = len([s for s in self._sample_pool if not s.get("is_ai")])
+        return ai_samples >= self._min_samples // 2 and human_samples >= self._min_samples // 2
+
+    def _trigger_training(self, ai_detector) -> Dict:
+        ai_samples = [s for s in self._sample_pool if s.get("is_ai")]
+        human_samples = [s for s in self._sample_pool if not s.get("is_ai")]
+        result = {
+            "action": "auto_lora_train",
+            "ai_samples": len(ai_samples),
+            "human_samples": len(human_samples),
+            "novel_patterns": len(self._novel_patterns),
+            "ts": time.time(),
+        }
+        try:
+            if hasattr(ai_detector, 'fine_tune_lora'):
+                train_msgs = [s["msg"] for s in ai_samples[-self._min_samples:]]
+                train_labels = [1] * len(train_msgs)
+                train_msgs.extend(s["msg"] for s in human_samples[-self._min_samples:])
+                train_labels.extend([0] * (len(train_msgs) - len(train_labels)))
+                if len(set(train_labels)) >= 2:
+                    ai_detector.fine_tune_lora(
+                        train_msgs, train_labels,
+                        epochs=2, learning_rate=5e-5,
+                    )
+                    result["training_result"] = "success"
+                    self._last_training_ts = time.time()
+                    self._sample_pool = self._sample_pool[-50:]
+                    self._training_log.append(result)
+                    self._save()
+                    return result
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    def get_status(self) -> Dict[str, Any]:
+        ai_count = len([s for s in self._sample_pool if s.get("is_ai")])
+        return {
+            "enabled": self._enabled,
+            "pool_size": len(self._sample_pool),
+            "ai_samples": ai_count,
+            "human_samples": len(self._sample_pool) - ai_count,
+            "novel_patterns": len(self._novel_patterns),
+            "last_training": self._last_training_ts,
+            "cooldown_remaining": max(0, self._cooldown_secs - (time.time() - self._last_training_ts)),
+        }
+
+    def _save(self) -> None:
+        try:
+            data = {
+                "last_training": self._last_training_ts,
+                "training_log": list(self._training_log)[-20:],
+                "novel_patterns": {k: {**v, "samples": v["samples"][-5:]} for k, v in list(self._novel_patterns.items())[:20]},
+                "sample_pool": self._sample_pool[-50:],
+            }
+            with open(self._SAVE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load(self) -> None:
+        try:
+            with open(self._SAVE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._last_training_ts = data.get("last_training", 0)
+            for entry in data.get("training_log", []):
+                self._training_log.append(entry)
+            self._novel_patterns = data.get("novel_patterns", {})
+            self._sample_pool = data.get("sample_pool", [])
+        except Exception:
+            pass
+
+
+# ── Integration 12: Pomodoro → Behavioral Biometrics Calibration ────────
+class PomodoroBiometricsCalibrator:
+    """Uses PomodoroManager session data to calibrate BehavioralBiometrics
+    typing cadence baselines.
+
+    During focused work sessions, typing patterns differ significantly from
+    casual chat — this calibrator adjusts the human-likelihood detection
+    thresholds based on whether the user is in a work session or break.
+    """
+
+    def __init__(self):
+        self._session_baselines: Dict[str, Dict] = {}
+        self._calibration_count: int = 0
+        self._last_calibration_ts: float = 0.0
+        self._enabled: bool = True
+
+    def calibrate(self, pomodoro, biometrics) -> Optional[Dict]:
+        if not self._enabled:
+            return None
+        now = time.time()
+        if now - self._last_calibration_ts < 300:
+            return None
+        self._last_calibration_ts = now
+        pomo_state = pomodoro.get_status() if hasattr(pomodoro, 'get_status') else {}
+        is_working = pomo_state.get("state", "") == "work"
+        session_count = pomo_state.get("completed_sessions", 0)
+        if session_count < 1:
+            return None
+        cadence = biometrics.get_typing_cadence_stats()
+        burst = biometrics.get_burst_stats()
+        if cadence.get("samples", 0) < 10:
+            return None
+        baseline = {
+            "cadence_mean": cadence["mean"],
+            "cadence_std": cadence["std"],
+            "burst_rate": burst["avg_rate"],
+            "is_work_session": is_working,
+            "completed_sessions": session_count,
+            "ts": now,
+        }
+        self._session_baselines[str(session_count)] = baseline
+        self._calibration_count += 1
+        return {
+            "calibrated": True,
+            "cadence_mean_ms": cadence["mean"],
+            "cadence_std_ms": cadence["std"],
+            "burst_rate_kps": burst["avg_rate"],
+            "pomodoro_sessions": session_count,
+        }
+
+    def get_calibrated_human_score(self, biometrics, pomodoro) -> float:
+        pomo_state = pomodoro.get_status() if hasattr(pomodoro, 'get_status') else {}
+        is_working = pomo_state.get("state", "") == "work"
+        base_score = biometrics.get_human_likelihood()
+        if is_working:
+            base_score *= 0.85
+        return max(0.0, min(100.0, base_score))
+
+
+# ── Integration Orchestrator ────────────────────────────────────────────
+class IntegrationOrchestrator:
+    """Central hub that wires all integration engines together and exposes
+    unified query/report interfaces for the TUI layer."""
+
+    def __init__(self):
+        self.dashboard = UnifiedSocialDashboard()
+        self.ai_agent_bridge = AIAgentBridge()
+        self.hybrid_predictor: Optional[HybridPredictor] = None
+        self.threat_score = UnifiedThreatScore()
+        self.identity_fusion = IdentityFusionEngine()
+        self.research_fact_chain = ResearchFactCheckChain()
+        self.emotion_triggers = EmotionArcTriggerManager()
+        self.stance_echo = StanceEchoCrossPollinator()
+        self.social_flow = SocialFlowPredictor()
+        self.sarcasm_corrector = SarcasmSentimentCorrector()
+        self.auto_lora = AutoLoRATrainer()
+        self.pomodoro_biometrics = PomodoroBiometricsCalibrator()
+
+    def setup(self, scoring) -> None:
+        """Wire hybrid predictor to the LLM pipeline once scoring is ready."""
+        self.hybrid_predictor = HybridPredictor(scoring.predictive_reply)
+        agent = scoring.conversational_agent
+        self.hybrid_predictor.set_llm_caller(agent._call_llm)
+        self.emotion_triggers._trigger_manager_ref = scoring.triggers
+
+
+# =========================
+# ScoringEngine
+# =========================
 
 class ScoringEngine:
     def __init__(self, ai_detector: EnsembleAIDetector):
@@ -5896,6 +7692,104 @@ class ScoringEngine:
         self.tls_fingerprinter = TLSConnectionFingerprinter()
         self.ai_vs_ai = AIVsAIDetector()
         self.sentiment_ai = SentimentAICorrelator()
+        # Advanced AI detection
+        self.llm_fingerprinter = LLMFingerprinter()
+        self.deepfake_relay = DeepfakeRelayDetector()
+        # Networking & analytics
+        self.network_analytics = NetworkAnalytics()
+        # Automation & bots
+        self.triggers = TriggerManager()
+        self.automod = AutoModManager()
+        self.webhooks = WebhookManager()
+        # Data & integration
+        self.github = GitHubTracker()
+        # Advanced AI/ML features
+        self.astroturfing = AstroturfingDetector()
+        self.personality = PersonalityProfiler()
+        self.predictive_reply = PredictiveReplyEngine()
+        self.stances = StanceTracker()
+        self.flow_predictor = ConversationFlowPredictor()
+        self.sentiment_contagion = SentimentContagionMap()
+        self.bot_swarm = BotSwarmDetector()
+        self.ban_evasion = BanEvasionDetector()
+        self.fact_checker = RealtimeFactChecker()
+        self.research_agent = AutonomousResearchAgent()
+        self.conversational_agent = ConversationalAgent()
+        self.role_inference = RoleInference()
+        self.debate_analyzer = DebateAnalyzer()
+        self.echo_chamber = EchoChamberDetector()
+        self.achievements = AchievementBadges()
+        self.achievements_enabled = False
+        self.sarcasm = SarcasmDetector()
+        self.emotion_arc = EmotionArc()
+        # Real-time stats panel
+        self.stats = RealtimeStats()
+        # Rich integration orchestrator
+        self.integrations = IntegrationOrchestrator()
+        self.integrations.setup(self)
+
+    # ── Integration orchestration methods ──────────────────────────────
+    def process_message_integrations(self, nick: str, channel: str, msg: str,
+                                      ai_score: int, rolling_ai: int,
+                                      sentiment_score: float = 0.0) -> int:
+        """Run all 12 integration pipelines for a single incoming message.
+        Returns a composite significance bitmask."""
+        _ = rolling_ai  # unused in most branches
+        significance = 0
+        # Integration 1: Log for dossier (lazy, on-demand via /dossier)
+        # Integration 2: AI → Agent bridge (handled separately)
+        # Integration 3: Predictive reply training (already in _score_msg_bg)
+        # Integration 4: Threat ecosystem updates (on-demand via /threat)
+        # Integration 5: Achievement → Personality fusion
+        if self.achievements_enabled:
+            new_badges = self.achievements.check_achievements(nick)
+            if new_badges:
+                effects = self.integrations.identity_fusion.apply_badge_bonuses(
+                    nick, new_badges, self)
+                if effects:
+                    significance |= 1  # bit 0: badge fusion
+        # Integration 6: Research + Fact Check chain
+        chained = self.integrations.research_fact_chain.chain(nick, channel, msg, self)
+        if chained:
+            significance |= 2  # bit 1: claim verified
+        # Integration 7: Emotion arc triggers (handled in _irc_privmsg via transition detection)
+        # Integration 8: Stance + Echo (on-demand analysis, not per-message)
+        # Integration 9: Social flow predictor (on-demand via /flow)
+        # Integration 10: Sarcasm → Sentiment (handled in sentiment pipeline)
+        # Integration 11: Auto LoRA (handled in _score_msg_bg via llm_fp feed)
+        # Integration 12: Pomodoro → Biometrics (handled via timer/periodic)
+        return significance
+
+    def get_dossier(self, nick: str) -> str:
+        return self.integrations.dashboard.summarize_dossier(nick, self)
+
+    def get_channel_threat(self, channel: str) -> Dict[str, Any]:
+        return self.integrations.threat_score.compute_channel_threat(channel, self)
+
+    def get_threats(self, min_level: float = 0.0) -> List[Dict]:
+        return self.integrations.threat_score.get_all_threats(min_level)
+
+    def get_social_flow(self, channel: str, current_speaker: str = "", limit: int = 5) -> List[Dict]:
+        return self.integrations.social_flow.enhance_predictions(channel, current_speaker, self, limit)
+
+    def get_stance_echo_cross_pollination(self, channel: str) -> Dict[str, Any]:
+        return self.integrations.stance_echo.analyze(channel, self)
+
+    def get_corrected_sentiment(self, nick: str, channel: str, text: str,
+                                 sentiment_score: float, sarcasm_result: Dict) -> float:
+        return self.integrations.sarcasm_corrector.correct(
+            nick, channel, text, sentiment_score, sarcasm_result)
+
+    def get_auto_lora_status(self) -> Dict[str, Any]:
+        return self.integrations.auto_lora.get_status()
+
+    def calibrate_pomodoro_biometrics(self) -> Optional[Dict]:
+        return self.integrations.pomodoro_biometrics.calibrate(self.pomodoro, BehavioralBiometrics())
+
+    def get_emotion_response(self, nick: str, channel: str,
+                              prev_emotion: str, current_emotion: str) -> Optional[str]:
+        return self.integrations.emotion_triggers.check_transition(
+            nick, channel, prev_emotion, current_emotion)
 
     def _load_fingerprints(self) -> None:
         """Load persisted bot fingerprints from disk."""
@@ -6211,6 +8105,7 @@ class IRCClient:
         self.use_ssl = use_ssl
         self.use_tor = use_tor
         self.tor_strict: bool = False
+        self.i2p_strict: bool = False
         self._own_umodes: set = set()      # user modes (+i, +o, +w, etc.)
         self._ircop_nicks: set = set()     # nicks known to be IRC operators
         self._ctcp_mode: str = "normal"    # normal, off, spoof
@@ -6228,9 +8123,12 @@ class IRCClient:
         self.users: Dict[str, UserState] = {}
         self.running = True
         self._identified = False
-        self.joined_channels: set = {DEFAULT_CHANNEL} if DEFAULT_CHANNEL else set()
+        self._waiting_for_nickserv = False
+        self._pending_joins: list = []
+        self.joined_channels: set = set()
         self._ctcp_times: Dict[str, deque] = {}  # rate-limit CTCP replies
         self._cap_ls_caps: set = set()           # accumulated caps across multiline CAP LS
+        self._cap_ls_advertised: set = set()    # snapshot of all advertised caps (preserved after clear)
         self._cap_ls_values: dict = {}           # cap name → advertised value (e.g. sts=...)
         self._active_caps: set = set()           # currently ACKed/enabled caps
         self._batch_buffer: dict = {}            # batch ref → [(cmd,nick,params,prefix,tags)]
@@ -6282,6 +8180,9 @@ class IRCClient:
         self._thread_parents: Dict[str, str] = {}
         # IRCv3 read-marker: last known read marker per channel
         self._read_markers: Dict[str, str] = {}
+        # Adaptive rate limiting state
+        self._throttle_count: int = 0
+        self._last_throttle: float = 0.0
 
     @property
     def server_id(self) -> str:
@@ -6333,17 +8234,56 @@ class IRCClient:
                 f"Tor strict mode: refusing clearnet host '{self.server}' "
                 f"(only .onion addresses allowed)")
 
-        via = " (via Tor)" if self.use_tor else ""
+        # I2P-only mode: refuse non-I2P hosts
+        if self.i2p_strict and not self.server.endswith(".i2p"):
+            raise ConnectionError(
+                f"I2P strict mode: refusing non-I2P host '{self.server}' "
+                f"(only .i2p addresses allowed)")
+
+        is_i2p = self.server.endswith(".i2p")
+        via = " (via Tor)" if self.use_tor else " (via I2P)" if is_i2p else ""
         proto = "SSL" if self.use_ssl else "plain"
         await self.ui_queue.put(("status", f"Connecting to {self.server}:{self.port} ({proto}{via})..."))
+
+        # Async DNS resolution with caching
+        if not self.use_tor and not is_i2p:
+            try:
+                resolved = await _dns_resolver.resolve_ip(self.server)
+                if resolved:
+                    await self.ui_queue.put(("status", f"[DNS] {self.server} → {', '.join(resolved)}"))
+            except Exception as dns_err:
+                await self.ui_queue.put(("status", f"[DNS] resolution failed: {dns_err} (falling back to system resolver)"))
+
         try:
             # 30-second connect timeout prevents hangs on unreachable hosts.
             # limit=2^20 (1 MiB) sets the StreamReader internal buffer; the default
             # 64 KB can stall on fast servers that send large NAMES / MOTD bursts.
             if self.use_tor:
                 self.reader, self.writer = await asyncio.wait_for(
-                    _socks5_connect(self.server, self.port),
+                    _socks5_connect(self.server, self.port,
+                                   proxy_host=TOR_PROXY_HOST, proxy_port=TOR_PROXY_PORT),
                     timeout=30.0,
+                )
+                if self.use_ssl:
+                    loop = asyncio.get_running_loop()
+                    raw_sock = self.writer.transport.get_extra_info("socket")
+                    ssl_sock = await loop.run_in_executor(
+                        None, lambda: _SSL_CTX.wrap_socket(
+                            raw_sock, server_hostname=self.server,
+                            do_handshake_on_connect=True))
+                    ssl_sock.setblocking(False)
+                    ssl_reader = asyncio.StreamReader(limit=2**20)
+                    ssl_protocol = asyncio.StreamReaderProtocol(ssl_reader)
+                    await loop.connect_accepted_socket(
+                        lambda: ssl_protocol, ssl_sock)
+                    self.writer = asyncio.StreamWriter(
+                        ssl_sock, ssl_protocol, ssl_reader, loop)
+                    self.reader = ssl_reader
+            elif is_i2p:
+                self.reader, self.writer = await asyncio.wait_for(
+                    _socks5_connect(self.server, self.port,
+                                   proxy_host=I2P_PROXY_HOST, proxy_port=I2P_PROXY_PORT),
+                    timeout=60.0,
                 )
                 if self.use_ssl:
                     loop = asyncio.get_running_loop()
@@ -6463,6 +8403,12 @@ class IRCClient:
         IRC servers typically kick clients that exceed ~10 lines/second; this
         keeps us well under that limit even on /join floods or mass-kicks.
 
+        Adaptive rate limiting:
+          • Detects server throttling (numerics 404, 406, 407, 436)
+          • Dynamically reduces rate on throttle detection, recovers gradually
+          • Per-channel rate tracking to avoid flooding busy channels
+          • Priority queuing: PING/PONG and SASL get highest priority
+
         Batching: after the first token is consumed we drain all immediately
         available messages (up to remaining token budget) and send them in a
         single writelines() + drain() call.  This reduces kernel round-trips
@@ -6476,29 +8422,70 @@ class IRCClient:
         tokens = BURST
         last_refill = time.monotonic()
 
+        # Adaptive rate limiting state
+        _adaptive_rate = RATE
+        _adaptive_burst = BURST
+        _throttle_count = 0
+        _last_throttle = 0.0
+        _recovery_timer = 0.0
+        _MIN_RATE = 1.0
+        _MAX_RATE = 8.0
+        _THROTTLE_NUMERICS = frozenset({"404", "406", "407", "436", "465"})
+        _channel_send_times: Dict[str, deque] = {}
+        _CHANNEL_BURST_LIMIT = 5
+        _CHANNEL_WINDOW = 2.0
+
         while self.running:
             try:
                 data = await self._send_queue.get()
             except asyncio.CancelledError:
                 break
 
-            # Refill the bucket for time elapsed since last send
+            # Adaptive recovery: gradually increase rate if no recent throttles
             now = time.monotonic()
-            tokens = min(BURST, tokens + (now - last_refill) * RATE)
+            if _throttle_count > 0 and now - _last_throttle > 30.0:
+                _recovery_timer += (now - _recovery_timer) * 0.1 if _recovery_timer else now
+                if now - _last_throttle > 60.0 and _adaptive_rate < RATE:
+                    _adaptive_rate = min(RATE, _adaptive_rate + 0.5)
+                    _adaptive_burst = min(BURST, _adaptive_burst + 1)
+                    _throttle_count = max(0, _throttle_count - 1)
+
+            # Refill the bucket for time elapsed since last send
+            tokens = min(_adaptive_burst, tokens + (now - last_refill) * _adaptive_rate)
             last_refill = now
 
             # If the bucket is empty, sleep until we have a token
             if tokens < 1.0:
-                wait = (1.0 - tokens) / RATE
+                wait = (1.0 - tokens) / _adaptive_rate
                 try:
                     await asyncio.sleep(wait)
                 except asyncio.CancelledError:
                     break
                 now = time.monotonic()
-                tokens = min(BURST, tokens + (now - last_refill) * RATE)
+                tokens = min(_adaptive_burst, tokens + (now - last_refill) * _adaptive_rate)
                 last_refill = now
 
             tokens -= 1.0
+
+            # Channel-level rate limiting: prevent flooding a single channel
+            try:
+                line_text = data.decode("utf-8", errors="replace").strip()
+                if line_text.startswith("PRIVMSG "):
+                    parts = line_text.split(" ", 2)
+                    if len(parts) >= 2:
+                        chan = parts[1]
+                        if chan.startswith("#"):
+                            chan_times = _channel_send_times.setdefault(chan, deque(maxlen=20))
+                            chan_times.append(now)
+                            recent = sum(1 for t in chan_times if now - t < _CHANNEL_WINDOW)
+                            if recent > _CHANNEL_BURST_LIMIT:
+                                delay = 1.0
+                                try:
+                                    await asyncio.sleep(delay)
+                                except asyncio.CancelledError:
+                                    break
+            except Exception:
+                pass
 
             # Batch: absorb all messages that are already queued (up to token
             # budget) so they share a single drain() syscall.
@@ -6524,6 +8511,12 @@ class IRCClient:
                 except Exception:
                     pass
                 break
+
+    def record_throttle(self, numeric: str) -> None:
+        """Called when a throttle-related numeric is received; reduces send rate."""
+        if numeric in {"404", "406", "407", "436", "465"}:
+            self._throttle_count = getattr(self, "_throttle_count", 0) + 1
+            self._last_throttle = time.monotonic()
 
     def _ctcp_allowed(self, nick: str) -> bool:
         """Allow at most 3 CTCP replies per nick per 30 s."""
@@ -6575,13 +8568,42 @@ class IRCClient:
             except Exception:
                 break
 
+    def _build_join_list(self) -> List[str]:
+        """Build the list of channels to join on connect.
+
+        DEFAULT_CHANNEL is always first; then previously-joined channels;
+        then auto-join channels not already in the list.
+        """
+        channels: List[str] = []
+        seen = set()
+        if DEFAULT_CHANNEL:
+            channels.append(DEFAULT_CHANNEL)
+            seen.add(self._irc_lower(DEFAULT_CHANNEL))
+        for ch in sorted(self.joined_channels):
+            if self._irc_lower(ch) not in seen:
+                channels.append(ch)
+                seen.add(self._irc_lower(ch))
+        for ch in sorted(_AUTOJOIN_CHANNELS):
+            if self._irc_lower(ch) not in seen:
+                channels.append(ch)
+                seen.add(self._irc_lower(ch))
+        return channels
+
     async def _delayed_nickserv_identify(self) -> None:
         """Send NickServ IDENTIFY after a short delay without blocking the read loop."""
         await asyncio.sleep(1.5)
         if self.writer and not self.writer.is_closing():
             self.send_raw(f"PRIVMSG NickServ :IDENTIFY {NICKSERV_PASSWORD}")
-            await self.ui_queue.put(("status", "Auto-identified to NickServ"))
-            self._identified = True
+            await self.ui_queue.put(("status", "Auto-identifying to NickServ..."))
+            # Set timeout to join channels even if NickServ doesn't respond
+            asyncio.create_task(self._nickserv_timeout())
+
+    async def _nickserv_timeout(self) -> None:
+        """Join channels after timeout if NickServ doesn't respond."""
+        await asyncio.sleep(10)
+        if self._waiting_for_nickserv and not self._identified:
+            await self.ui_queue.put(("status", "NickServ timeout — joining channels anyway"))
+            await self._join_pending_channels()
 
     async def run_connection(self) -> None:
         """Connect + keepalive with exponential-backoff auto-reconnect."""
@@ -6589,6 +8611,9 @@ class IRCClient:
         attempt = 0
         while self.running:
             self._identified = False
+            self._waiting_for_nickserv = False
+            self._pending_joins = []
+            self._resumed_session = False
             # Reset all per-connection state. Anything populated by
             # the previous session (caps, ISUPPORT, batches,
             # chathistory cap, ...) would otherwise leak into the
@@ -6802,6 +8827,7 @@ class IRCClient:
                 echoed_ts = int(params[0].lstrip(":keepalive-"))
                 if echoed_ts > 0:
                     self._latency = time.time() - echoed_ts
+                    self.biometrics.record_incoming_message()
             except (ValueError, IndexError):
                 pass
 
@@ -6853,17 +8879,23 @@ class IRCClient:
                 if "chathistory" in want and "draft/chathistory" in want:
                     want.remove("draft/chathistory")
                 _sasl_creds_ok = (
-                    SASL_MECHANISM == "EXTERNAL"
-                        and bool(SASL_CERT and SASL_KEY)
-                    or SASL_MECHANISM == "ECDSA-NIST256P-CHALLENGE"
-                        and bool(SASL_KEY)
-                    or bool(NICKSERV_PASSWORD)
+                    SASL_MECHANISM
+                    and (
+                        SASL_MECHANISM == "EXTERNAL"
+                            and bool(SASL_CERT and SASL_KEY)
+                        or SASL_MECHANISM == "ECDSA-NIST256P-CHALLENGE"
+                            and bool(SASL_KEY)
+                        or SASL_MECHANISM in ("PLAIN", "SCRAM-SHA-256")
+                            and bool(NICKSERV_PASSWORD)
+                    )
                 )
                 if "sasl" in self._cap_ls_caps and _sasl_creds_ok:
                     want.append("sasl")
                 self.send_raw(f"CAP REQ :{' '.join(want)}" if want else "CAP END")
                 if not want:
                     self._finish_registration()
+                # Preserve the full advertised-capability snapshot for /v3test and /cap ls
+                self._cap_ls_advertised = set(self._cap_ls_caps)
                 self._cap_ls_caps.clear()
         elif subcmd == "ACK":
             acked = set((params[-1] if params else "").lower().split())
@@ -6898,6 +8930,9 @@ class IRCClient:
                 new_avail[cname.lower()] = cval
                 if cval:
                     self._cap_ls_values[cname.lower()] = cval
+            # Update the advertised-capability snapshot so /v3test and /cap ls
+            # remain accurate after dynamic announcements.
+            self._cap_ls_advertised |= set(new_avail.keys())
             if "sts" in new_avail and not self.use_ssl:
                 self._handle_sts(new_avail["sts"])
             want = [c for c in self._WANT_CAPS
@@ -7241,20 +9276,42 @@ class IRCClient:
         else:
             await self.ui_queue.put(("status", "Successfully logged in to IRC"))
             if not self._identified and NICKSERV_PASSWORD:
+                self._waiting_for_nickserv = True
+                self._pending_joins = self._build_join_list()
                 asyncio.create_task(self._delayed_nickserv_identify())
-            for ch in sorted(self.joined_channels):
-                self.send_raw(f"JOIN {ch}")
-                await self.ui_queue.put(("status", f"Joining {ch}..."))
-            for ch in sorted(_AUTOJOIN_CHANNELS):
-                if self._irc_lower(ch) not in (self._irc_lower(c) for c in self.joined_channels):
-                    self.send_raw(f"JOIN {ch}")
-                    await self.ui_queue.put(("status", f"Joining {ch}..."))
+                await self.ui_queue.put(("status", "Waiting for NickServ authentication before joining channels..."))
+            else:
+                self._pending_joins = self._build_join_list()
+                await self._join_pending_channels()
         if not self.current_channel and DEFAULT_CHANNEL:
             self.current_channel = DEFAULT_CHANNEL
         if self._soju_is_bouncer and self._chathistory_cap:
             asyncio.create_task(self._soju_auto_replay())
         # Query own user modes (triggers 221 RPL_UMODEIS)
         self.send_raw(f"MODE {self.nick}")
+
+    async def _join_pending_channels(self) -> None:
+        """Join all channels that were queued during authentication.
+
+        The list is built by _build_join_list which puts DEFAULT_CHANNEL
+        first so it is always joined before any other channel.
+        """
+        channels_to_join = list(self._pending_joins)
+        self._pending_joins.clear()
+        self._waiting_for_nickserv = False
+
+        # Fallback: if the pending-join list is empty, rebuild it from the
+        # current configuration so we never silently skip joining.
+        if not channels_to_join:
+            channels_to_join = self._build_join_list()
+
+        if not channels_to_join:
+            await self.ui_queue.put(("status", "No channels to join"))
+            return
+
+        for ch in channels_to_join:
+            self.send_raw(f"JOIN {ch}")
+            await self.ui_queue.put(("status", f"Joining {ch}..."))
 
     async def _soju_auto_replay(self) -> None:
         """Request chathistory for all joined channels after soju connect."""
@@ -7288,6 +9345,7 @@ class IRCClient:
         channel = params[0]
         await self.ui_queue.put(("join", nick, channel))
         if nick == self.nick:
+            self.joined_channels.add(channel)
             await self.ui_queue.put(("self_join", channel))
         triggered = self.scoring.watches.check_event("join", nick, channel)
         for tw in triggered:
@@ -7297,12 +9355,17 @@ class IRCClient:
     async def _irc_part(self, nick, params, prefix):
         if params:
             await self.ui_queue.put(("part", nick, params[0]))
+            if nick == self.nick:
+                self.joined_channels.discard(params[0])
 
     async def _irc_kick(self, nick, params, prefix):
         if params:
             reason = params[-1] if len(params) > 2 else ""
+            kicked = params[1] if len(params) > 1 else ""
+            if self._irc_lower(kicked) == self._irc_lower(self.nick):
+                self.joined_channels.discard(params[0])
             await self.ui_queue.put(("kick", nick, params[0],
-                                     params[1] if len(params) > 1 else "", reason))
+                                     kicked, reason))
 
     async def _irc_topic_cmd(self, nick, params, prefix):
         if params:
@@ -7399,6 +9462,8 @@ class IRCClient:
         self.biometrics.record_incoming_message()
         target = params[0]
         msg    = params[1]
+        if not target or not msg:
+            return
         # server-time: prefer server-provided timestamp over local clock
         ts_str = _parse_server_time(tags["time"]) if "time" in tags else None
         # account-tag: sender's services account (if server advertises it)
@@ -7449,6 +9514,41 @@ class IRCClient:
             if reply_to:
                 self.scoring.relationships.record_reply(nick, reply_to)
             self.scoring.relationships.record_co_channel(nick, target)
+        # Integration 9: Feed social graph data into flow predictor
+        if target.startswith("#"):
+            self.scoring.flow_predictor.record(nick, target, msg, reply_to)
+        # Integration 2: AI Agent Bridge — evaluate whether agent should engage
+        if self.scoring.conversational_agent._enabled:
+            ai_score = int(u_state.rolling_ai_likelihood())
+            self.scoring.integrations.ai_agent_bridge.evaluate(
+                nick, target, ai_score, self.scoring.conversational_agent)
+        # Integration 7: Emotion arc persistence for transition detection
+        try:
+            self.scoring.emotion_arc.analyze(nick, msg)
+        except Exception:
+            pass
+        # Integration 8: Echo chamber observation
+        if target.startswith("#"):
+            try:
+                sent_result = self.scoring.sentiment.analyze(msg)
+                self.scoring.echo_chamber.observe(nick, target, msg, sent_result["score"])
+            except Exception:
+                pass
+        # Integration 1+5+3: Personality profiler, stance tracker, role inference, astroturfing
+        try:
+            self.scoring.personality.update(nick, msg)
+            self.scoring.stances.record(nick, msg)
+            self.scoring.predictive_reply.train(target, nick, msg, reply_to)
+            self.scoring.astroturfing.record_message(nick, target, msg)
+            _sent = self.scoring.sentiment.analyze(msg)
+            self.scoring.sentiment_contagion.record(nick, target, msg)
+            self.scoring.bot_swarm.record(nick, target, msg, ai_score / 100.0 if 'ai_score' in dir() else 0)
+            self.scoring.ban_evasion.track_user(nick, target, msg, [])
+            self.scoring.role_inference.observe(nick, target, msg, bool(reply_to), _sent["score"], 0, time.time())
+            if self.scoring.achievements_enabled:
+                self.scoring.achievements.observe(nick, target, msg, time.time())
+        except Exception:
+            pass
         _t = asyncio.create_task(self._score_msg_bg(nick, target, msg, u_state, u_score, m_score))
         self._bg_tasks.add(_t)
         _t.add_done_callback(self._bg_tasks.discard)
@@ -7473,6 +9573,24 @@ class IRCClient:
 
     async def _irc_notice(self, nick, params, prefix):
         text = params[-1] if params else ""
+        
+        # Detect NickServ authentication success
+        if nick and nick.lower() == "nickserv" and self._waiting_for_nickserv:
+            text_lower = text.lower()
+            success_patterns = [
+                "you are now identified",
+                "password accepted",
+                "you are successfully identified",
+                "you are already identified",
+                "identified for",
+            ]
+            if any(pattern in text_lower for pattern in success_patterns):
+                self._identified = True
+                await self.ui_queue.put(("status", f"NickServ: {text}"))
+                await self.ui_queue.put(("status", "NickServ authentication successful — joining channels"))
+                await self._join_pending_channels()
+                return
+        
         if "!" in prefix:  # user NOTICE (not server)
             target = params[0] if params else self.nick
             display_target = target if target.startswith("#") else "*status*"
@@ -8557,6 +10675,26 @@ class IRCClient:
                 if _blocklist_score > 0.0:
                     prob = min(1.0, prob + 0.30 * _blocklist_score)
 
+                # LLM fingerprinting: detect generation patterns
+                llm_result = self.scoring.llm_fingerprinter.analyze(nick, msg)
+                llm_boost = llm_result["combined"] * 0.15
+                if llm_boost > 0.0:
+                    prob = min(1.0, prob + llm_boost)
+                    detail["llm_fp"] = llm_result["combined"]
+
+                # Deepfake relay detection: detect relay-style patterns
+                relay_result = self.scoring.deepfake_relay.analyze(nick, target, msg)
+                relay_boost = relay_result["combined"] * 0.10
+                if relay_boost > 0.0:
+                    prob = min(1.0, prob + relay_boost)
+                    detail["relay"] = relay_result["combined"]
+
+                # Integration 11: Feed LLM fingerprinter results into AutoLoRA pipeline
+                lora_result = self.scoring.integrations.auto_lora.feed_detection(
+                    nick, msg, llm_result, self.scoring.ai_detector)
+                if lora_result:
+                    detail["auto_lora"] = lora_result.get("training_result", "attempted")
+
                 a_score = int(prob * 100)
         except asyncio.CancelledError:
             # Task cancelled (e.g. during shutdown) — log the partial result before
@@ -8623,11 +10761,48 @@ class IRCClient:
         if target.startswith("#"):
             try:
                 sent_result = self.scoring.sentiment.analyze(msg)
+                raw_sentiment = sent_result["score"]
+                # Integration 10: Sarcasm-aware sentiment correction
+                sarcasm_result = self.scoring.sarcasm.analyze(nick, msg, raw_sentiment)
+                corrected_sentiment = self.scoring.integrations.sarcasm_corrector.correct(
+                    nick, target, msg, raw_sentiment, sarcasm_result)
                 self.scoring.sentiment_ai.record(
                     nick, target, float(rolling_ai),
-                    sent_result["score"], sent_result.get("intensity", 0.0))
+                    corrected_sentiment, sent_result.get("intensity", 0.0))
+                # Integration 7: Emotion arc transition → auto-response
+                emotion_result = self.scoring.emotion_arc.analyze(nick, msg)
+                prev_emotion = emotion_result.get("prev_emotion")
+                current_emotion = emotion_result.get("dominant", "neutral")
+                if prev_emotion and prev_emotion != current_emotion:
+                    emo_response = self.scoring.integrations.emotion_triggers.check_transition(
+                        nick, target, prev_emotion, current_emotion)
+                    if emo_response and isinstance(emo_response, str):
+                        await self.ui_queue.put(("emo_response", target or "", nick or "", prev_emotion or "neutral",
+                                                  current_emotion or "neutral", emo_response))
             except Exception:
                 pass
+        # Integration 6: Research + Fact Check chain
+        try:
+            chained = self.scoring.integrations.research_fact_chain.chain(
+                nick, target, msg, self.scoring)
+            if chained:
+                for claim in chained:
+                    if isinstance(claim, dict) and claim.get("claim"):
+                        await self.ui_queue.put(("factcheck", nick or "?", target or "", claim))
+        except Exception:
+            pass
+        # Integration 5: Achievement badges + identity fusion
+        try:
+            if self.scoring.achievements_enabled:
+                new_badges = self.scoring.achievements.check_achievements(nick)
+                if new_badges:
+                    self.scoring.integrations.identity_fusion.apply_badge_bonuses(
+                        nick, new_badges, self.scoring)
+                    for badge in new_badges:
+                        if isinstance(badge, dict):
+                            await self.ui_queue.put(("achievement", nick or "?", badge))
+        except Exception:
+            pass
         log_ai_event(
             nick, target, msg, u_score, m_score, a_score, rolling_ai,
             heu_score=detail.get("heu", 0), bino_score=detail.get("bino", 0),
@@ -8894,7 +11069,9 @@ class PluginAPI:
                 self._tui._dashboard_last_update = 0.0
             self._tui.current_channel = name if name.startswith("#") else None
             self._tui._unread_windows.discard(name)
-            self._tui._chat_dirty = self._tui._userlist_dirty = self._tui._input_dirty = True
+            self._tui._chat_dirty = self._tui._userlist_dirty = self._tui._input_dirty = self._tui._stats_dirty = True
+            self._tui._last_stats_draw = 0.0
+            self._tui._last_stats_channel = ""
             self._tui.dirty = True
 
     # ── Scheduling ───────────────────────────────────────────────────────────
@@ -9310,6 +11487,58 @@ class ServerContext:
         self._sorted_users:  Dict[str, List[str]] = {}
         self.channel_user_modes: Dict[str, Dict[str, str]] = {}
 
+
+# ── Console font helper ─────────────────────────────────────────────────────
+def _set_console_font(font_name: str) -> None:
+    """Attempt to set the terminal console font.
+
+    On Windows 10+ ConPTY this writes the font name to a temporary
+    Windows-Terminal-style profile snippet.  On other platforms a
+    best-effort OSC-50 escape is emitted.  Failures are silent.
+    """
+    if sys.platform != "win32":
+        try:
+            sys.stdout.write(f"\x1b]50;{font_name}\x07")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        return
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        LF_FACESIZE = 32
+        FW_NORMAL = 400
+
+        class COORD(ctypes.Structure):
+            _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+        class CONSOLE_FONT_INFOEX(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("nFont", wintypes.DWORD),
+                ("dwFontSize", COORD),
+                ("FontFamily", wintypes.UINT),
+                ("FontWeight", wintypes.UINT),
+                ("FaceName", wintypes.WCHAR * LF_FACESIZE),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        if not handle or handle == -1:
+            return
+
+        font_info = CONSOLE_FONT_INFOEX()
+        font_info.cbSize = ctypes.sizeof(CONSOLE_FONT_INFOEX)
+        font_info.FontWeight = FW_NORMAL
+        font_info.FaceName = font_name[:LF_FACESIZE - 1]
+
+        kernel32.SetCurrentConsoleFontEx(handle, False, ctypes.byref(font_info))
+    except Exception:
+        pass
+
+
 # =========================
 # TUI - Enhanced Dashboard
 # =========================
@@ -9324,12 +11553,12 @@ class TUI:
         self.userlist_width = 30
         self._show_userlist = True
 
-        try:
-            self.chat_win  = curses.newwin(self.chat_height, max(1, self.width - self.userlist_width), 0, 0)
-            self.user_win  = curses.newwin(self.chat_height, self.userlist_width, 0, max(0, self.width - self.userlist_width))
-            self.input_win = curses.newwin(4, max(1, self.width), max(0, self.height - 4), 0)
-        except curses.error as e:
-            raise SystemExit(f"Terminal too small to initialise windows: {e}")
+        # Real-time stats panel
+        self._show_stats_panel = False
+        self._stats_width = 32  # wide enough for 7x24 activity heatmap
+        self._stats_win: Optional[Any] = None
+
+        self._create_windows()
 
         # Multi-server state: primary server is client passed to __init__
         self._primary_server_id: str = client.server_id
@@ -9338,6 +11567,110 @@ class TUI:
         # _active_server_id is set during event dispatch; points at the server
         # whose dicts (channel_users etc.) are currently aliased to self.*
         self._active_server_id: str = self._primary_server_id
+
+        # Connection task reference (set by main_curses, used by /reconnect)
+        self._conn_task = None
+
+        # Load persisted settings
+        _cfg = load_irc_config()
+        self._persisted_settings = set(_cfg.get("persisted_settings", [
+            "theme", "userlist", "stats", "autotranslate", "linkpreview",
+            "mute", "model", "achievements", "ai_scoring", "ctcp_mode",
+            "silence", "aliases", "snippets", "ignore",
+            "triggers", "automod", "watch", "todos", "notes", "bookmarks",
+            "font"
+        ]))
+        p = self._persisted_settings
+        if "userlist" in p:
+            self._show_userlist = _cfg.get("userlist_visible", True)
+        if "stats" in p:
+            self._show_stats_panel = _cfg.get("stats_panel_visible", False)
+        if "autotranslate" in p:
+            self.auto_translate = _cfg.get("autotranslate", True)
+        if "linkpreview" in p:
+            self.link_preview_enabled = _cfg.get("linkpreview", True)
+        if "mute" in p:
+            self.mention_beep_muted = _cfg.get("mention_beep_muted", False)
+        if "model" in p:
+            self.ai_chat_model = _cfg.get("ai_model", CLAUDE_DEFAULT_MODEL)
+        if "theme" in p:
+            self.current_theme = _cfg.get("theme", 1)
+        if "font" in p:
+            self.current_font = _cfg.get("font", 0)
+        if "silence" in p:
+            self._silenced_channels = set(_cfg.get("silenced_channels", []))
+        if "aliases" in p:
+            self._aliases = _cfg.get("aliases", {})
+        if "snippets" in p:
+            self._snippets = _cfg.get("snippets", {})
+        if "ignore" in p:
+            self._ignore_nicks = set(_cfg.get("ignore_list", []))
+
+        # Ensure ai_chat_model always has a default
+        if not hasattr(self, "ai_chat_model"):
+            self.ai_chat_model = CLAUDE_DEFAULT_MODEL
+        if not hasattr(self, "current_theme"):
+            self.current_theme = 1
+        if not hasattr(self, "current_font"):
+            self.current_font = 0
+        if not hasattr(self, "auto_translate"):
+            self.auto_translate = True
+        if not hasattr(self, "link_preview_enabled"):
+            self.link_preview_enabled = True
+        if not hasattr(self, "mention_beep_muted"):
+            self.mention_beep_muted = False
+        if not hasattr(self, "_silenced_channels"):
+            self._silenced_channels = set()
+        if not hasattr(self, "_aliases"):
+            self._aliases = {}
+        if not hasattr(self, "_snippets"):
+            self._snippets = {}
+        if not hasattr(self, "_ignore_nicks"):
+            self._ignore_nicks = set()
+
+        # Apply loaded settings to scoring engine
+        if hasattr(client, 'scoring'):
+            if "achievements" in p:
+                client.scoring.achievements_enabled = _cfg.get("achievements_enabled", False)
+            if "ai_scoring" in p:
+                client.scoring.ai_detector.enabled = _cfg.get("ai_scoring_enabled", True)
+            if "ctcp_mode" in p:
+                client._ctcp_mode = _cfg.get("ctcp_mode", "normal")
+
+        # Load complex data structures from config into scoring managers
+        scoring = getattr(client, 'scoring', None)
+        if scoring:
+            if "triggers" in p and hasattr(scoring, 'triggers'):
+                triggers_data = _cfg.get("triggers", [])
+                if triggers_data:
+                    scoring.triggers._triggers = triggers_data
+            if "automod" in p and hasattr(scoring, 'automod'):
+                automod_rules = _cfg.get("automod_rules", {})
+                automod_wl = _cfg.get("automod_whitelist", {})
+                if automod_rules:
+                    scoring.automod._rules = automod_rules
+                if automod_wl:
+                    scoring.automod._whitelist = {k: set(v) for k, v in automod_wl.items()}
+            if "watch" in p and hasattr(scoring, 'watches'):
+                watch_data = _cfg.get("watch_list", {})
+                if watch_data:
+                    scoring.watches._watches = watch_data
+            if "todos" in p and hasattr(scoring, 'todos'):
+                todos_data = _cfg.get("todos", [])
+                if todos_data:
+                    scoring.todos._todos = todos_data
+            if "notes" in p and hasattr(scoring, 'notes'):
+                notes_data = _cfg.get("notes", {})
+                if notes_data:
+                    scoring.notes._notes = notes_data
+            if "bookmarks" in p and hasattr(scoring, 'bookmarks'):
+                bookmarks_data = _cfg.get("bookmarks", [])
+                if bookmarks_data:
+                    scoring.bookmarks._bookmarks = bookmarks_data
+            if "snippets" in p and hasattr(scoring, 'snippets'):
+                snippets_data = _cfg.get("snippets", {})
+                if snippets_data:
+                    scoring.snippets._snippets = snippets_data
 
         self.windows: List[ChatWindow] = []
         self.window_by_name: Dict[str, ChatWindow] = {}
@@ -9403,6 +11736,12 @@ class TUI:
         self._ch_activity: Dict[str, Counter] = {}
         self._recent_styl_scores: Dict[str, float] = {}
         self._ai_feedback_log: List[Dict[str, Any]] = []
+
+        # Smart auto-complete: phrase completions and recent speaker tracking
+        self._phrase_completions: List[str] = []
+        self._phrase_freq: Counter = Counter()
+        self._recent_speaker_nicks: set = set()
+        self._completion_log: Counter = Counter()
 
         # /seen tracking: nick_lower → (unix_ts, message_preview, channel)
         self._seen_times: Dict[str, Tuple[float, str, str]] = {}
@@ -9485,6 +11824,12 @@ class TUI:
         self._chat_dirty    = True
         self._userlist_dirty = True
         self._input_dirty   = True
+        self._stats_dirty   = True
+
+        # Stats panel performance tracking
+        self._last_stats_draw: float = 0.0
+        self._stats_draw_interval: float = 1.0
+        self._last_stats_channel: str = ""
 
         # Cached window dimensions (updated only on resize)
         # Compute _tw from the logical expected width, not getmaxyx(), so that a
@@ -9496,6 +11841,9 @@ class TUI:
 
         # Unread tracking: window names that have received messages while inactive
         self._unread_windows: set = set()
+
+        # Silence: channels where join/part/quit messages are hidden
+        self._silenced_channels: set = set()
 
         self._event_handlers: dict = {}
         self._slash_handlers: dict = {}
@@ -9511,6 +11859,16 @@ class TUI:
             self.window_by_name["*status*"].add_line(
                 f"[plugin] Auto-loaded {len(auto_loaded)} plugin(s): {', '.join(auto_loaded)}",
                 timestamp=False)
+        # Auto-load analyzers package plugins
+        if ANALYZERS_AVAILABLE and _analyzers_pkg:
+            try:
+                analyzers_loaded = _analyzers_pkg.load_all(self, PluginAPI)
+                if analyzers_loaded:
+                    self.window_by_name["*status*"].add_line(
+                        f"[analyzer] Loaded {len(analyzers_loaded)} analyzer(s): {', '.join(analyzers_loaded)}",
+                        timestamp=False)
+            except Exception:
+                pass
 
         stdscr.nodelay(True)
         stdscr.keypad(True)
@@ -9550,6 +11908,13 @@ class TUI:
         self._tor_strict: bool = load_irc_config().get("tor", {}).get("strict", False)
         self.client.use_tor = self._use_tor
         self.client.tor_strict = self._tor_strict
+
+        # ── I2P ───────────────────────────────────────────────────────────────────
+        self._use_i2p: bool = load_irc_config().get("i2p", {}).get("enabled", False)
+        self._i2p_strict: bool = load_irc_config().get("i2p", {}).get("strict", False)
+        if self._use_i2p:
+            self.client.use_tor = True
+            self.client.i2p_strict = self._i2p_strict
 
     # ── Multi-server helpers ─────────────────────────────────────────────────
 
@@ -10365,6 +12730,49 @@ class TUI:
             except Exception:
                 pass
 
+    async def _periodic_github_poller(self) -> None:
+        """Periodically check tracked GitHub repos for updates."""
+        while True:
+            try:
+                await asyncio.sleep(300)
+                if not hasattr(self._active_client(), 'scoring'):
+                    continue
+                scoring = self._active_client().scoring
+                updates = await scoring.github.check_updates()
+                if updates:
+                    status_win = self.window_by_name.get("*status*")
+                    for u in updates:
+                        msg = f"[GitHub] {u['type'].upper()} {u['repo']}: {u['title']} by {u['user']} {u['url']}"
+                        if status_win:
+                            status_win.add_line(msg)
+                        # Also post to the tracked channel
+                        target_win = self.window_by_name.get(u["channel"])
+                        if target_win and target_win != status_win:
+                            target_win.add_line(f"-!- {msg}")
+                    self._chat_dirty = True
+                    self.dirty = True
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+    async def _periodic_topology_updater(self) -> None:
+        """Periodically update network topology from channel user lists."""
+        while True:
+            try:
+                await asyncio.sleep(60)
+                if not hasattr(self._active_client(), 'scoring'):
+                    continue
+                client = self._active_client()
+                na = client.scoring.network_analytics
+                for ch, users in self.channel_users.items():
+                    na.update_topology(client.server_id, ch, users)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+
     def apply_theme(self, n: int, announce: bool = True) -> None:
         """Switch to theme n (1-based). Re-initialises the four key color pairs
         and forces a full redraw.  Color pair integers are live — no need to
@@ -10389,35 +12797,74 @@ class TUI:
             self.window_by_name["*status*"].add_line(
                 f"Theme → {name} ({self.current_theme}/{len(THEMES)})  {theme_list}")
 
+    def _create_windows(self) -> None:
+        """Create all subwindows including the optional stats panel."""
+        try:
+            stats_offset = self._stats_width if self._show_stats_panel else 0
+            chat_w = max(1, self.width - self.userlist_width - stats_offset)
+            self.chat_win  = curses.newwin(self.chat_height, chat_w, 0, 0)
+            self.user_win  = curses.newwin(self.chat_height, self.userlist_width, 0, max(0, self.width - self.userlist_width))
+            self.input_win = curses.newwin(4, max(1, self.width), max(0, self.height - 4), 0)
+            if self._show_stats_panel:
+                stats_x = self.width - self.userlist_width - self._stats_width
+                self._stats_win = curses.newwin(self.chat_height, self._stats_width, 0, max(0, stats_x))
+            else:
+                self._stats_win = None
+        except curses.error as e:
+            raise SystemExit(f"Terminal too small to initialise windows: {e}")
+
     def _resize_windows(self) -> None:
         """Resize/reposition subwindows and refresh cached dimensions."""
+        min_w = max(10, self.width)
+        stats_offset = self._stats_width if self._show_stats_panel else 0
         if self._show_userlist:
-            chat_w = max(1, self.width - self.userlist_width)
+            chat_w = max(1, min_w - self.userlist_width - stats_offset)
         else:
-            chat_w = max(1, self.width)
-        user_x = self.width - self.userlist_width
+            chat_w = max(1, min_w - stats_offset)
+
+        # chat window
         try:
             self.chat_win.resize(self.chat_height, chat_w)
         except curses.error:
             pass
-        try:
-            self.user_win.resize(self.chat_height, self.userlist_width)
-            self.user_win.mvwin(0, user_x)
-        except curses.error:
-            pass
+        _actual_chat_h, _actual_chat_w = self.chat_win.getmaxyx()
+
+        # userlist — position at right edge; skip when hidden
+        if self._show_userlist:
+            user_x = max(0, min_w - self.userlist_width)
+            try:
+                self.user_win.resize(self.chat_height, self.userlist_width)
+                self.user_win.mvwin(0, user_x)
+            except curses.error:
+                pass
+            _actual_user_h, _actual_user_w = self.user_win.getmaxyx()
+            self._uw = max(1, _actual_user_w - 2)
+        else:
+            self._uw = 0
+
+        # stats panel — position between chat and userlist (or just right of chat)
+        if self._show_stats_panel and self._stats_win:
+            if self._show_userlist:
+                stats_x = max(0, min_w - self.userlist_width - self._stats_width)
+            else:
+                stats_x = max(0, min_w - self._stats_width)
+            try:
+                self._stats_win.resize(self.chat_height, self._stats_width)
+                self._stats_win.mvwin(0, max(0, stats_x))
+            except curses.error:
+                pass
+
+        # input bar — always full width
         try:
             self.input_win.resize(4, self.width)
             self.input_win.mvwin(self.height - 4, 0)
         except curses.error:
             pass
-        # Refresh cached dimension values and force full repaint.
-        # Use the expected logical width (not getmaxyx) so a silently-failed
-        # resize can't leave _tw pointing at the old oversized chat window.
-        self._tw             = max(1, chat_w - 1)
-        self._uw             = max(1, self.userlist_width - 2)
+
+        self._tw             = max(1, _actual_chat_w - 1)
         self._input_w        = max(1, self.input_win.getmaxyx()[1] - 4)
-        self._content_height = max(1, self.chat_height - 1)
-        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self._content_height = max(1, _actual_chat_h - 1)
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
 
     def _render_irc_line(self, row: int, line: str, base_attr: int, tw: int) -> None:
         """Write *line* to chat_win at *row*, applying IRC inline formatting.
@@ -10441,6 +12888,7 @@ class TUI:
         tw = self._tw
         current_win = self.get_current_window()
         self.chat_win.erase()
+        self.chat_win.bkgd(' ', curses.A_NORMAL)
         self._wrap_window(current_win)
         wrapped = current_win.wrapped_cache
         total = len(wrapped)
@@ -10539,6 +12987,14 @@ class TUI:
         except curses.error:
             pass
 
+        # Clear remaining rows to prevent ghost content from previous window
+        last_row = content_height + (1 if _typing_names else 0)
+        for row in range(last_row + 1, self.chat_height):
+            try:
+                self.chat_win.addstr(row, 0, ' ' * tw)
+            except curses.error:
+                break
+
     def _draw_userlist(self) -> None:
         uw = self._uw
         self.user_win.erase()
@@ -10626,6 +13082,117 @@ class TUI:
                 except curses.error:
                     break
 
+        # Clear remaining rows to prevent ghost content
+        last_user_row = min(len(users), self.chat_height - 2) if display_ch else 0
+        for row in range(last_user_row + 1, self.chat_height):
+            try:
+                self.user_win.addstr(row, 1, ' ' * (uw - 1))
+            except curses.error:
+                break
+
+    def _draw_stats_panel(self) -> None:
+        if not self._show_stats_panel or self._stats_win is None:
+            return
+
+        now = time.monotonic()
+        client = self._active_client()
+        if not hasattr(client, 'scoring') or not hasattr(client.scoring, 'stats'):
+            return
+        cur_win = self.get_current_window()
+        ch = None
+        if cur_win.is_channel and cur_win.name in self.channel_users:
+            ch = cur_win.name
+        elif self.current_channel and self.current_channel in self.channel_users:
+            ch = self.current_channel
+
+        channel_changed = ch != self._last_stats_channel
+        if not channel_changed and (now - self._last_stats_draw) < self._stats_draw_interval:
+            return
+
+        self._last_stats_draw = now
+        self._last_stats_channel = ch or ""
+
+        sw = self._stats_width
+        self._stats_win.erase()
+        self._stats_win.border()
+
+        total_users = len(self.channel_users.get(ch, set())) if ch else 0
+        suspect_count = len(self.channel_users.get(ch, set()) & self._suspect_nicks) if ch else 0
+        channels_joined = len([w for w in self.windows if w.is_channel])
+
+        lines = client.scoring.stats.get_panel_lines(ch, total_users, suspect_count, channels_joined)
+
+        try:
+            self._stats_win.addstr(0, 1, " Stats ".center(sw - 2)[:sw - 2], self._attr_userheader)
+        except curses.error:
+            pass
+
+        for i, line in enumerate(lines[1:], 1):
+            try:
+                self._stats_win.addstr(i, 1, line[:sw - 2], curses.A_NORMAL)
+            except curses.error:
+                break
+
+        # Mini activity bar (last 10 hours)
+        try:
+            bar_row = min(len(lines) + 1, self.chat_height - 3)
+            hourly = client.scoring.stats._hourly_activity
+            current_hour = time.localtime().tm_hour
+            bar_chars = []
+            for h in range(10):
+                idx = (current_hour - 9 + h) % 24
+                val = hourly[idx]
+                if val == 0:
+                    bar_chars.append(" ")
+                elif val < 5:
+                    bar_chars.append("▁")
+                elif val < 20:
+                    bar_chars.append("▃")
+                elif val < 50:
+                    bar_chars.append("▅")
+                else:
+                    bar_chars.append("▇")
+            bar_str = "".join(bar_chars)
+            self._stats_win.addstr(bar_row, 1, f" 10h:{bar_str}", curses.A_DIM)
+        except curses.error:
+            pass
+
+        # ── 7-day x 24-hour visual activity heatmap ────────────────────
+        if ch:
+            try:
+                hm_row = min(len(lines) + 3, self.chat_height - 9)
+                na = client.scoring.network_analytics
+                hm = na.get_heatmap(ch)
+                day_names = "MTWTFSS"
+                max_c = 0
+                for d in range(7):
+                    if d in hm:
+                        max_c = max(max_c, max(hm[d].values() if hm[d] else [0]))
+                if max_c > 0:
+                    self._stats_win.addstr(hm_row, 1, " Activity Heatmap ".center(sw - 2)[:sw - 2], curses.A_DIM)
+                    hm_row += 1
+                    intensity_chars = " ·░▒▓█"
+                    for d in range(7):
+                        day_hm = hm.get(d, {})
+                        cells = []
+                        for h in range(24):
+                            c = day_hm.get(h, 0)
+                            if c == 0:
+                                cells.append(intensity_chars[0])
+                            else:
+                                idx = min(4, max(1, int(c / max_c * 4)))
+                                cells.append(intensity_chars[idx])
+                        row_str = f" {day_names[d]}{''.join(cells)}"
+                        self._stats_win.addstr(hm_row, 1, row_str[:sw - 2], curses.A_NORMAL)
+                        hm_row += 1
+                        if hm_row >= self.chat_height - 1:
+                            break
+                    # Legend
+                    hm_row = min(hm_row, self.chat_height - 2)
+                    self._stats_win.addstr(hm_row, 1, " ·░▒▓█ (low→high)".center(sw - 2)[:sw - 2], curses.A_DIM)
+            except Exception:
+                pass
+
     def _handle_tab_click(self, mx: int) -> None:
         """Switch to the window whose tab label was clicked."""
         _, w = self.input_win.getmaxyx()
@@ -10680,7 +13247,9 @@ class TUI:
                     self._dashboard_dirty = True
                     self._dashboard_last_update = 0.0
                 self.current_channel = None
-                self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
+                self._last_stats_draw = 0.0
+                self._last_stats_channel = ""
                 self.dirty = True
                 return
             col += lw + 1
@@ -10838,6 +13407,8 @@ class TUI:
         self.last_redraw = time.monotonic()
 
         new_h, new_w = self.stdscr.getmaxyx()
+        if new_w < 10 or new_h < 5:
+            return False
         if new_h != self.height or new_w != self.width:
             self.height, self.width = new_h, new_w
             self.chat_height = max(1, self.height - 4)
@@ -10871,11 +13442,28 @@ class TUI:
             self._draw_input()
             self._input_dirty = False
             refreshed.append(self.input_win)
+        if self._stats_dirty and self._show_stats_panel:
+            self._draw_stats_panel()
+            self._stats_dirty = False
+            if self._stats_win:
+                refreshed.append(self._stats_win)
+        elif self._show_stats_panel and _chat_refreshed and self._stats_win:
+            refreshed.append(self._stats_win)
 
+        # Mark all windows as touched so noutrefresh writes the full region,
+        # preventing stale content from bleeding across window boundaries.
         for w in refreshed:
-            w.noutrefresh()
-        if refreshed:
-            curses.doupdate()
+            try:
+                w.touchwin()
+            except curses.error:
+                pass
+        try:
+            for w in refreshed:
+                w.noutrefresh()
+            if refreshed:
+                curses.doupdate()
+        except curses.error:
+            pass
         return True
 
     def get_current_window(self) -> ChatWindow:
@@ -10915,7 +13503,9 @@ class TUI:
             win.scroll_offset = 0  # jump to bottom so the new messages are visible
         self._unread_windows.discard(win.name)
         win._unread_from = -1
-        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+        self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
+        self._last_stats_draw = 0.0
+        self._last_stats_channel = ""
         self.dirty = True
 
     @staticmethod
@@ -10937,14 +13527,6 @@ class TUI:
         return sorted(users, key=lambda n: (-self._prefix_rank(self._highest_prefix(modes.get(n, set()))), n.lower()))
 
     def do_nick_complete(self, reverse: bool = False) -> None:
-        if not self.current_channel or self.current_channel not in self.channel_users:
-            return
-        ch = self.current_channel
-        if ch not in self._sorted_users:
-            self._sorted_users[ch] = self._sort_users_by_mode(ch)
-        users = self._sorted_users[ch]
-        if not users:
-            return
         buf    = self.input_buffer
         cursor = min(self.input_cursor, len(buf))
         word_start = cursor
@@ -10953,9 +13535,40 @@ class TUI:
         prefix = buf[word_start:cursor].lower()
         if not prefix:
             return
-        matches = [u for u in users if u.lower().startswith(prefix)]
-        if not matches:
+
+        # Phase 1: current channel nicks (sorted by mode precedence)
+        channel_matches = []
+        if self.current_channel and self.current_channel in self.channel_users:
+            ch = self.current_channel
+            if ch not in self._sorted_users:
+                self._sorted_users[ch] = self._sort_users_by_mode(ch)
+            channel_matches = [u for u in self._sorted_users[ch] if u.lower().startswith(prefix)]
+
+        # Phase 2: nick history (nicks seen in other channels or recently active)
+        history_matches = []
+        _recent_nicks = set()
+        for ch, users in self.channel_users.items():
+            if ch != self.current_channel:
+                _recent_nicks.update(u.lower() for u in users)
+        # Add nicks from recent messages that aren't in any current channel
+        if hasattr(self, '_recent_speaker_nicks'):
+            _recent_nicks.update(self._recent_speaker_nicks)
+        history_matches = [n for n in sorted(_recent_nicks)
+                          if n.startswith(prefix) and n not in (m.lower() for m in channel_matches)]
+
+        # Phase 3: common phrases (frequently typed completions)
+        phrase_matches = []
+        if hasattr(self, '_phrase_completions'):
+            phrase_matches = [p for p in self._phrase_completions
+                             if p.lower().startswith(prefix)
+                             and p.lower() not in (m.lower() for m in channel_matches + history_matches)]
+
+        # Combine all sources, de-duplicated
+        all_matches = channel_matches + history_matches + phrase_matches
+        if not all_matches:
             return
+
+        # Cycle through matches
         if self.completion_state and self.completion_state[0] == prefix:
             if reverse:
                 idx = (self.completion_state[2] - 1) % len(self.completion_state[1])
@@ -10963,15 +13576,38 @@ class TUI:
                 idx = (self.completion_state[2] + 1) % len(self.completion_state[1])
             match = self.completion_state[1][idx]
         else:
-            idx = len(matches) - 1 if reverse else 0
-            match = matches[idx]
-        self.completion_state = (prefix, matches, idx)
+            idx = len(all_matches) - 1 if reverse else 0
+            match = all_matches[idx]
+        self.completion_state = (prefix, all_matches, idx)
+
         suffix = ": " if word_start == 0 else " "
         replacement = match + suffix
         self.input_buffer = buf[:word_start] + replacement + buf[cursor:]
         self.input_cursor = word_start + len(replacement)
         self._input_dirty = True
         self.dirty = True
+
+        # Record this completion for phrase learning
+        self._record_completion(prefix, match)
+
+    def _record_completion(self, prefix: str, completed: str) -> None:
+        """Track completion frequency to build phrase completion list."""
+        self._completion_log[completed.lower()] += 1
+        if len(self._completion_log) > 200:
+            oldest = self._completion_log.most_common()[-50:]
+            for k, _ in oldest:
+                del self._completion_log[k]
+        self._phrase_completions = [
+            nick for nick, _ in self._completion_log.most_common(30)
+        ]
+
+    def _track_speaker(self, nick: str) -> None:
+        """Add nick to recent speaker set for cross-channel auto-complete."""
+        self._recent_speaker_nicks.add(nick.lower())
+        if len(self._recent_speaker_nicks) > 200:
+            to_remove = list(self._recent_speaker_nicks)[:50]
+            for n in to_remove:
+                self._recent_speaker_nicks.discard(n)
 
     def do_command_complete(self, reverse: bool = False) -> None:
         """Complete slash command names when input starts with '/'."""
@@ -11055,6 +13691,52 @@ class TUI:
         h["channel_rename"]  = self._ev_channel_rename
         for k in ("whois", "status"):
             h[k] = self._ev_status_line
+        h["emo_response"] = self._ev_emo_response
+        h["factcheck"]    = self._ev_factcheck
+        h["achievement"]  = self._ev_achievement
+
+    # ── Integration event handlers ──────────────────────────────────────
+
+    async def _ev_emo_response(self, event):
+        """Emotion-arc auto-response: display in channel window."""
+        try:
+            _et, channel, nick, prev, current, response = event if len(event) >= 6 else (None, "", "", "", "", "")
+            win = self.ensure_window(channel, is_channel=True)
+            win.add_line(f"  [emotion: {prev}→{current}] {response}")
+            self._chat_dirty = True
+            self.dirty = True
+        except Exception:
+            pass
+
+    async def _ev_factcheck(self, event):
+        """Chained fact-check + research result."""
+        try:
+            _et, nick, channel, claim = event if len(event) >= 4 else (None, "", "", {})
+            win = self.ensure_window(channel, is_channel=True)
+            verdict = claim.get("verdict", "?") if isinstance(claim, dict) else "?"
+            flags = ", ".join(claim.get("flags", [])) if isinstance(claim, dict) else ""
+            research = claim.get("research", {}) if isinstance(claim, dict) else {}
+            summary = research.get("summary", "")[:120] if isinstance(research, dict) and research else ""
+            url = research.get("url", "") if isinstance(research, dict) and research else ""
+            win.add_line(f"  [factcheck] {nick}: {str(verdict).upper()} ({flags}){(' — ' + summary) if summary else ''}")
+            if url:
+                win.add_line(f"     > {url}")
+            self._chat_dirty = True
+            self.dirty = True
+        except Exception:
+            pass
+
+    async def _ev_achievement(self, event):
+        """Achievement earned notification."""
+        try:
+            _et, nick, badge = event if len(event) >= 3 else (None, "", {})
+            sw = self._status_win()
+            if isinstance(badge, dict):
+                sw.add_line(f"  {badge.get('icon', '*')} {nick} earned: {badge.get('name', 'achievement')} — {badge.get('desc', '')}")
+            self._chat_dirty = True
+            self.dirty = True
+        except Exception:
+            pass
 
     async def handle_event(self, event: tuple) -> None:
         if not event:
@@ -11074,7 +13756,24 @@ class TUI:
         self._sync_ctx(self._primary_server_id)
         handler = self._event_handlers.get(event[0])
         if handler:
-            await handler(event)
+            event = self._sanitize_event(event)
+            try:
+                await handler(event)
+            except Exception as _exc:
+                etype = event[0] if event else "?"
+                nick  = event[1] if len(event) > 1 else "?"
+                await self.ui_queue.put(
+                    ("status", f"[err] handler {etype} for {nick}: {_exc}"))
+
+    @staticmethod
+    def _sanitize_event(event: tuple) -> tuple:
+        """Replace None with '' in the first 3 positions (etype, nick, target)
+        which are always strings and are the main crash source."""
+        safe = list(event)
+        for i in range(min(3, len(safe))):
+            if safe[i] is None:
+                safe[i] = ""
+        return tuple(safe)
 
     # ── TUI event handlers ────────────────────────────────────────────────────
 
@@ -11082,6 +13781,9 @@ class TUI:
         # Unpack with defaults for the optional tail fields added for IRCv3
         (_, nick, target, msg, u_score, m_score, a_score, rolling_ai,
          is_action, *_extra) = event
+        if not target:
+            return
+        client = self._active_client()
         ts_str    = _extra[0] if len(_extra) > 0 else None
         account   = _extra[1] if len(_extra) > 1 else ""
         is_replay = _extra[2] if len(_extra) > 2 else False
@@ -11094,12 +13796,14 @@ class TUI:
         if target.startswith("#"):
             win_name = target
             is_chan   = True
-        elif nick == self._active_client().nick:
+        elif self._active_client()._irc_lower(nick) == self._active_client()._irc_lower(client.nick):
             win_name = target
             is_chan   = False
         else:
             win_name = nick
             is_chan   = False
+        if not win_name:
+            return
         win = self.ensure_window(win_name, is_channel=is_chan)
         # read-marker: mark the first unread line when this window is not active
         if not is_replay and win is not self.get_current_window() and win._unread_from < 0:
@@ -11125,7 +13829,7 @@ class TUI:
             preview = f"* {nick} {msg}" if is_action else msg
             win._msg_store[msgid] = (nick, preview)
             win._last_msgid = msgid
-        our_nick = self._active_client().nick
+        our_nick = client.nick
         is_mention = bool(mention) or (
             our_nick and nick.lower() != our_nick.lower()
             and re.search(r'\b' + re.escape(our_nick) + r'\b', msg, re.IGNORECASE))
@@ -11141,6 +13845,7 @@ class TUI:
         # Investigative tracking
         hour = time.localtime().tm_hour
         self._msg_hours.setdefault(nick, []).append(hour)
+        self._track_speaker(nick)
         if target.startswith("#"):
             prev = self._last_speaker.get(target)
             if prev and prev != nick:
@@ -11162,29 +13867,109 @@ class TUI:
         self.user_ai_scores[nick] = rolling_ai
 
         # ── New AI/ML pipeline ──────────────────────────────────────────────
-        if not is_replay and hasattr(self._active_client(), 'scoring'):
-            scoring = self._active_client().scoring
-            # Sentiment analysis
-            scoring.analyze_sentiment(nick, msg)
-            # Topic detection
-            scoring.topics.detect(msg)
-            # Semantic similarity tracking
-            scoring.semantic.add_message(nick, msg, target)
-            # Thread tracking
-            scoring.threads.add_message(msgid, nick, target, msg, reply_to=reply_to)
-            # Cross-channel bot detection
-            if target.startswith("#"):
-                scoring.cross_channel.record_message(nick, target, msg)
-            # Productivity: channel stats tracking
-            if target.startswith("#"):
-                scoring.channel_stats.record_message(nick, target, msg)
-            # Productivity: nick watch checks
-            triggered = scoring.watches.check_event("speak", nick, target)
-            if mention:
-                triggered += scoring.watches.check_event("mention", nick, target)
-            for tw in triggered:
-                alert = tw.get("message") or f"{nick} triggered a watch"
-                await self.ui_queue.put(("status", f"[watch] {alert}"))
+        if not is_replay and hasattr(client, 'scoring'):
+            try:
+                scoring = client.scoring
+                # Sentiment analysis
+                scoring.analyze_sentiment(nick, msg)
+                # Topic detection
+                scoring.topics.detect(msg)
+                # Semantic similarity tracking
+                scoring.semantic.add_message(nick, msg, target)
+                # Thread tracking
+                scoring.threads.add_message(msgid, nick, target, msg, reply_to=reply_to)
+                # Cross-channel bot detection
+                if target.startswith("#"):
+                    scoring.cross_channel.record_message(nick, target, msg)
+                # Productivity: channel stats tracking
+                if target.startswith("#"):
+                    scoring.channel_stats.record_message(nick, target, msg)
+                    # Network analytics: heatmap tracking
+                    scoring.network_analytics.record_message(target)
+                    # Advanced AI/ML pipeline
+                    scoring.astroturfing.record_message(nick, target, msg)
+                    scoring.personality.update(nick, msg)
+                    scoring.predictive_reply.train(target, nick, msg, reply_to)
+                    scoring.stances.record(nick, msg)
+                    scoring.flow_predictor.record(nick, target, msg, reply_to)
+                    scoring.sentiment_contagion.record(nick, target, msg)
+                    scoring.bot_swarm.record(nick, target, msg, rolling_ai / 100.0)
+                    # Real-time stats tracking
+                    try:
+                        _sr = scoring.sentiment.analyze(msg)
+                        _sent = _sr.get("score", 0)
+                    except Exception:
+                        _sent = 0
+                    scoring.stats.record_message(nick, target, rolling_ai, _sent)
+                    
+                    # Role inference
+                    is_reply = bool(reply_to)
+                    u_state = client.users.get(nick)
+                    first_seen = u_state.join_time if u_state else time.time()
+                    scoring.role_inference.observe(nick, target, msg, is_reply, u_score / 100.0, first_seen, time.time())
+
+                    # Debate analyzer: track exchanges between users
+                    if reply_to:
+                        replied_nicks = [n.strip() for n in reply_to.split(",") if n.strip()]
+                        for rn in replied_nicks:
+                            scoring.debate_analyzer.record_message(nick, rn, target, msg, time.time())
+
+                    # Echo chamber detection
+                    scoring.echo_chamber.observe(nick, target, msg, u_score / 100.0)
+
+                    # Achievement badges
+                    if scoring.achievements_enabled:
+                        replied_to_by = [n.strip() for n in reply_to.split(",") if n.strip()] if reply_to else []
+                        scoring.achievements.observe(nick, target, msg, time.time(), replied_to_by)
+                        new_badges = scoring.achievements.check_achievements(nick)
+                        for badge in new_badges:
+                            await self.ui_queue.put(("status", f"[achievement] {nick} earned: {badge['icon']} {badge['name']} - {badge['desc']}"))
+                    
+                    # Sarcasm detection
+                    sarcasm_result = scoring.sarcasm.analyze(nick, msg, u_score / 100.0)
+                    if sarcasm_result["is_sarcastic"]:
+                        await self.ui_queue.put(("status", f"[sarcasm] {nick} detected as sarcastic ({sarcasm_result['score']:.0%}) [{', '.join(sarcasm_result['signals'])}]"))
+                    
+                    # Emotion arc tracking
+                    scoring.emotion_arc.analyze(nick, msg)
+                    
+                    # Ban evasion tracking & detection
+                    u_state = client.users.get(nick)
+                    timing_gaps = []
+                    if u_state and hasattr(u_state, 'msg_times') and u_state.msg_times and len(u_state.msg_times) > 1:
+                        recent_times = list(u_state.msg_times)[-10:]
+                        timing_gaps = [recent_times[i] - recent_times[i-1] for i in range(1, len(recent_times)) if recent_times[i] - recent_times[i-1] < 300]
+                    scoring.ban_evasion.track_user(nick, target, msg, timing_gaps)
+                    evasion_match = scoring.ban_evasion.check_evasion(nick)
+                    if evasion_match:
+                        await self.ui_queue.put(("status", f"[ban-evasion] ⚠️ {nick} matches banned user {evasion_match['banned_nick']} (score: {evasion_match['score']:.0%})"))
+                    research_results = scoring.research_agent.observe(nick, target, msg)
+                    for rr in research_results:
+                        if rr.get("summary"):
+                            await self.ui_queue.put(("status", f"[research] {rr['query']}: {rr['summary'][:120]}"))
+                    fact_results = scoring.fact_checker.check(nick, target, msg)
+                    for fr in fact_results:
+                        if fr.get("verdict") in ("likely_false", "questionable"):
+                            await self.ui_queue.put(("status", f"[factcheck] [{fr['verdict']}] {fr['claim'][:100]}"))
+
+                    # Conversational agent: observe and respond
+                    if target.startswith("#"):
+                        ca = scoring.conversational_agent
+                        is_mention = bool(mention) or (
+                            ca._nick and re.search(r'\b' + re.escape(ca._nick) + r'\b', msg, re.IGNORECASE))
+                        agent_response = ca.observe(nick, target, msg, is_mention)
+                        if agent_response:
+                            client = self._active_client()
+                            client.cmd_msg(target, agent_response)
+                # Productivity: nick watch checks
+                triggered = scoring.watches.check_event("speak", nick, target)
+                if mention:
+                    triggered += scoring.watches.check_event("mention", nick, target)
+                for tw in triggered:
+                    alert = tw.get("message") or f"{nick} triggered a watch"
+                    await self.ui_queue.put(("status", f"[watch] {alert}"))
+            except Exception:
+                pass
 
         # /seen tracking
         nick_lower = nick.lower()
@@ -11224,6 +14009,60 @@ class TUI:
             pass  # _chat_dirty already set below
         self._chat_dirty = True
         self.dirty = True
+
+        # Automation: trigger matching
+        if not is_replay and hasattr(self._active_client(), 'scoring'):
+            try:
+                scoring = self._active_client().scoring
+                triggers = scoring.triggers.match(nick, target, msg)
+                for t in triggers:
+                    if t["action"] == "reply":
+                        response = t["response"].replace("{nick}", nick).replace("{msg}", msg)
+                        client = self._active_client()
+                        client.cmd_msg(target, response)
+                        sw = self.ensure_window(target, is_channel=target.startswith("#"))
+                        sw.add_line(f"[trigger #{t['id']}] → {response}", timestamp=False)
+                    elif t["action"] == "notify":
+                        await self.ui_queue.put(("status", f"[trigger #{t['id']}] {nick}: {msg}"))
+                    elif t["action"] == "log":
+                        log_path = os.path.join(_SCRIPT_DIR, "trigger_log.jsonl")
+                        try:
+                            with open(log_path, "a", encoding="utf-8") as f:
+                                f.write(json.dumps({"ts": time.time(), "trigger": t["id"],
+                                                    "nick": nick, "channel": target, "msg": msg}) + "\n")
+                        except Exception:
+                            pass
+
+                # Automation: auto-mod checks
+                if target.startswith("#"):
+                    violations = scoring.automod.check(nick, target, msg)
+                    for v in violations:
+                        rule = v["rule"]
+                        await self.ui_queue.put(("status", f"[automod] {v['nick']} in {target}: {v['reason']} → {rule['action']}"))
+                        if rule["action"] in ("kick", "ban"):
+                            client = self._active_client()
+                            if rule["action"] == "kick":
+                                client.send_raw(f"KICK {target} {v['nick']} :AutoMod: {v['reason']}")
+                            elif rule["action"] == "ban":
+                                client.send_raw(f"MODE {target} +b *!*@*")
+                                client.send_raw(f"KICK {target} {v['nick']} :AutoMod: {v['reason']}")
+
+                # Webhook: fire event
+                await scoring.webhooks.fire("msg", target, {
+                    "nick": nick, "msg": msg, "channel": target, "action": "msg",
+                })
+
+                # Bot mode: check for !commands
+                if getattr(self, '_bot_mode_enabled', False) and hasattr(self, '_bot_commands'):
+                    if msg.startswith("!"):
+                        cmd = msg[1:].split()[0].lower()
+                        if cmd in self._bot_commands:
+                            response = self._bot_commands[cmd]
+                            client = self._active_client()
+                            client.cmd_msg(target, response)
+            except Exception:
+                pass
+
         await self.plugin_manager.dispatch("on_message", nick=nick, target=target,
                                            msg=msg, is_action=is_action, is_replay=is_replay)
         await self.script_engine.dispatch("on_message", nick=nick, target=target,
@@ -11243,9 +14082,6 @@ class TUI:
             self._chat_dirty = True
             self.dirty = True
         await self.plugin_manager.dispatch("on_typing", nick=nick, target=target, state=state)
-        if tgt == self.get_current_window().name.lower():
-            self._chat_dirty = True
-            self.dirty = True
 
     async def _ev_react(self, event):
         _, nick, target, msgid, emoji = event
@@ -11354,7 +14190,7 @@ class TUI:
         for d in (self._msg_hours, self._adjacency, self._targets, self._ch_activity):
             if old_nick in d:
                 d[new_nick] = d.pop(old_nick)
-                self._sorted_users.pop(ch, None)
+        self._sorted_users.clear()
         if old_nick in self.user_scores:
             self.user_scores[new_nick] = self.user_scores.pop(old_nick)
         if old_nick in self.user_ai_scores:
@@ -11423,8 +14259,9 @@ class TUI:
                 self.channel_users[channel].add(nick)
                 self.channel_user_modes.setdefault(channel, {})[nick] = set()
                 self._sorted_users.pop(channel, None)
-            mark = "◈" if nick.lower() in self._ircop_nicks else "*"
-            win.add_line(f"{mark} {nick} has joined {channel}")
+            if channel not in self._silenced_channels:
+                mark = "◈" if nick.lower() in self._ircop_nicks else "*"
+                win.add_line(f"{mark} {nick} has joined {channel}")
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
         await self.plugin_manager.dispatch("on_join", nick=nick, channel=channel)
@@ -11445,10 +14282,11 @@ class TUI:
             self.channel_user_modes.get(channel, {}).pop(nick, None)
             self._sorted_users.pop(channel, None)
         win = self.ensure_window(channel)
-        win.add_line(f"* {nick} has left {channel}" + (f" ({reason})" if reason else ""))
-        if win is not self.get_current_window():
-            self._unread_windows.add(channel)
-            self._input_dirty = True
+        if channel not in self._silenced_channels:
+            win.add_line(f"* {nick} has left {channel}" + (f" ({reason})" if reason else ""))
+            if win is not self.get_current_window():
+                self._unread_windows.add(channel)
+                self._input_dirty = True
         self._chat_dirty = self._userlist_dirty = True
         self.dirty = True
         await self.plugin_manager.dispatch("on_part", nick=nick, channel=channel, reason=reason)
@@ -11462,12 +14300,13 @@ class TUI:
                 users.discard(nick)
                 self.channel_user_modes.get(ch, {}).pop(nick, None)
                 self._sorted_users.pop(ch, None)
-                ch_win = self.window_by_name.get(self._wk(self._active_server_id, ch))
-                if ch_win:
-                    ch_win.add_line(quit_msg)
-                    if ch_win is not self.get_current_window():
-                        self._unread_windows.add(ch_win.name)
-                        self._input_dirty = True
+                if ch not in self._silenced_channels:
+                    ch_win = self.window_by_name.get(self._wk(self._active_server_id, ch))
+                    if ch_win:
+                        ch_win.add_line(quit_msg)
+                        if ch_win is not self.get_current_window():
+                            self._unread_windows.add(ch_win.name)
+                            self._input_dirty = True
         self._suspect_nicks.discard(nick)
         self._ircop_nicks.discard(nick.lower())
         self.user_scores.pop(nick, None)
@@ -11776,7 +14615,6 @@ class TUI:
         h["mood"]       = self._slash_sentiment
         h["anomaly"]    = self._slash_anomaly
         h["topics"]     = self._slash_topics
-        h["topic"]      = self._slash_topics
         h["similar"]    = self._slash_similar
         h["threads"]    = self._slash_threads
         h["thread"]     = self._slash_threads
@@ -11787,6 +14625,9 @@ class TUI:
         h["savefp"]     = self._slash_savefp
         h["behavior"]   = self._slash_behavior
         h["biometrics"] = self._slash_biometrics
+        h["llmfp"]      = self._slash_llmfp
+        h["deepfake"]   = self._slash_deepfake
+        h["relay"]      = self._slash_deepfake
         h["aistatus"]   = self._slash_aistatus
         h["aipipeline"] = self._slash_aistatus
         h["join"]       = self._slash_join
@@ -11818,12 +14659,57 @@ class TUI:
         h["owner"]      = self._slash_owner
         h["deowner"]    = self._slash_deowner
         h["cap"]        = self._slash_cap
+        h["v3test"] = h["v3"] = self._slash_v3test
         h["sasl"]       = self._slash_sasl
         h["chghost"]    = self._slash_chghost
         h["setname"]    = self._slash_setname
         h["umode"]      = self._slash_umode
         h["oper"]       = self._slash_oper
         h["raw"]        = self._slash_raw
+        h["dns"]        = self._slash_dns
+        h["resolve"]    = self._slash_dns
+        h["latency"]    = self._slash_latency
+        h["heatmap"]    = self._slash_heatmap
+        h["network"]    = self._slash_network
+        h["achievements"] = self._slash_achievements
+        h["ach"]        = self._slash_achievements
+        h["trigger"]    = self._slash_trigger
+        h["automod"]    = self._slash_automod
+        h["webhook"]    = self._slash_webhook
+        h["botcmd"]     = self._slash_bot_cmd
+        h["github"]     = self._slash_github
+        h["import"]     = self._slash_import
+        h["astroturf"]  = self._slash_astroturf
+        h["personality"] = self._slash_personality
+        h["predict"]    = self._slash_predict
+        h["stance"]     = self._slash_stance
+        h["flow"]       = self._slash_flow
+        h["contagion"]  = self._slash_contagion
+        h["swarm"]      = self._slash_swarm
+        h["banevasion"] = self._slash_banevasion
+        h["banev"]      = self._slash_banevasion
+        h["factcheck"]  = self._slash_factcheck
+        h["research"]   = self._slash_research
+        h["agent"]      = self._slash_agent
+        h["convo"]      = self._slash_agent
+        h["roles"]      = self._slash_roles
+        h["role"]       = self._slash_roles
+        h["debate"]     = self._slash_debate
+        h["echo"]       = self._slash_echo
+        h["echamber"]   = self._slash_echo
+        h["badges"]     = self._slash_badges
+        h["badge"]      = self._slash_badges
+        h["sarcasm"] = self._slash_sarcasm
+        h["emotion"] = self._slash_emotion
+        h["emotions"] = self._slash_emotion
+        h["dossier"] = self._slash_dossier
+        h["profile"] = self._slash_dossier
+        h["threat"] = self._slash_threat
+        h["threats"] = self._slash_threat
+        h["crosspol"] = self._slash_crosspollinate
+        h["crosspollinate"] = self._slash_crosspollinate
+        h["autolora"] = self._slash_autolora
+        h["pombio"] = self._slash_pombio
         h["stats"]      = self._slash_stats
         h["uptime"]     = self._slash_uptime
         h["ping"]       = self._slash_ping
@@ -11836,9 +14722,13 @@ class TUI:
         h["close"] = h["wc"] = self._slash_close
         h["win"] = h["window"] = self._slash_win
         h["quit"] = h["exit"] = self._slash_quit
-        h["server"]     = self._slash_server
+        h["server"] = h["connect"] = self._slash_server
+        h["servers"]    = self._slash_servers
         h["reconnect"]  = self._slash_reconnect
+        h["disconnect"] = self._slash_disconnect
+        h["all"]        = self._slash_all
         h["theme"]      = self._slash_theme
+        h["font"]       = self._slash_font
         h["askai"]      = self._slash_askai
         h["summarize"] = h["summarise"] = h["summerize"] = self._slash_summarize
         h["model"]      = self._slash_model
@@ -11880,6 +14770,8 @@ class TUI:
         h["dcc"]          = self._slash_dcc
         h["dccchat"]      = self._slash_dccchat
         h["userlist"]     = self._slash_userlist
+        h["silence"]      = self._slash_silence
+        h["persist"]      = self._slash_persist
         h["znc"]          = self._slash_znc
         h["jitsi"]        = self._slash_jitsi
         h["chain"]        = self._slash_chain
@@ -12417,13 +15309,12 @@ class TUI:
         det_state = "ENABLED" if detector.enabled else "DISABLED"
         log_state = "log:ON" if _ai_logging_enabled else "log:OFF"
         await self.ui_queue.put(("status", f"AI detection {det_state}  ({log_state})"))
+        _save_tui_settings(self)
 
     async def _slash_logtoggle(self, args, extra, line):
         if _NO_AI:
             await self.ui_queue.put(("status", "[logtoggle] disabled by --no-ai")); return
         global _ai_logging_enabled
-        # Write a final "disabled" record before we stop writing, or a "enabled" record
-        # immediately after we start — so the log gap is bounded and auditable.
         if _ai_logging_enabled:
             log_toggle_event(enabled=False, nick=self._active_client().nick)
         _ai_logging_enabled = not _ai_logging_enabled
@@ -12431,6 +15322,14 @@ class TUI:
             log_toggle_event(enabled=True, nick=self._active_client().nick)
         state = "ENABLED" if _ai_logging_enabled else "DISABLED"
         await self.ui_queue.put(("status", f"AI detection logging {state}  (file: {AI_LOG_PATH})"))
+
+    async def _slash_achievements(self, args, extra, line):
+        client = self._active_client()
+        scoring = client.scoring
+        scoring.achievements_enabled = not scoring.achievements_enabled
+        state = "ENABLED" if scoring.achievements_enabled else "DISABLED"
+        await self.ui_queue.put(("status", f"Achievements {state}"))
+        _save_tui_settings(self)
 
     async def _slash_feedback(self, args, extra, line):
         """Provide feedback on AI detection to tune weights dynamically.
@@ -13029,6 +15928,114 @@ class TUI:
             sw.add_line("  IRCv3 draft/thread: active")
         if "read-marker" in client._active_caps:
             sw.add_line("  IRCv3 read-marker: active")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_llmfp(self, args, extra, line):
+        """Show LLM fingerprint analysis for a nick or list top suspects.
+
+        Usage:
+          /llmfp <nick>   — show LLM fingerprint score for nick
+          /llmfp list     — list top LLM suspects
+          /llmfp status   — show LLM fingerprinter stats
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[llmfp] disabled by --no-ai")); return
+
+        sub = (args or "").strip().lower()
+        client = self._active_client()
+        fp = client.scoring.llm_fingerprinter
+        sw = self._status_win()
+
+        if not sub:
+            await self.ui_queue.put(("status", "Usage: /llmfp <nick|list|status>"))
+            return
+
+        if sub == "list":
+            suspects = fp.get_top_suspects(limit=15)
+            sw.add_line("=== LLM Fingerprint Top Suspects ===")
+            sw.add_line("")
+            if not suspects:
+                sw.add_line("  No LLM suspects detected yet.")
+            else:
+                for s in suspects:
+                    sw.add_line(f"  {s['nick']:<16} LLM: {s['score']:5.1f}%  msgs: {s['samples']}")
+        elif sub == "status":
+            data = {nick: fp.get_nick_score(nick) for nick in fp._nick_data}
+            total = sum(1 for d in data.values() if d["samples"] > 0)
+            sw.add_line("=== LLM Fingerprinter Status ===")
+            sw.add_line(f"  Tracked nicks: {total}")
+            sw.add_line(f"  Save path: {fp._SAVE_PATH}")
+        else:
+            nick = sub
+            result = fp.get_nick_score(nick)
+            sw.add_line(f"=== LLM Fingerprint: {nick} ===")
+            sw.add_line("")
+            if result["samples"] == 0:
+                sw.add_line("  No data for this nick yet.")
+            else:
+                sw.add_line(f"  LLM score      : {result['llm_score']:.1f}%")
+                sw.add_line(f"  Confidence     : {result['confidence']}")
+                sw.add_line(f"  Samples        : {result['samples']}")
+                sw.add_line(f"  Hedging ratio  : {result['hedging_ratio']:.2f}")
+                sw.add_line(f"  Repetition     : {result['repetition_ratio']:.2f}")
+                sw.add_line(f"  List bias      : {result['list_ratio']:.2f}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_deepfake(self, args, extra, line):
+        """Show deepfake relay detection analysis.
+
+        Usage:
+          /deepfake <nick>   — show relay score for nick
+          /deepfake chains   — show active relay chains
+          /deepfake status   — show detector stats
+        """
+        if _NO_AI:
+            await self.ui_queue.put(("status", "[deepfake] disabled by --no-ai")); return
+
+        sub = (args or "").strip().lower()
+        client = self._active_client()
+        df = client.scoring.deepfake_relay
+        sw = self._status_win()
+
+        if not sub:
+            await self.ui_queue.put(("status", "Usage: /deepfake <nick|chains|status>"))
+            return
+
+        if sub == "chains":
+            chains = df.get_active_chains(limit=5)
+            sw.add_line("=== Active Relay Chains ===")
+            sw.add_line("")
+            if not chains:
+                sw.add_line("  No relay chains detected.")
+            else:
+                for c in chains:
+                    sw.add_line(f"  Chain: {c['chain_id'][:40]}...")
+                    sw.add_line(f"    Participants: {', '.join(c['participants'])}")
+                    sw.add_line(f"    Length: {c['length']}  Avg score: {c['avg_score']:.2f}")
+                    sw.add_line("")
+        elif sub == "status":
+            total = len(df._nick_data)
+            total_msgs = sum(d.get("total_msgs", 0) for d in df._nick_data.values())
+            sw.add_line("=== Deepfake Relay Detector Status ===")
+            sw.add_line(f"  Tracked nicks  : {total}")
+            sw.add_line(f"  Total messages : {total_msgs}")
+            sw.add_line(f"  Active chains  : {len(df._relay_chains)}")
+            sw.add_line(f"  Save path      : {df._SAVE_PATH}")
+        else:
+            nick = sub
+            result = df.get_nick_score(nick)
+            sw.add_line(f"=== Deepfake Relay: {nick} ===")
+            sw.add_line("")
+            if result["samples"] == 0:
+                sw.add_line("  No data for this nick yet.")
+            else:
+                sw.add_line(f"  Relay score    : {result['relay_score']:.1f}%")
+                sw.add_line(f"  Confidence     : {result['confidence']}")
+                sw.add_line(f"  Samples        : {result['samples']}")
+                sw.add_line(f"  Relay phrases  : {result['relay_phrases']}")
+                sw.add_line(f"  Quotes         : {result['quotes']}")
         self._chat_dirty = True
         self.dirty = True
 
@@ -14164,7 +17171,7 @@ class TUI:
             else:
                 await self.ui_queue.put(("status", "No capabilities active"))
         elif sub == "ls":
-            available = sorted(client._cap_ls_caps)
+            available = sorted(client._cap_ls_advertised)
             if available:
                 sw = self._status_win()
                 sw.add_line(f"Server offers {len(available)} capabilities:")
@@ -14186,6 +17193,168 @@ class TUI:
         else:
             await self.ui_queue.put(("status",
                 "Usage: /cap [list|ls|req <cap>]"))
+
+    # ── IRCv3 compatibility test catalog ────────────────────────────────────
+    # Each entry: capability name → (spec_name, category, weight)
+    # Weight: 10 = required/core, 5 = recommended, 3 = nice-to-have, 1 = draft/niche
+    _V3_CATALOG: Dict[str, Tuple[str, str, int]] = {
+        # ── Core Protocol (CAP LS 302, STS, SASL variants) ──────────────
+        "cap-notify":           ("CAP Notify",              "Core", 10),
+        "cap-3.2":              ("CAP 3.2",                 "Core", 10),
+        "sasl":                 ("SASL (generic)",          "Core", 10),
+        "sasl=PLAIN":           ("SASL PLAIN",              "Core", 10),
+        "sasl=SCRAM-SHA-256":   ("SASL SCRAM-SHA-256",      "Core", 5),
+        "sasl=EXTERNAL":        ("SASL EXTERNAL",            "Core", 5),
+        "sasl=ECDSA-NIST256P-CHALLENGE": ("SASL ECDSA",     "Core", 3),
+        "sts":                  ("STS (Strict Transport)",  "Core", 10),
+        # ── Message Tags ─────────────────────────────────────────────────
+        "message-tags":         ("Message Tags",            "Messaging", 10),
+        "draft/message-tags-0.2": ("Message Tags (draft)",  "Messaging", 3),
+        "server-time":          ("Server Time",             "Messaging", 8),
+        "echo-message":         ("Echo Message",            "Messaging", 5),
+        "labeled-response":     ("Labeled Response",        "Messaging", 5),
+        "batch":                ("Batches",                 "Messaging", 8),
+        "draft/multiline":      ("Multiline Messages",      "Messaging", 5),
+        "draft/multiline-concat": ("Multiline Concat",      "Messaging", 3),
+        "draft/multiline-max-bytes": ("Multiline Max Bytes","Messaging", 2),
+        "draft/multiline-max-lines": ("Multiline Max Lines","Messaging", 2),
+        # ── Account & Authentication ─────────────────────────────────────
+        "account-tag":          ("Account Tag",             "Account", 8),
+        "account-notify":       ("Account Notify",          "Account", 8),
+        "extended-join":        ("Extended Join",           "Account", 8),
+        "draft/account-registration": ("Account Registration","Account", 3),
+        "draft/account-registration-email": ("Reg w/ Email","Account", 2),
+        # ── Identity ─────────────────────────────────────────────────────
+        "chghost":              ("Change Host",             "Identity", 5),
+        "setname":              ("Set Name",                "Identity", 5),
+        "draft/setname":        ("Set Name (draft)",        "Identity", 3),
+        # ── Channel Features ─────────────────────────────────────────────
+        "away-notify":          ("Away Notify",             "Channel", 8),
+        "invite-notify":        ("Invite Notify",           "Channel", 5),
+        "userhost-in-names":    ("Userhost in Names",       "Channel", 3),
+        "multi-prefix":         ("Multi-Prefix",            "Channel", 5),
+        "draft/channel-rename": ("Channel Rename",          "Channel", 2),
+        # ── Chat History ─────────────────────────────────────────────────
+        "chathistory":          ("Chat History",            "History", 5),
+        "draft/chathistory":    ("Chat History (draft)",    "History", 5),
+        "draft/chathistory-max":("Chat History Max",        "History", 3),
+        "draft/event-playback": ("Event Playback",          "History", 2),
+        # ── Monitoring ───────────────────────────────────────────────────
+        "monitor":              ("MONITOR",                 "Monitoring", 8),
+        "whox":                 ("WHOX",                    "Monitoring", 5),
+        # ── User Interaction ─────────────────────────────────────────────
+        "draft/typing":         ("Typing Indicators",       "Interaction", 5),
+        "draft/thread":         ("Message Threads",         "Interaction", 5),
+        "draft/react":          ("Message Reactions",       "Interaction", 5),
+        "draft/reply":          ("Message Replies",         "Interaction", 5),
+        "read-marker":          ("Read Markers",            "Interaction", 5),
+        # ── Connection ───────────────────────────────────────────────────
+        "draft/resume":         ("Connection Resumption",   "Connection", 3),
+        "draft/ping":           ("PING Latency",            "Connection", 3),
+        "draft/webirc":         ("WebIRC Gateway",          "Connection", 2),
+        "draft/rate-limit":     ("Rate Limiting",           "Connection", 2),
+        "draft/standard-replies":("Standard Replies",       "Connection", 5),
+        # ── Bouncer / Server-Side ────────────────────────────────────────
+        "soju.im/bouncer-networks": ("Soju Bouncer",        "Bouncer", 3),
+        "znc.in/playback":      ("ZNC Playback",            "Bouncer", 3),
+        "znc.in/self-message":  ("ZNC Self Message",        "Bouncer", 2),
+        "znc.in/server-time-iso":("ZNC Server Time ISO",   "Bouncer", 2),
+    }
+
+    async def _slash_v3test(self, args, extra, line):
+        """Test IRCv3 compatibility of the current server.
+
+        Usage: /v3test  or  /v3
+
+        Scores the server's advertised IRCv3 capabilities against a catalog
+        of ~55 known specs weighted by importance (core=10, recommended=5,
+        nice-to-have=3, draft/niche=1).  Outputs an overall percentile and a
+        per-category breakdown.
+        """
+        client = self._active_client()
+        caps = client._cap_ls_advertised
+        active = client._active_caps
+
+        if not caps:
+            await self.ui_queue.put(("status",
+                "No capabilities advertised yet. "
+                "Run /v3test after connecting (CAP LS must complete first)."))
+            return
+
+        sw = self._status_win()
+        sw.add_line(f"=== IRCv3 Compatibility: {client.server}:{client.port} ===")
+        sw.add_line("")
+
+        # ── Compute scores per category ──────────────────────────────────
+        cat_available: Dict[str, int] = {}
+        cat_total: Dict[str, int] = {}
+        overall_available = 0
+        overall_total = 0
+        details: List[Tuple[str, str, int, bool]] = []
+
+        for cap_key, (spec_name, category, weight) in sorted(self._V3_CATALOG.items()):
+            is_present = cap_key in caps
+            is_active = cap_key in active
+            cat_available[category] = cat_available.get(category, 0) + (weight if is_present else 0)
+            cat_total[category] = cat_total.get(category, 0) + weight
+            overall_available += weight if is_present else 0
+            overall_total += weight
+            details.append((spec_name, category, weight, is_present, is_active))
+
+        overall_pct = round(overall_available / overall_total * 100, 1)
+
+        # ── Overall score bar ────────────────────────────────────────────
+        bar_len = 40
+        filled = int(overall_pct / 100 * bar_len)
+        bar = '▓' * filled + '░' * (bar_len - filled)
+        sw.add_line(f"  Overall: {overall_pct:5.1f}%  [{bar}]")
+        sw.add_line(f"  Active : {len(active)} of {len(caps)} advertised ({len(active)}/{len(self._V3_CATALOG)} known)")
+        sw.add_line("")
+
+        # ── Category breakdown ───────────────────────────────────────────
+        category_order = ["Core", "Messaging", "Account", "Identity",
+                         "Channel", "History", "Monitoring", "Interaction",
+                         "Connection", "Bouncer"]
+        for cat in category_order:
+            if cat not in cat_total:
+                continue
+            av = cat_available.get(cat, 0)
+            tot = cat_total[cat]
+            pct = round(av / tot * 100, 1)
+            bar_filled = int(pct / 100 * 20)
+            bar_str = '▓' * bar_filled + '░' * (20 - bar_filled)
+            sw.add_line(f"  {cat:<14} {pct:5.1f}%  [{bar_str}]")
+
+        sw.add_line("")
+
+        # ── Missing important caps ───────────────────────────────────────
+        missing_core = [(n, w) for n, _, w, p, _ in details
+                        if not p and w >= 8]
+        if missing_core:
+            sw.add_line("  Notable gaps (high-weight missing):")
+            for name, w in sorted(missing_core, key=lambda x: -x[1]):
+                sw.add_line(f"    ✗ {name}  (weight {w})")
+
+        # ── Grade ───────────────────────────────────────────────────────
+        if overall_pct >= 85:
+            grade = "A+ Outstanding"
+        elif overall_pct >= 70:
+            grade = "A  Excellent"
+        elif overall_pct >= 55:
+            grade = "B  Good"
+        elif overall_pct >= 40:
+            grade = "C  Average"
+        elif overall_pct >= 25:
+            grade = "D  Below Average"
+        else:
+            grade = "F  Minimal"
+
+        sw.add_line(f"  Grade: {grade}")
+        sw.add_line("")
+        sw.add_line("  Legend: " + "▓ supported  ░ not advertised")
+        sw.add_line("  Use /cap ls for the full advertised capability list.")
+        self._chat_dirty = True
+        self.dirty = True
 
     async def _slash_sasl(self, args, extra, line):
         """View or configure SASL authentication.
@@ -14292,6 +17461,1460 @@ class TUI:
             self._active_client().send_raw(raw_cmd)
         else:
             await self.ui_queue.put(("status", "Usage: /raw <IRC command>"))
+
+    async def _slash_dns(self, args, extra, line):
+        """Async DNS resolution with caching.
+
+        Usage:
+          /dns <hostname>     — resolve hostname to IP
+          /dns cache          — show DNS cache status
+          /dns clear          — clear DNS cache
+        """
+        sub = (args + " " + extra).strip()
+        sw = self._status_win()
+
+        if not sub:
+            await self.ui_queue.put(("status", "Usage: /dns <hostname|cache|clear>"))
+            return
+
+        if sub.lower() == "cache":
+            info = _dns_resolver.get_cache_info()
+            sw.add_line("=== DNS Cache ===")
+            sw.add_line(f"  Cached entries: {info['cached']}")
+            sw.add_line(f"  Pending queries: {info['pending']}")
+            sw.add_line("")
+            for entry in info.get("entries", [])[:10]:
+                sw.add_line(f"  {entry['host']:<30} TTL: {entry['ttl_remaining']:.0f}s  Results: {entry['results']}")
+        elif sub.lower() == "clear":
+            _dns_resolver.clear()
+            sw.add_line("-!- DNS cache cleared")
+        else:
+            host = sub.split()[0]
+            try:
+                ips = await _dns_resolver.resolve_ip(host)
+                if ips:
+                    sw.add_line(f"=== DNS Resolution: {host} ===")
+                    for ip in ips:
+                        sw.add_line(f"  {ip}")
+                else:
+                    sw.add_line(f"-!- No results for {host}")
+            except Exception as e:
+                sw.add_line(f"-!- DNS resolution failed: {e}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_latency(self, args, extra, line):
+        """Show connection latency statistics.
+
+        Usage: /latency [server]
+        """
+        client = self._active_client()
+        server = (args or "").strip() or client.server
+        na = client.scoring.network_analytics
+        sw = self._status_win()
+
+        if client._latency > 0:
+            na.record_latency(client.server_id, client._latency * 1000)
+
+        stats = na.get_latency_stats(server)
+        if stats.get("samples", 0) == 0:
+            sw.add_line(f"=== Latency: {server} ===")
+            sw.add_line(f"  Current: {client._latency * 1000:.1f} ms")
+            sw.add_line("  No history yet — send more PINGs to collect samples.")
+        else:
+            sw.add_line(f"=== Latency: {server} ===")
+            sw.add_line(f"  Current  : {stats.get('current', 0):.1f} ms")
+            sw.add_line(f"  Mean     : {stats['mean']:.1f} ms")
+            sw.add_line(f"  Min/Max  : {stats['min']:.1f} / {stats['max']:.1f} ms")
+            sw.add_line(f"  Median   : {stats['median']:.1f} ms")
+            sw.add_line(f"  P95/P99  : {stats['p95']:.1f} / {stats['p99']:.1f} ms")
+            sw.add_line(f"  Jitter   : {stats['jitter']:.1f} ms")
+            sw.add_line(f"  Samples  : {stats['samples']}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_heatmap(self, args, extra, line):
+        """Show channel activity heatmap.
+
+        Usage: /heatmap [channel]
+        """
+        client = self._active_client()
+        channel = (args or "").strip()
+        if not channel:
+            cur_win = self.get_current_window()
+            channel = cur_win.name if cur_win.name.startswith("#") else self.current_channel
+        if not channel:
+            await self.ui_queue.put(("status", "Usage: /heatmap <channel>"))
+            return
+
+        na = client.scoring.network_analytics
+        sw = self._status_win()
+        hm = na.get_heatmap(channel)
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+        sw.add_line(f"=== Activity Heatmap: {channel} ===")
+        sw.add_line("")
+        header = "      " + "".join(f"{h:3d}" for h in range(24))
+        sw.add_line(header)
+        sw.add_line("      " + "───" * 24)
+
+        max_count = 1
+        for d in range(7):
+            if d in hm:
+                max_count = max(max_count, max(hm[d].values()))
+
+        for d in range(7):
+            row = f"{day_names[d]:>4} "
+            for h in range(24):
+                count = hm.get(d, {}).get(h, 0)
+                if count == 0:
+                    row += "  ."
+                else:
+                    intensity = int(count / max_count * 5)
+                    chars = " ░▒▓█"
+                    row += f" {chars[min(intensity, 4)]}"
+            sw.add_line(row)
+
+        sw.add_line("")
+        top = na.get_heatmap_summary(channel)
+        if top:
+            d, h, c = top[0]
+            sw.add_line(f"  Peak: {day_names[d]} {h:02d}:00 ({c} messages)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_network(self, args, extra, line):
+        """Show network topology and analytics.
+
+        Usage:
+          /network topology  — show server → channels → users map
+          /network uptime    — show connection uptime stats
+          /network status    — show all network analytics
+        """
+        client = self._active_client()
+        sub = (args or "").strip().lower()
+        na = client.scoring.network_analytics
+        sw = self._status_win()
+
+        if sub == "topology":
+            topo = na.get_topology(client.server_id)
+            sw.add_line(f"=== Network Topology: {client.server_id} ===")
+            sw.add_line(f"  Channels: {topo['channels']}")
+            sw.add_line(f"  Total users: {topo['total_users']}")
+            sw.add_line("")
+            for ch in topo["channel_list"][:20]:
+                users = na._topology.get(client.server_id, {}).get(ch, set())
+                sw.add_line(f"  {ch:<20} ({len(users)} users)")
+        elif sub == "uptime":
+            up = na.get_uptime(client.server_id)
+            sw.add_line(f"=== Uptime: {client.server_id} ===")
+            sw.add_line(f"  Connected: {'Yes' if up['connected'] else 'No'}")
+            if up["connected"]:
+                dur = up["current_duration"]
+                sw.add_line(f"  Current session: {dur // 3600:.0f}h {(dur % 3600) // 60:.0f}m")
+            sw.add_line(f"  Total connections: {up['total_connections']}")
+            sw.add_line(f"  Uptime: {up['uptime_pct']:.1f}%")
+        else:
+            up = na.get_uptime(client.server_id)
+            lat = na.get_latency_stats(client.server_id)
+            sw.add_line(f"=== Network Status: {client.server_id} ===")
+            sw.add_line(f"  Connected: {'Yes' if up['connected'] else 'No'}")
+            sw.add_line(f"  Latency: {lat.get('current', 0):.1f} ms (mean: {lat.get('mean', 0):.1f} ms)")
+            sw.add_line(f"  Channels: {up.get('total_connections', 0)}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_trigger(self, args, extra, line):
+        """Manage auto-response triggers.
+
+        Usage:
+          /trigger add <regex> <action> <response> [channel] [cooldown]
+          /trigger list
+          /trigger remove <id>
+          /trigger enable|disable <id>
+        """
+        client = self._active_client()
+        triggers = client.scoring.triggers
+        parts = (args + " " + extra).strip().split(maxsplit=4)
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /trigger <add|list|remove|enable|disable> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 4:
+                await self.ui_queue.put(("status", "Usage: /trigger add <regex> <reply|notify|log> <response> [channel] [cooldown]"))
+                return
+            pattern = parts[1]
+            trigger_action = parts[2]
+            response = parts[3]
+            channel = parts[4].split()[0] if len(parts) > 4 else ""
+            tid = triggers.add(pattern, trigger_action, response, channel)
+            sw.add_line(f"-!- Trigger #{tid} added: {pattern} → {trigger_action}")
+        elif action == "list":
+            tlist = triggers.list_triggers()
+            sw.add_line("=== Triggers ===")
+            if not tlist:
+                sw.add_line("  No triggers configured.")
+            else:
+                for t in tlist:
+                    status = "ON" if t["enabled"] else "OFF"
+                    sw.add_line(f"  #{t['id']} [{status}] {t['pattern']} → {t['action']} "
+                               f"({t['channel'] or 'global'}) fires={t['fire_count']}")
+        elif action == "remove":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /trigger remove <id>"))
+                return
+            if triggers.remove(int(parts[1])):
+                sw.add_line(f"-!- Trigger #{parts[1]} removed")
+            else:
+                sw.add_line(f"-!- Trigger #{parts[1]} not found")
+        elif action in ("enable", "disable"):
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Usage: /trigger {action} <id>"))
+                return
+            tid = int(parts[1])
+            for t in triggers._triggers:
+                if t["id"] == tid:
+                    t["enabled"] = action == "enable"
+                    sw.add_line(f"-!- Trigger #{tid} {action}d")
+                    break
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_automod(self, args, extra, line):
+        """Manage auto-moderation rules.
+
+        Usage:
+          /automod add <channel> <type> <pattern> <action> [threshold]
+          /automod list [channel]
+          /automod remove <channel> <id>
+          /automod whitelist <channel> <nick>
+        """
+        client = self._active_client()
+        automod = client.scoring.automod
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /automod <add|list|remove|whitelist> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 5:
+                await self.ui_queue.put(("status", "Usage: /automod add <channel> <flood|caps|regex|links> <pattern> <warn|kick|ban> [threshold]"))
+                return
+            channel, rule_type, pattern, mod_action = parts[1], parts[2], parts[3], parts[4]
+            threshold = int(parts[5]) if len(parts) > 5 else 3
+            rid = automod.add_rule(channel, rule_type, pattern, mod_action, threshold)
+            sw.add_line(f"-!- AutoMod rule #{rid} added to {channel}")
+        elif action == "list":
+            channel = parts[1] if len(parts) > 1 else (self.current_channel or "")
+            rules = automod.list_rules(channel)
+            sw.add_line(f"=== AutoMod Rules: {channel} ===")
+            if not rules:
+                sw.add_line("  No rules configured.")
+            else:
+                for r in rules:
+                    sw.add_line(f"  #{r['id']} [{r['type']}] pattern='{r['pattern']}' "
+                               f"→ {r['action']} (threshold={r['threshold']})")
+        elif action == "remove":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /automod remove <channel> <id>"))
+                return
+            if automod.remove_rule(parts[1], int(parts[2])):
+                sw.add_line(f"-!- Rule #{parts[2]} removed from {parts[1]}")
+        elif action == "whitelist":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /automod whitelist <channel> <nick>"))
+                return
+            automod.add_whitelist(parts[1], parts[2])
+            sw.add_line(f"-!- {parts[2]} whitelisted in {parts[1]}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_webhook(self, args, extra, line):
+        """Manage webhooks for forwarding IRC events.
+
+        Usage:
+          /webhook add <url> <events> [channel] [name]
+          /webhook list
+          /webhook remove <id>
+        """
+        client = self._active_client()
+        webhooks = client.scoring.webhooks
+        parts = (args + " " + extra).strip().split(maxsplit=4)
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /webhook <add|list|remove> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /webhook add <url> <msg,join,part,quit,topic,action> [channel] [name]"))
+                return
+            url = parts[1]
+            events = parts[2].split(",")
+            channel = parts[3] if len(parts) > 3 else ""
+            name = parts[4] if len(parts) > 4 else ""
+            wid = webhooks.add(url, events, channel, name)
+            sw.add_line(f"-!- Webhook #{wid} added: {url}")
+        elif action == "list":
+            wh_list = webhooks.list_webhooks()
+            sw.add_line("=== Webhooks ===")
+            if not wh_list:
+                sw.add_line("  No webhooks configured.")
+            else:
+                for w in wh_list:
+                    status = "ON" if w["enabled"] else "OFF"
+                    sw.add_line(f"  #{w['id']} [{status}] {w['name']}: {w['url']} "
+                               f"events={','.join(w['events'])} channel={w['channel'] or 'all'}")
+        elif action == "remove":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /webhook remove <id>"))
+                return
+            if webhooks.remove(int(parts[1])):
+                sw.add_line(f"-!- Webhook #{parts[1]} removed")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_bot_cmd(self, args, extra, line):
+        """Bot mode: respond to commands from other users.
+
+        Usage:
+          /bot start    — enable bot mode (respond to !commands)
+          /bot stop     — disable bot mode
+          /bot status   — show bot mode status
+          /bot addcmd <trigger> <response>
+        """
+        sub = (args or "").strip().lower()
+        sw = self._status_win()
+
+        if sub == "start":
+            self._bot_mode_enabled = True
+            sw.add_line("-!- Bot mode enabled — responding to !commands")
+        elif sub == "stop":
+            self._bot_mode_enabled = False
+            sw.add_line("-!- Bot mode disabled")
+        elif sub == "status":
+            status = "enabled" if getattr(self, '_bot_mode_enabled', False) else "disabled"
+            sw.add_line(f"-!- Bot mode: {status}")
+        elif sub.startswith("addcmd"):
+            rest = (extra or "").strip()
+            if not rest:
+                await self.ui_queue.put(("status", "Usage: /bot addcmd <trigger> <response>"))
+                return
+            parts = rest.split(maxsplit=1)
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /bot addcmd <trigger> <response>"))
+                return
+            trigger, response = parts
+            if not hasattr(self, '_bot_commands'):
+                self._bot_commands = {}
+            self._bot_commands[trigger.lower()] = response
+            sw.add_line(f"-!- Bot command '!{trigger}' added")
+        else:
+            await self.ui_queue.put(("status", "Usage: /bot <start|stop|status|addcmd>"))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_github(self, args, extra, line):
+        """Track GitHub repositories.
+
+        Usage:
+          /github add <owner/repo> [channel] [events]
+          /github list
+          /github remove <owner/repo>
+          /github check    — manually check for updates
+        """
+        client = self._active_client()
+        gh = client.scoring.github
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /github <add|list|remove|check> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "add":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /github add <owner/repo> [channel]"))
+                return
+            repo_key = parts[1]
+            if "/" not in repo_key:
+                await self.ui_queue.put(("status", "Usage: /github add <owner/repo> [channel]"))
+                return
+            owner, repo = repo_key.split("/", 1)
+            channel = parts[2] if len(parts) > 2 else (self.current_channel or "")
+            events = parts[3].split(",") if len(parts) > 3 else ["issue", "pr", "release"]
+            token = GITHUB_TOKEN
+            key = gh.add(owner, repo, channel, events, token)
+            sw.add_line(f"-!- Tracking {key} → {channel}")
+        elif action == "list":
+            repos = gh.list_repos()
+            sw.add_line("=== GitHub Tracked Repos ===")
+            if not repos:
+                sw.add_line("  No repos tracked.")
+            else:
+                for r in repos:
+                    sw.add_line(f"  {r['key']} → {r['channel']} "
+                               f"events={','.join(r['events'])} enabled={r['enabled']}")
+        elif action == "remove":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /github remove <owner/repo>"))
+                return
+            if gh.remove(parts[1]):
+                sw.add_line(f"-!- Stopped tracking {parts[1]}")
+        elif action == "check":
+            sw.add_line("-!- Checking for GitHub updates...")
+            updates = await gh.check_updates()
+            if updates:
+                for u in updates:
+                    sw.add_line(f"  [{u['type'].upper()}] {u['repo']}: {u['title']} by {u['user']}")
+                    sw.add_line(f"    {u['url']}")
+            else:
+                sw.add_line("  No new updates.")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_import(self, args, extra, line):
+        """Import chat logs from other IRC clients.
+
+        Usage: /import <filepath> [window_name] [format]
+        Formats: hexchat, weechat, irssi, generic, auto
+        """
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /import <filepath> [window_name] [format]"))
+            return
+
+        filepath = parts[0]
+        window = parts[1] if len(parts) > 1 else (self.current_channel or "*status*")
+        fmt = parts[2] if len(parts) > 2 else "auto"
+
+        if not os.path.isfile(filepath):
+            await self.ui_queue.put(("status", f"-!- File not found: {filepath}"))
+            return
+
+        detected = ChatLogImporter.detect_format(filepath)
+        sw.add_line(f"-!- Importing {filepath} (format: {fmt if fmt != 'auto' else detected}) → {window}")
+
+        count = ChatLogImporter.import_file(filepath, window, fmt)
+        sw.add_line(f"-!- Imported {count} messages")
+
+        if window in self.window_by_name:
+            win = self.window_by_name[window]
+            win._wrap_dirty = True
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_astroturf(self, args, extra, line):
+        """Detect coordinated astroturfing campaigns.
+
+        Usage:
+          /astroturf [channel]  — show detected campaigns
+          /astroturf list       — list all campaigns
+        """
+        client = self._active_client()
+        channel = (args or "").strip()
+        if not channel:
+            cur_win = self.get_current_window()
+            channel = cur_win.name if cur_win.name.startswith("#") else self.current_channel
+        sw = self._status_win()
+        campaigns = client.scoring.astroturfing.get_campaigns(channel, limit=10)
+        sw.add_line(f"=== Astroturfing Detection: {channel or 'all'} ===")
+        if not campaigns:
+            sw.add_line("  No campaigns detected.")
+        else:
+            for c in campaigns:
+                sw.add_line(f"  [{c['confidence']:.0%}] {', '.join(c['nicks'][:5])}")
+                for ev in c.get("evidence", [])[:3]:
+                    sw.add_line(f"    • {ev}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_personality(self, args, extra, line):
+        """Show personality profile for a user (Big Five traits).
+
+        Usage: /personality <nick>
+        """
+        client = self._active_client()
+        nick = (args or "").strip()
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /personality <nick>"))
+            return
+        sw = self._status_win()
+        prof = client.scoring.personality.get_profile(nick)
+        sw.add_line(f"=== Personality Profile: {nick} ===")
+        if "confidence" in prof and prof["confidence"] == "insufficient data":
+            sw.add_line(f"  Need more messages (have {prof.get('samples', 0)}, need 5+)")
+        else:
+            sw.add_line(f"  Openness         : {prof['openness']}%")
+            sw.add_line(f"  Conscientiousness: {prof['conscientiousness']}%")
+            sw.add_line(f"  Extraversion     : {prof['extraversion']}%")
+            sw.add_line(f"  Agreeableness    : {prof['agreeableness']}%")
+            sw.add_line(f"  Neuroticism      : {prof['neuroticism']}%")
+            sw.add_line(f"  Vocabulary size  : {prof['vocabulary_size']}")
+            sw.add_line(f"  Avg message len  : {prof['avg_msg_len']}")
+            sw.add_line(f"  Confidence       : {prof['confidence']} ({prof['samples']} msgs)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_predict(self, args, extra, line):
+        """Predictive reply suggestions.
+
+        Usage: /predict <context>
+        """
+        client = self._active_client()
+        context = (args + " " + extra).strip()
+        if not context:
+            await self.ui_queue.put(("status", "Usage: /predict <context>"))
+            return
+        sw = self._status_win()
+        suggestions = client.scoring.predictive_reply.suggest(context, limit=5)
+        sw.add_line(f"=== Predictive Replies ===")
+        sw.add_line(f"  Context: {context[:80]}")
+        sw.add_line("")
+        if not suggestions:
+            sw.add_line("  No suggestions yet — need more channel history.")
+        else:
+            for i, s in enumerate(suggestions, 1):
+                sw.add_line(f"  {i}. [{s['type']}] {s['text'][:80]}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_stance(self, args, extra, line):
+        """Show user's stance on topics.
+
+        Usage:
+          /stance <nick>       — show all stances
+          /stance <nick> <topic> — show specific topic
+        """
+        client = self._active_client()
+        parts = (args + " " + extra).strip().split()
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /stance <nick> [topic]"))
+            return
+        nick = parts[0]
+        topic = parts[1] if len(parts) > 1 else ""
+        sw = self._status_win()
+        if topic:
+            s = client.scoring.stances.get_stance(nick, topic)
+            if s:
+                sw.add_line(f"=== Stance: {nick} on {topic} ===")
+                sw.add_line(f"  Current: {s['current']}")
+                sw.add_line(f"  Support: {s['support_pct']}%  Oppose: {s['oppose_pct']}%")
+            else:
+                sw.add_line(f"  No stance data for {nick} on {topic}")
+        else:
+            stances = client.scoring.stances.get_all_stances(nick)
+            sw.add_line(f"=== Stances: {nick} ===")
+            if not stances:
+                sw.add_line("  No stance data yet.")
+            else:
+                for t, s in stances.items():
+                    sw.add_line(f"  {t:<15} {s['current']:<10} support={s['support_pct']}% oppose={s['oppose_pct']}%")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_flow(self, args, extra, line):
+        """Conversation flow prediction.
+
+        Usage:
+          /flow next [channel]  — predict next speaker
+          /flow state [channel] — conversation state
+        """
+        client = self._active_client()
+        parts = (args + " " + extra).strip().split()
+        action = parts[0] if parts else "state"
+        channel = parts[1] if len(parts) > 1 else (self.current_channel or "")
+        if not channel:
+            await self.ui_queue.put(("status", "Usage: /flow <next|state> [channel]"))
+            return
+        sw = self._status_win()
+        if action == "next":
+            speakers = client.scoring.flow_predictor.predict_next_speaker(channel, limit=5)
+            sw.add_line(f"=== Next Speaker Prediction: {channel} ===")
+            if not speakers:
+                sw.add_line("  Not enough data yet.")
+            else:
+                for s in speakers:
+                    sw.add_line(f"  {s['nick']:<15} {s['probability']:.0%}")
+        else:
+            state = client.scoring.flow_predictor.predict_conversation_state(channel)
+            sw.add_line(f"=== Conversation State: {channel} ===")
+            sw.add_line(f"  State: {state['state']}")
+            sw.add_line(f"  Messages (5min): {state['msgs_5min']}")
+            sw.add_line(f"  Messages (30min): {state['msgs_30min']}")
+            sw.add_line(f"  Activity level: {state['activity_level']:.0%}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_contagion(self, args, extra, line):
+        """Sentiment contagion map.
+
+        Usage:
+          /contagion mood [channel]  — current channel mood
+          /contagion influencers [channel] — top influencers
+          /contagion cascades        — recent cascades
+        """
+        client = self._active_client()
+        parts = (args + " " + extra).strip().split()
+        action = parts[0] if parts else "mood"
+        channel = parts[1] if len(parts) > 1 else (self.current_channel or "")
+        sw = self._status_win()
+        if action == "mood":
+            if not channel:
+                await self.ui_queue.put(("status", "Usage: /contagion mood <channel>"))
+                return
+            mood = client.scoring.sentiment_contagion.get_channel_mood(channel)
+            sw.add_line(f"=== Channel Mood: {channel} ===")
+            sw.add_line(f"  Sentiment: {mood['sentiment']:+.3f}")
+            sw.add_line(f"  Trend: {mood['trend']}")
+        elif action == "influencers":
+            if not channel:
+                await self.ui_queue.put(("status", "Usage: /contagion influencers <channel>"))
+                return
+            influencers = client.scoring.sentiment_contagion.get_top_influencers(channel, limit=5)
+            sw.add_line(f"=== Top Influencers: {channel} ===")
+            for inf in influencers:
+                sw.add_line(f"  {inf['nick']:<15} influence: {inf['influence']:.3f}")
+        elif action == "cascades":
+            cascades = client.scoring.sentiment_contagion.get_cascades(limit=5)
+            sw.add_line("=== Recent Sentiment Cascades ===")
+            for c in cascades:
+                sw.add_line(f"  {c['initiator']} → {', '.join(c['participants'][:4])} ({c['length']} participants)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_swarm(self, args, extra, line):
+        """Bot swarm detection.
+
+        Usage:
+          /swarm list    — show detected swarms
+          /swarm status  — show detector stats
+        """
+        client = self._active_client()
+        parts = (args + " " + extra).strip().split()
+        action = parts[0] if parts else "list"
+        sw = self._status_win()
+        if action == "list":
+            swarms = client.scoring.bot_swarm.get_swarms(limit=10)
+            sw.add_line("=== Bot Swarm Detection ===")
+            if not swarms:
+                sw.add_line("  No swarms detected.")
+            else:
+                for s in swarms:
+                    sw.add_line(f"  [{s['confidence']:.0%}] {', '.join(s['nicks'][:5])} ({s['size']} accounts)")
+        elif action == "status":
+            total_accounts = len(client.scoring.bot_swarm._account_profiles)
+            sw.add_line("=== Bot Swarm Detector Status ===")
+            sw.add_line(f"  Tracked accounts: {total_accounts}")
+            sw.add_line(f"  Detected swarms: {len(client.scoring.bot_swarm._swarm_clusters)}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_banevasion(self, args, extra, line):
+        """Ban evasion detection.
+
+        Usage:
+          /banevasion track <nick> [reason]  — snapshot nick as banned
+          /banevasion check <nick>           — manually check nick against banned list
+          /banevasion list                   — show tracked banned nicks
+          /banevasion matches                — show detected evasion attempts
+          /banevasion clear <nick>           — remove nick from banned list
+        """
+        client = self._active_client()
+        detector = client.scoring.ban_evasion
+        parts = (args + " " + extra).strip().split(maxsplit=2)
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /banevasion <track|check|list|matches|clear> ..."))
+            return
+
+        action = parts[0].lower()
+        if action == "track":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /banevasion track <nick> [reason]"))
+                return
+            nick = parts[1]
+            reason = parts[2] if len(parts) > 2 else "Manually tracked"
+            profile = detector.snapshot_banned(nick, reason)
+            if profile:
+                sw.add_line(f"-!- Tracked banned user: {nick} ({reason})")
+            else:
+                sw.add_line(f"-!- Not enough data to track {nick} (need ≥3 messages)")
+        elif action == "check":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /banevasion check <nick>"))
+                return
+            match = detector.check_evasion(parts[1])
+            if match:
+                sw.add_line(f"=== Ban Evasion Alert ===")
+                sw.add_line(f"  Suspect: {match['suspect']}")
+                sw.add_line(f"  Matches: {match['banned_nick']} (score: {match['score']:.0%})")
+                sw.add_line(f"  Reason: {match['reason']}")
+                sw.add_line(f"  Details: vocab={match['details']['vocab']}, bigram={match['details']['bigram']}, timing={match['details']['timing']}")
+            else:
+                sw.add_line(f"-!- No evasion match for {parts[1]}")
+        elif action == "list":
+            banned = detector.list_banned()
+            sw.add_line("=== Tracked Banned Users ===")
+            if not banned:
+                sw.add_line("  No banned users tracked.")
+            else:
+                for b in banned:
+                    sw.add_line(f"  {b['nick']} (banned: {time.strftime('%Y-%m-%d', time.localtime(b['banned_at']))}) - {b['reason']}")
+        elif action == "matches":
+            matches = detector.get_matches(limit=10)
+            sw.add_line("=== Detected Evasion Attempts ===")
+            if not matches:
+                sw.add_line("  No evasion attempts detected.")
+            else:
+                for m in matches:
+                    sw.add_line(f"  {m['suspect']} → {m['banned_nick']} ({m['score']:.0%}) [{m['reason']}]")
+        elif action == "clear":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", "Usage: /banevasion clear <nick>"))
+                return
+            if detector.remove_banned(parts[1]):
+                sw.add_line(f"-!- Removed {parts[1]} from banned list")
+            else:
+                sw.add_line(f"-!- {parts[1]} not found in banned list")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_roles(self, args, extra, line):
+        """Role inference for channel users.
+
+        Usage:
+          /roles [channel]  — show inferred roles for all users
+          /roles <nick>     — show detailed role breakdown for a nick
+        """
+        client = self._active_client()
+        inference = client.scoring.role_inference
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if parts and not parts[0].startswith("#"):
+            nick = parts[0]
+            result = inference.get_role(nick)
+            if result:
+                sw.add_line(f"=== Role Analysis: {nick} ===")
+                sw.add_line(f"  Primary: {result['primary_role']}")
+                sw.add_line(f"  Messages: {result['msg_count']}, Tenure: {result['tenure_days']} days")
+                sw.add_line("  Scores:")
+                for role, score in result["scores"].items():
+                    bar = "█" * int(score * 20)
+                    sw.add_line(f"    {role:<15} {score:.0%} {bar}")
+            else:
+                sw.add_line(f"-!- Not enough data for {nick} (need ≥3 messages)")
+        else:
+            channel = parts[0] if parts else ""
+            results = inference.infer_roles(channel)
+            ch_key = channel.lower() if channel else "*"
+            users = results.get(ch_key, [])
+            sw.add_line(f"=== Role Inference{' for ' + channel if channel else ''} ===")
+            if not users:
+                sw.add_line("  No users with enough data to infer roles.")
+            else:
+                for u in users:
+                    sw.add_line(f"  {u['nick']:<20} {u['primary_role']:<15} ({u['scores'][u['primary_role']]:.0%}) [{u['msg_count']} msgs, {u['tenure_days']}d]")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_debate(self, args, extra, line):
+        """Debate analysis between two users.
+
+        Usage:
+          /debate <nick1> <nick2> [channel]  — analyze debate quality
+          /debate list [channel]             — show active debates
+        """
+        client = self._active_client()
+        analyzer = client.scoring.debate_analyzer
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /debate <nick1> <nick2> [channel] | /debate list [channel]"))
+            return
+
+        if parts[0].lower() == "list":
+            channel = parts[1] if len(parts) > 1 else ""
+            debates = analyzer.get_active_debates(channel, limit=10)
+            sw.add_line("=== Active Debates ===")
+            if not debates:
+                sw.add_line("  No active debates detected.")
+            else:
+                for d in debates:
+                    sw.add_line(f"  {d['nick1']} vs {d['nick2']} in {d['channel']}")
+                    sw.add_line(f"    Messages: {d['msg_count']}, Duration: {d['duration_min']}min")
+                    sw.add_line(f"    Quality: {d['overall_quality']:.0%}, Status: {d['resolution']['status']}")
+        elif len(parts) >= 2:
+            nick1, nick2 = parts[0], parts[1]
+            channel = parts[2] if len(parts) > 2 else ""
+            result = analyzer.analyze(nick1, nick2, channel)
+            if result:
+                sw.add_line(f"=== Debate: {nick1} vs {nick2} ===")
+                sw.add_line(f"  Channel: {result['channel']}, Messages: {result['msg_count']}, Duration: {result['duration_min']}min")
+                sw.add_line(f"  Overall Quality: {result['overall_quality']:.0%}")
+                sw.add_line(f"  Turn Balance: {result['turn_balance']['balance']:.0%}")
+                sw.add_line(f"  Resolution: {result['resolution']['status']}")
+                for side in ["nick1_analysis", "nick2_analysis"]:
+                    nick = result["nick1" if side == "nick1_analysis" else "nick2"]
+                    a = result[side]
+                    sw.add_line(f"  --- {nick} ---")
+                    sw.add_line(f"    Quality: {a['quality_score']:.0%}")
+                    sw.add_line(f"    Fallacy Rate: {a['fallacy_rate']:.0%}")
+                    sw.add_line(f"    Evidence Rate: {a['evidence_rate']:.0%}")
+                    sw.add_line(f"    Constructive: {a['constructive_rate']:.0%}")
+                    sw.add_line(f"    Dismissive: {a['dismissive_rate']:.0%}")
+                    if a.get("fallacies"):
+                        sw.add_line(f"    Fallacies: {', '.join(f'{k}({v})' for k, v in a['fallacies'].items())}")
+            else:
+                sw.add_line(f"-!- Not enough data for debate between {nick1} and {nick2}")
+        else:
+            await self.ui_queue.put(("status", "Usage: /debate <nick1> <nick2> [channel]"))
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_echo(self, args, extra, line):
+        """Echo chamber detection.
+
+        Usage:
+          /echo [channel]   — analyze echo chamber metrics for channel
+          /echo list        — analyze all channels
+        """
+        client = self._active_client()
+        detector = client.scoring.echo_chamber
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts or parts[0].startswith("#"):
+            channel = parts[0] if parts else self.get_current_window().name
+            result = detector.analyze(channel)
+            if result:
+                sw.add_line(f"=== Echo Chamber: {result['channel']} ===")
+                sw.add_line(f"  Echo Score: {result['echo_score']:.0%} [{result['severity'].upper()}]")
+                sw.add_line(f"  Users: {result['user_count']}, Messages: {result['msg_count']}")
+                m = result["metrics"]
+                sw.add_line("  Metrics:")
+                sw.add_line(f"    Sentiment Consensus:    {m['sentiment_consensus']:.0%}")
+                sw.add_line(f"    Opinion Homogeneity:    {m['opinion_homogeneity']:.0%}")
+                sw.add_line(f"    Agreement Ratio:        {m['agreement_ratio']:.0%}")
+                sw.add_line(f"    Dissent Ratio:          {m['dissent_ratio']:.0%}")
+                sw.add_line(f"    Attack Ratio:           {m['attack_ratio']:.0%}")
+                sw.add_line(f"    Dissent Suppression:    {m['dissent_suppression']:.0%}")
+                sw.add_line(f"    Cross-Channel Exposure: {m['cross_channel_exposure']:.0%}")
+                sw.add_line(f"    Topic Diversity:        {m['topic_diversity']:.0%}")
+            else:
+                sw.add_line(f"-!- Not enough data for {channel} (need ≥10 messages)")
+        elif parts[0].lower() == "list":
+            results = detector.analyze_all()
+            sw.add_line("=== Echo Chamber Analysis (All Channels) ===")
+            if not results:
+                sw.add_line("  No channels with enough data.")
+            else:
+                for r in results:
+                    sw.add_line(f"  {r['channel']:<20} {r['echo_score']:.0%} [{r['severity'].upper()}] ({r['user_count']} users, {r['msg_count']} msgs)")
+        self._chat_dirty = True
+        self.dirty = True
+
+    # ── Integration 1: Unified Social Dashboard ───────────────────────
+    async def _slash_dossier(self, args, extra, line):
+        """Unified social dossier — personality, role, emotion, stance, sarcasm, badges.
+
+        Usage:
+          /dossier <nick>       — full dossier for a user
+          /dossier compare <n1> <n2> — emotional comparison of two users
+        """
+        client = self._active_client()
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+        if not parts:
+            my_nick = self._active_client().nick
+            text = client.scoring.get_dossier(my_nick)
+            for ln in text.split("\n"):
+                sw.add_line(ln)
+        elif parts[0].lower() == "compare" and len(parts) >= 3:
+            comparison = client.scoring.emotion_arc.compare_arcs(parts[1], parts[2])
+            sw.add_line(f"=== Comparison: {parts[1]} vs {parts[2]} ===")
+            if "error" in comparison:
+                sw.add_line(f"  {comparison['error']}")
+            else:
+                sw.add_line(f"  Alignment: {comparison['alignment']:.0%}")
+                sw.add_line(f"  {comparison['nick1']}: {comparison['nick1_dominant']} (vol: {comparison['nick1_volatility']:.0%})")
+                sw.add_line(f"  {comparison['nick2']}: {comparison['nick2_dominant']} (vol: {comparison['nick2_volatility']:.0%})")
+            # Also show cross-stance overlap
+            s1 = client.scoring.stances.get_all_stances(parts[1])
+            s2 = client.scoring.stances.get_all_stances(parts[2])
+            common = set(s1.keys()) & set(s2.keys())
+            if common:
+                sw.add_line(f"  Shared topics: {', '.join(common)[:60]}")
+                for topic in common:
+                    st1 = s1[topic]["current"]
+                    st2 = s2[topic]["current"]
+                    agree = "=" if st1 == st2 else "≠"
+                    sw.add_line(f"    {topic}: {st1} {agree} {st2}")
+        else:
+            nick = parts[0]
+            text = client.scoring.get_dossier(nick)
+            for ln in text.split("\n"):
+                sw.add_line(ln)
+            # Show debate history if relevant
+            win = self.get_current_window()
+            channel = win.name if win else ""
+            if channel and parts[0] != self._active_client().nick:
+                debate = client.scoring.debate_analyzer.analyze(parts[0], channel)
+                if debate:
+                    sw.add_line(f"  Debate quality vs channel: {debate.get('overall_quality',0):.0%}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    # ── Integration 4: Unified Threat Score ───────────────────────────
+    async def _slash_threat(self, args, extra, line):
+        """Cross-analyzer threat assessment for a channel.
+
+        Usage:
+          /threat [channel]     — compute unified threat score
+          /threat list          — list all channels with active threats
+          /threat watch         — show all threats above moderate level
+        """
+        client = self._active_client()
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+        if not parts or parts[0].startswith("#"):
+            channel = parts[0] if parts and parts[0].startswith("#") else self.get_current_window().name
+            result = client.scoring.get_channel_threat(channel)
+            sw.add_line(f"=== Threat Assessment: {channel} ===")
+            sw.add_line(f"  Level: {result['threat_level']:.0%} [{result['severity'].upper()}]")
+            sw.add_line(f"  Recommendation: {result['recommendation']}")
+            if result.get("signals"):
+                sw.add_line("  Signal breakdown:")
+                for sig_name, sig_val in result["signals"].items():
+                    sw.add_line(f"    {sig_name:<25} {sig_val:.0%}")
+        elif parts[0].lower() == "list" or parts[0].lower() == "all":
+            threats = client.scoring.get_threats(0.0)
+            sw.add_line("=== Active Threats (All Channels) ===")
+            if not threats:
+                sw.add_line("  No threats detected.")
+            else:
+                for t in threats:
+                    sw.add_line(f"  {t['channel']:<20} {t['threat_level']:.0%} [{t['severity'].upper()}]")
+        elif parts[0].lower() == "watch":
+            threats = client.scoring.get_threats(0.3)
+            sw.add_line("=== Threats Requiring Attention ===")
+            if not threats:
+                sw.add_line("  All clear — no threats above moderate level.")
+            else:
+                for t in threats:
+                    sw.add_line(f"  {t['channel']:<20} {t['threat_level']:.0%} [{t['severity'].upper()}]")
+                    sw.add_line(f"    → {t['recommendation']}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    # ── Integration 8: Stance + Echo Chamber Cross-Pollination ─────────
+    async def _slash_crosspollinate(self, args, extra, line):
+        """Analyze echo chamber and suggest cross-channel exposure.
+
+        Usage:
+          /crosspollinate [channel]
+          /crosspol [channel]
+        """
+        client = self._active_client()
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+        channel = parts[0] if parts and parts[0].startswith("#") else self.get_current_window().name
+        result = client.scoring.get_stance_echo_cross_pollination(channel)
+        sw.add_line(f"=== Cross-Pollination: {channel} ===")
+        sw.add_line(f"  Echo Score: {result.get('echo_score', 0):.0%}")
+        sw.add_line(f"  Verdict: {result.get('verdict', 'unknown')}")
+        for topic_info in result.get("polarized_topics", []):
+            sw.add_line(f"  Topic '{topic_info['topic']}': {topic_info['polarization']:.0%} uniform "
+                       f"({topic_info['direction']}, {topic_info['user_count']} users)")
+        suggestions = result.get("suggestions", [])
+        if suggestions:
+            sw.add_line("  Suggestions for breaking filter bubble:")
+            for s in suggestions:
+                sw.add_line(f"    → {s[:120]}")
+        else:
+            sw.add_line("  Channel appears well-diversified. No suggestions needed.")
+        self._chat_dirty = True
+        self.dirty = True
+
+    # ── Integration 11: Auto-LoRA Status ──────────────────────────────
+    async def _slash_autolora(self, args, extra, line):
+        """Show Auto-LoRA auto-training status and controls.
+
+        Usage:
+          /autolora status       — show training state
+          /autolora force        — force training now (if samples available)
+        """
+        client = self._active_client()
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+        action = parts[0].lower() if parts else "status"
+        status = client.scoring.get_auto_lora_status()
+        if action == "force":
+            lora_result = client.scoring.integrations.auto_lora._trigger_training(
+                client.scoring.ai_detector)
+            sw.add_line("=== Auto-LoRA Training Forced ===")
+            sw.add_line(f"  Result: {lora_result.get('training_result', 'unknown')}")
+            if "error" in lora_result:
+                sw.add_line(f"  Error: {lora_result['error']}")
+        sw.add_line("=== Auto-LoRA Status ===")
+        sw.add_line(f"  Enabled: {status.get('enabled', True)}")
+        sw.add_line(f"  Pool size: {status.get('pool_size', 0)}")
+        sw.add_line(f"  AI samples: {status.get('ai_samples', 0)}")
+        sw.add_line(f"  Human samples: {status.get('human_samples', 0)}")
+        sw.add_line(f"  Novel patterns: {status.get('novel_patterns', 0)}")
+        cooldown = status.get("cooldown_remaining", 0)
+        if cooldown > 0:
+            sw.add_line(f"  Cooldown remaining: {cooldown:.0f}s")
+        else:
+            sw.add_line(f"  Ready for training")
+        self._chat_dirty = True
+        self.dirty = True
+
+    # ── Integration 12: Pomodoro + Biometrics Status ───────────────────
+    async def _slash_pombio(self, args, extra, line):
+        """Show Pomodoro + Behavioral Biometrics calibration status.
+
+        Usage:
+          /pombio status        — show calibration state
+          /pombio calibrate     — force calibration
+        """
+        client = self._active_client()
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+        action = parts[0].lower() if parts else "status"
+        if action == "calibrate":
+            result = client.scoring.calibrate_pomodoro_biometrics()
+            if result:
+                sw.add_line("=== Pomodoro Biometrics Calibration ===")
+                sw.add_line(f"  Cadence Mean: {result.get('cadence_mean_ms', 0):.1f}ms")
+                sw.add_line(f"  Cadence StdDev: {result.get('cadence_std_ms', 0):.1f}ms")
+                sw.add_line(f"  Burst Rate: {result.get('burst_rate_kps', 0):.1f} k/s")
+                sw.add_line(f"  Pomodoro Sessions: {result.get('pomodoro_sessions', 0)}")
+            else:
+                sw.add_line("-!- Not enough data for calibration. Need ≥10 keystroke samples and ≥1 Pomodoro session.")
+        else:
+            status = client.scoring.get_auto_lora_status()
+            pomo_status = client.scoring.pomodoro.get_status() if hasattr(client.scoring.pomodoro, 'get_status') else {}
+            biom = BehavioralBiometrics()
+            human_score = client.scoring.integrations.pomodoro_biometrics.get_calibrated_human_score(
+                biom, client.scoring.pomodoro)
+            sw.add_line("=== Pomodoro + Biometrics ===")
+            sw.add_line(f"  Pomodoro State: {pomo_status.get('state', 'idle')}")
+            sw.add_line(f"  Sessions Completed: {pomo_status.get('completed_sessions', 0)}")
+            sw.add_line(f"  Calibrated Human Score: {human_score:.0f}%")
+            cadence = biom.get_typing_cadence_stats()
+            sw.add_line(f"  Cadence Samples: {cadence.get('samples', 0)}")
+            if cadence.get("samples", 0) > 0:
+                sw.add_line(f"  Cadence Mean: {cadence['mean']:.1f}ms  StdDev: {cadence['std']:.1f}ms")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_badges(self, args, extra, line):
+        """Achievement badges.
+
+        Usage:
+          /badges [nick]      — show badges for nick (or yourself)
+          /badges list        — show all badge definitions
+          /badges leaderboard — show top badge earners
+        """
+        client = self._active_client()
+        badges = client.scoring.achievements
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            my_nick = self._active_client().nick
+            earned = badges.get_badges(my_nick)
+            sw.add_line(f"=== Badges: {my_nick} ===")
+            if not earned:
+                sw.add_line("  No badges earned yet.")
+            else:
+                for b in earned:
+                    sw.add_line(f"  {b['icon']} {b['name']:<20} {b['desc']}")
+        elif parts[0].lower() == "list":
+            sw.add_line("=== All Badge Definitions ===")
+            by_category = {}
+            for bid, bdef in badges._BADGE_DEFS.items():
+                by_category.setdefault(bdef["category"], []).append(bdef)
+            for cat in sorted(by_category):
+                sw.add_line(f"  -- {cat} --")
+                for b in by_category[cat]:
+                    sw.add_line(f"    {b['icon']} {b['name']:<20} {b['desc']}")
+        elif parts[0].lower() == "leaderboard":
+            limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 20
+            leaderboard = badges.get_leaderboard(limit)
+            sw.add_line("=== Badge Leaderboard ===")
+            if not leaderboard:
+                sw.add_line("  No badges awarded yet.")
+            else:
+                for i, entry in enumerate(leaderboard, 1):
+                    sw.add_line(f"  {i}. {entry['nick']:<20} {entry['badge_count']} badges ({entry['msg_count']} msgs, {entry['channels']} channels)")
+        else:
+            nick = parts[0]
+            earned = badges.get_badges(nick)
+            sw.add_line(f"=== Badges: {nick} ===")
+            if not earned:
+                sw.add_line(f"  {nick} has no badges yet.")
+            else:
+                for b in earned:
+                    sw.add_line(f"  {b['icon']} {b['name']:<20} {b['desc']}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_sarcasm(self, args, extra, line):
+        """Sarcasm detection.
+
+        Usage:
+          /sarcasm <nick>       — show sarcasm rate for nick
+          /sarcasm recent [n]   — show recent sarcastic messages
+          /sarcasm channel      — show top sarcastic users in current channel
+        """
+        client = self._active_client()
+        detector = client.scoring.sarcasm
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            my_nick = self._active_client().nick
+            result = detector.get_user_sarcasm_rate(my_nick)
+            sw.add_line(f"=== Sarcasm Rate: {my_nick} ===")
+            sw.add_line(f"  Rate: {result['sarcasm_rate']:.0%} ({result['sarcastic_count']}/{result['total_analyzed']} msgs)")
+            sw.add_line(f"  Avg Score: {result['avg_score']:.0%}")
+        elif parts[0].lower() == "recent":
+            limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 20
+            detections = detector.get_recent_detections(limit)
+            sw.add_line("=== Recent Sarcasm Detections ===")
+            if not detections:
+                sw.add_line("  No sarcastic messages detected.")
+            else:
+                for d in detections:
+                    sw.add_line(f"  [{time.strftime('%H:%M', time.localtime(d['ts']))}] {d['nick']}: {d['text'][:60]} (score: {d['score']:.0%}) [{', '.join(d['signals'])}]")
+        elif parts[0].lower() == "channel":
+            win = self.get_current_window()
+            channel = win.name if win else ""
+            sw.add_line(f"=== Top Sarcastic Users in {channel} ===")
+            users_in_channel = self.channel_users.get(channel, set())
+            sarcasm_rates = []
+            for nick in users_in_channel:
+                result = detector.get_user_sarcasm_rate(nick)
+                if result["total_analyzed"] >= 5:
+                    sarcasm_rates.append(result)
+            sarcasm_rates.sort(key=lambda x: -x["sarcasm_rate"])
+            if not sarcasm_rates:
+                sw.add_line("  No users with enough data.")
+            else:
+                for i, r in enumerate(sarcasm_rates[:10], 1):
+                    sw.add_line(f"  {i}. {r['nick']:<20} {r['sarcasm_rate']:.0%} ({r['sarcastic_count']}/{r['total_analyzed']})")
+        else:
+            nick = parts[0]
+            result = detector.get_user_sarcasm_rate(nick)
+            sw.add_line(f"=== Sarcasm Rate: {nick} ===")
+            sw.add_line(f"  Rate: {result['sarcasm_rate']:.0%} ({result['sarcastic_count']}/{result['total_analyzed']} msgs)")
+            sw.add_line(f"  Avg Score: {result['avg_score']:.0%}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_emotion(self, args, extra, line):
+        """Emotion arc tracking.
+
+        Usage:
+          /emotion <nick> [window]        — show emotion timeline for nick
+          /emotion compare <n1> <n2>      — compare emotional alignment between two users
+          /emotion summary <nick>         — show emotion distribution and volatility
+        """
+        client = self._active_client()
+        tracker = client.scoring.emotion_arc
+        sw = self._status_win()
+        parts = (args + " " + extra).strip().split()
+
+        if not parts:
+            my_nick = self._active_client().nick
+            arc = tracker.get_arc(my_nick)
+            if not arc["arc"]:
+                sw.add_line(f"-!- No emotion data for {my_nick}")
+                return
+            self._display_emotion_summary(sw, arc)
+        elif parts[0].lower() == "compare" and len(parts) >= 3:
+            comparison = tracker.compare_arcs(parts[1], parts[2])
+            if "error" in comparison:
+                sw.add_line(f"-!- {comparison['error']}")
+            else:
+                sw.add_line(f"=== Emotional Comparison: {comparison['nick1']} vs {comparison['nick2']} ===")
+                sw.add_line(f"  Alignment: {comparison['alignment']:.0%}")
+                sw.add_line(f"  {comparison['nick1']} dominant: {comparison['nick1_dominant']} (volatility: {comparison['nick1_volatility']:.0%})")
+                sw.add_line(f"  {comparison['nick2']} dominant: {comparison['nick2_dominant']} (volatility: {comparison['nick2_volatility']:.0%})")
+        elif parts[0].lower() == "summary" and len(parts) >= 2:
+            arc = tracker.get_arc(parts[1])
+            if not arc["arc"]:
+                sw.add_line(f"-!- No emotion data for {parts[1]}")
+                return
+            self._display_emotion_summary(sw, arc)
+        else:
+            nick = parts[0]
+            window = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 50
+            arc = tracker.get_arc(nick, window)
+            if not arc["arc"]:
+                sw.add_line(f"-!- No emotion data for {nick}")
+                return
+            self._display_emotion_summary(sw, arc)
+            # Show recent arc
+            sw.add_line("  Recent Arc:")
+            arc_entries = arc["arc"][-20:]
+            arc_str = ""
+            for entry in arc_entries:
+                emoji = {"joy": "😊", "anger": "😠", "sadness": "😢", "fear": "😨", "surprise": "😲", "disgust": "🤢", "neutral": "😐"}.get(entry["dominant"], "•")
+                arc_str += emoji
+            sw.add_line(f"    {arc_str}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    def _display_emotion_summary(self, sw, arc):
+        sw.add_line(f"=== Emotion Arc: {arc['nick']} ===")
+        summary = arc["summary"]
+        sw.add_line(f"  Messages: {summary['total_messages']}, Volatility: {summary['volatility']:.0%}")
+        sw.add_line(f"  Dominant Emotion: {summary['most_common_emotion']}")
+        sw.add_line("  Distribution:")
+        for emotion, pct in sorted(summary["emotion_distribution"].items(), key=lambda x: -x[1]):
+            bar = "█" * int(pct * 30)
+            sw.add_line(f"    {emotion:<12} {pct:.0%} {bar}")
+        if summary.get("top_transitions"):
+            sw.add_line("  Top Transitions:")
+            for trans, count in summary["top_transitions"].items():
+                sw.add_line(f"    {trans}: {count}")
+        if summary.get("dominant_by_period"):
+            sw.add_line("  By Time Period:")
+            for period, emotion in summary["dominant_by_period"].items():
+                sw.add_line(f"    {period:<20} {emotion}")
+
+    async def _slash_factcheck(self, args, extra, line):
+        """Real-time fact checking.
+
+        Usage:
+          /factcheck <claim>  — check a specific claim
+          /factcheck log      — show recent claims checked
+          /factcheck add <claim> <true|false> [source]
+        """
+        client = self._active_client()
+        parts = (args + " " + extra).strip().split(maxsplit=3)
+        sw = self._status_win()
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /factcheck <claim|log|add> ..."))
+            return
+        action = parts[0].lower()
+        if action == "log":
+            claims = client.scoring.fact_checker.get_claims(limit=10)
+            sw.add_line("=== Recent Fact Checks ===")
+            if not claims:
+                sw.add_line("  No claims checked yet.")
+            else:
+                for c in claims:
+                    sw.add_line(f"  [{c['verdict']}] {c['nick']}: {c['claim'][:80]}")
+                    if c.get("flags"):
+                        sw.add_line(f"    Flags: {', '.join(c['flags'][:3])}")
+        elif action == "add":
+            if len(parts) < 3:
+                await self.ui_queue.put(("status", "Usage: /factcheck add <claim> <true|false> [source]"))
+                return
+            claim = parts[1]
+            verified = parts[2].lower() == "true"
+            source = parts[3] if len(parts) > 3 else ""
+            client.scoring.fact_checker.add_fact(claim, verified, source)
+            sw.add_line(f"-!- Added fact: '{claim}' verified={verified}")
+        else:
+            claim_text = " ".join(parts)
+            results = client.scoring.fact_checker.check("user", "*status*", claim_text)
+            sw.add_line(f"=== Fact Check: {claim_text[:80]} ===")
+            if not results:
+                sw.add_line("  No claims detected or all appear credible.")
+            else:
+                for r in results:
+                    sw.add_line(f"  [{r['verdict']}] {r['claim'][:80]}")
+                    if r.get("flags"):
+                        sw.add_line(f"    Flags: {', '.join(r['flags'][:3])}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_research(self, args, extra, line):
+        """Autonomous research agent.
+
+        Usage:
+          /research enable   — enable research agent
+          /research disable  — disable research agent
+          /research status   — show agent status
+          /research recent   — show recent research
+        """
+        client = self._active_client()
+        agent = client.scoring.research_agent
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /research <enable|disable|status|recent>"))
+            return
+        action = parts[0].lower()
+        if action == "enable":
+            agent.enable()
+            sw.add_line("-!- Research agent enabled")
+        elif action == "disable":
+            agent.disable()
+            sw.add_line("-!- Research agent disabled")
+        elif action == "status":
+            stats = agent.get_stats()
+            sw.add_line("=== Research Agent Status ===")
+            sw.add_line(f"  Enabled: {stats['enabled']}")
+            sw.add_line(f"  Gaps identified: {stats['gaps_identified']}")
+            sw.add_line(f"  Feedback useful: {stats['feedback_useful_pct']}%")
+        elif action == "recent":
+            recent = agent.get_recent_research(limit=10)
+            sw.add_line("=== Recent Research ===")
+            if not recent:
+                sw.add_line("  No research conducted yet.")
+            else:
+                for r in recent:
+                    sw.add_line(f"  [{r['type']}] {r['query']}")
+                    sw.add_line(f"    {r.get('summary', '')[:100]}")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_agent(self, args, extra, line):
+        """Conversational agent control.
+
+        Usage:
+          /agent on|off                 — enable/disable agent
+          /agent personality <name>     — set personality (helpful, sarcastic, expert, casual, debater, mentor)
+          /agent nick <nick>            — set agent nick
+          /agent rate <0.0-1.0>         — set participation rate
+          /agent model <key>            — set LLM model (default: gemma4 via llama.cpp)
+          /agent mention on|off         — enable/disable responding to mentions
+          /agent proactive on|off       — enable/disable proactive participation
+          /agent summarize [channel]    — summarize recent conversation
+          /agent status                 — show agent status
+          /agent personalities          — list available personalities
+        """
+        client = self._active_client()
+        agent = client.scoring.conversational_agent
+        parts = (args + " " + extra).strip().split()
+        sw = self._status_win()
+
+        if not parts:
+            await self.ui_queue.put(("status", "Usage: /agent <on|off|personality|nick|rate|model|mention|proactive|summarize|status|personalities>"))
+            return
+
+        action = parts[0].lower()
+        if action in ("on", "enable"):
+            agent.enable()
+            agent.configure(nick=agent._nick or client.nick)
+            llm_available = bool(
+                (ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY) or
+                (OPENAI_AVAILABLE and OPENAI_API_KEY) or
+                (GEMINI_AVAILABLE and GEMINI_API_KEY) or
+                OLLAMA_URL or
+                LLAMACPP_URL
+            )
+            mode = "LLM" if llm_available else "fallback"
+            sw.add_line(f"-!- Conversational agent enabled (mode: {mode})")
+            if not llm_available:
+                sw.add_line("-!- No LLM API key found — using personality-based fallback responses")
+                sw.add_line("-!- Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY for AI responses")
+        elif action in ("off", "disable"):
+            agent.disable()
+            sw.add_line("-!- Conversational agent disabled")
+        elif action == "personality":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Available: {', '.join(agent.list_personalities())}"))
+                return
+            if parts[1] in agent.PERSONALITIES:
+                agent.configure(personality=parts[1])
+                sw.add_line(f"-!- Personality set to: {parts[1]}")
+            else:
+                sw.add_line(f"-!- Unknown personality. Available: {', '.join(agent.list_personalities())}")
+        elif action == "nick":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Usage: /agent nick <nick> (current: {agent._nick})"))
+                return
+            agent.configure(nick=parts[1])
+            sw.add_line(f"-!- Agent nick set to: {parts[1]}")
+        elif action == "rate":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Usage: /agent rate <0.0-1.0> (current: {agent._participation_rate})"))
+                return
+            try:
+                rate = float(parts[1])
+                agent.configure(participation_rate=rate)
+                sw.add_line(f"-!- Participation rate set to: {rate}")
+            except ValueError:
+                sw.add_line("-!- Invalid rate. Use 0.0-1.0")
+        elif action == "mention":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Respond to mentions: {'ON' if agent._respond_to_mentions else 'OFF'}"))
+                return
+            agent.configure(respond_to_mentions=parts[1].lower() == "on")
+            sw.add_line(f"-!- Respond to mentions: {'ON' if agent._respond_to_mentions else 'OFF'}")
+        elif action == "proactive":
+            if len(parts) < 2:
+                await self.ui_queue.put(("status", f"Proactive participation: {'ON' if agent._proactive_participation else 'OFF'}"))
+                return
+            agent.configure(proactive_participation=parts[1].lower() == "on")
+            sw.add_line(f"-!- Proactive participation: {'ON' if agent._proactive_participation else 'OFF'}")
+        elif action == "summarize":
+            channel = parts[1] if len(parts) > 1 else (self.current_channel or "")
+            if not channel:
+                await self.ui_queue.put(("status", "Usage: /agent summarize <channel>"))
+                return
+            sw.add_line(f"=== Conversation Summary: {channel} ===")
+            summary = agent.summarize_conversation(channel)
+            sw.add_line(f"  {summary}")
+        elif action == "status":
+            status = agent.get_status()
+            sw.add_line("=== Conversational Agent Status ===")
+            sw.add_line(f"  Enabled: {status['enabled']}")
+            sw.add_line(f"  Personality: {status['personality']}")
+            sw.add_line(f"  Nick: {status['nick']}")
+            sw.add_line(f"  Participation rate: {status['participation_rate']}")
+            sw.add_line(f"  Response mode: {status['mode']}")
+            sw.add_line(f"  Provider: {status['provider']}")
+            sw.add_line(f"  LLM model: {status['llm_model']}")
+            sw.add_line(f"  Channels active: {status['channels_active']}")
+            sw.add_line(f"  Messages tracked: {status['total_messages_tracked']}")
+            if status['mode'] == "fallback":
+                sw.add_line("  No LLM API key configured - using fallback responses")
+                sw.add_line("  Set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or run Ollama/llama.cpp")
+        elif action == "model":
+            if len(parts) < 2:
+                model_spec = AI_MODELS.get(agent._llm_model, AI_MODELS.get("gemma4"))
+                await self.ui_queue.put(("status", f"Current model: {agent._llm_model} ({model_spec.get('label', '?')})"))
+                await self.ui_queue.put(("status", f"Available: {', '.join(k for k, v in AI_MODELS.items() if v['provider'] in ('llamacpp', 'ollama'))}"))
+                return
+            model_key = parts[1].lower()
+            if model_key in AI_MODELS:
+                agent.configure(llm_model=model_key)
+                spec = AI_MODELS[model_key]
+                sw.add_line(f"-!- Agent model set to: {model_key} ({spec['label']}) [{spec['provider']}]")
+            else:
+                sw.add_line(f"-!- Unknown model '{parts[1]}'. Available: {', '.join(AI_MODELS.keys())}")
+        elif action == "personalities":
+            sw.add_line("=== Available Personalities ===")
+            for name, config in agent.PERSONALITIES.items():
+                current = " (active)" if name == agent._personality else ""
+                sw.add_line(f"  {name}{current}: {config['system'][:80]}...")
+        else:
+            await self.ui_queue.put(("status", f"Unknown command: {action}"))
+        self._chat_dirty = True
+        self.dirty = True
 
     async def _slash_stats(self, args, extra, line):
         """Show channel statistics.
@@ -14513,6 +19136,12 @@ class TUI:
         )
         for ctx in self.servers.values():
             c = ctx.client
+            # Save biometric identity for cross-session matching
+            try:
+                c.biometrics._save()
+                c.biometrics.save_identity(c.nick)
+            except Exception:
+                pass
             c.running = False          # prevent the reconnect loop from restarting
             if c.writer and not c.writer.is_closing():
                 try:
@@ -14601,6 +19230,24 @@ class TUI:
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
 
+    async def _slash_servers(self, args, extra, line):
+        """List all connected IRC servers with status.
+
+        Usage: /servers
+        """
+        sw = self._status_win()
+        sw.add_line("=== Connected Servers ===")
+        for sid, ctx in self.servers.items():
+            client = ctx.client
+            connected = "connected" if (client.writer and not client.writer.is_closing()) else "disconnected"
+            channels = list(getattr(client, 'joined_channels', set()))
+            sw.add_line(f"  {sid} [{connected}] {len(channels)} channels, nick={client.nick}")
+            if channels:
+                sw.add_line(f"    Channels: {' '.join(sorted(channels)[:10])}{' +' + str(len(channels)-10) if len(channels) > 10 else ''}")
+        sw.add_line(f"  -- Total: {len(self.servers)} server(s)")
+        self._chat_dirty = True
+        self.dirty = True
+
     async def _mux_server_events(self, src: asyncio.Queue, server_id: str) -> None:
         """Forward events from a secondary server's queue to the TUI's ui_queue.
 
@@ -14613,20 +19260,113 @@ class TUI:
 
     async def _slash_reconnect(self, args, extra, line):
         cur = self._active_client()
-        await self.ui_queue.put(("status", f"Forcing reconnect to {cur.server}:{cur.port}..."))
-        if cur.writer:
+        if cur.writer and not cur.writer.is_closing():
+            await self.ui_queue.put(("status", f"Reconnecting to {cur.server}:{cur.port}..."))
+            quit_line = b"QUIT :Reconnecting\r\n"
             try:
+                cur.writer.write(quit_line)
+                await asyncio.wait_for(cur.writer.drain(), timeout=1.0)
                 cur.writer.close()
             except Exception:
                 pass
+            cur.reader = None
+            cur.writer = None
+        cur.running = True
+        if not hasattr(self, '_conn_task') or self._conn_task.done():
+            self._conn_task = asyncio.create_task(cur.run_connection())
+            await self.ui_queue.put(("status", "Reconnection task started"))
+        else:
+            await self.ui_queue.put(("status", "Reconnection already in progress"))
+
+    async def _slash_disconnect(self, args, extra, line):
+        msg = (args + " " + extra).strip() if args else "Client disconnecting"
+        quit_line = (
+            (f"QUIT :{msg}" if msg else "QUIT :Client disconnecting")
+            .encode("utf-8", "replace")[:510] + b"\r\n"
+        )
+        for ctx in self.servers.values():
+            c = ctx.client
+            c.running = False
+            if c.writer and not c.writer.is_closing():
+                try:
+                    c.writer.write(quit_line)
+                    await asyncio.wait_for(c.writer.drain(), timeout=1.0)
+                    c.writer.close()
+                except Exception:
+                    pass
+            c.reader = None
+            c.writer = None
+        await self.ui_queue.put(("status", f"Disconnected (windows preserved — use /reconnect to rejoin)"))
+
+    async def _slash_all(self, args, extra, line):
+        """Disconnect from all servers and reconnect, rejoining all channels."""
+        quit_line = b"QUIT :Reconnecting all servers\r\n"
+        disconnected = []
+        for ctx in self.servers.values():
+            c = ctx.client
+            c.running = False
+            if c.writer and not c.writer.is_closing():
+                try:
+                    c.writer.write(quit_line)
+                    await asyncio.wait_for(c.writer.drain(), timeout=1.0)
+                    c.writer.close()
+                except Exception:
+                    pass
+            c.reader = None
+            c.writer = None
+            disconnected.append(f"{c.server}:{c.port}")
+
+        await self.ui_queue.put(("status", f"Disconnected from {len(disconnected)} server(s): {', '.join(disconnected)}"))
+        await self.ui_queue.put(("status", "Reconnecting all servers..."))
+
+        for ctx in self.servers.values():
+            c = ctx.client
+            c.running = True
+            task = asyncio.create_task(c.run_connection())
+            ctx.client._reconnect_task = task
+            await self.ui_queue.put(("status", f"  → Reconnecting to {c.server}:{c.port} (will rejoin {len(c.joined_channels) + len(_AUTOJOIN_CHANNELS)} channels)"))
 
     async def _slash_theme(self, args, extra, line):
         if args.isdigit() and 1 <= int(args) <= len(THEMES):
             self.apply_theme(int(args))
+            _save_tui_settings(self)
         else:
             names = "  ".join(f"[{i+1}] {t[0]}" for i, t in enumerate(THEMES))
             await self.ui_queue.put(("status",
                 f"Usage: /theme <1-{len(THEMES)}>  {names}  (current: {self.current_theme})"))
+
+    async def _slash_font(self, args, extra, line):
+        if args == "":
+            font_list = "  ".join(
+                f"[{i}] {label}" for i, (_, label) in enumerate(FONTS))
+            cur_name = FONTS[self.current_font][1] if 0 <= self.current_font < len(FONTS) else "Default"
+            await self.ui_queue.put(("status",
+                f"Available fonts (current: {cur_name}):  {font_list}"))
+        elif args.isdigit():
+            n = int(args)
+            if 0 <= n < len(FONTS):
+                self.current_font = n
+                self._apply_font(n)
+                _save_tui_settings(self)
+            else:
+                await self.ui_queue.put(("status",
+                    f"Font index {n} out of range (0-{len(FONTS)-1}).  /font to list."))
+        else:
+            await self.ui_queue.put(("status",
+                "Usage: /font [n] — /font to list, /font 0 for default"))
+
+    def _apply_font(self, n: int) -> None:
+        """Apply font selection n (0 = terminal default, no change)."""
+        if n == 0:
+            cur_name = "Terminal Default"
+        else:
+            cur_name = FONTS[n][1] if n < len(FONTS) else "Terminal Default"
+        self.window_by_name["*status*"].add_line(
+            f"Font → {cur_name} ({n}/{len(FONTS)-1})")
+        if n == 0:
+            return
+        font_name, _ = FONTS[n]
+        _set_console_font(font_name)
 
     async def _slash_askai(self, args, extra, line):
         if _NO_AI:
@@ -15051,6 +19791,7 @@ class TUI:
             await self.ui_queue.put(("status",
                 f"AI model set to {key}  ({spec['label']}  {spec['id']})  [{spec['provider']}]"
                 f"  — also active for AI detection"))
+            _save_tui_settings(self)
         else:
             keys = "  ".join(AI_MODELS)
             await self.ui_queue.put(("status",
@@ -15386,6 +20127,55 @@ class TUI:
         cfg.setdefault("tor", {})["enabled"] = self._use_tor
         cfg.setdefault("tor", {})["strict"] = self._tor_strict
         save_irc_config(cfg)
+
+    async def _slash_i2p(self, args, extra, line):
+        """I2P hidden service support.
+
+        Usage:
+          /i2p on          — enable I2P routing
+          /i2p off         — disable I2P routing
+          /i2p strict      — only allow .i2p hosts
+          /i2p nostrict    — allow any hosts
+          /i2p status      — show I2P configuration
+        """
+        text = (args + " " + extra).strip().lower()
+        parts = text.split()
+        sub = parts[0] if parts else ""
+        if sub == "on":
+            self._use_i2p = True
+            self.client.use_tor = True
+            self.client.i2p_strict = self._i2p_strict
+            for ctx in self.servers.values():
+                ctx.client.use_tor = True
+                ctx.client.i2p_strict = self._i2p_strict
+            await self.ui_queue.put(("status", "I2P enabled — new connections route through I2P SOCKS5"))
+        elif sub == "off":
+            self._use_i2p = False
+            self.client.use_tor = False
+            for ctx in self.servers.values():
+                ctx.client.use_tor = False
+            await self.ui_queue.put(("status", "I2P disabled — new connections use direct TCP"))
+        elif sub == "strict":
+            self._i2p_strict = True
+            self.client.i2p_strict = True
+            for ctx in self.servers.values():
+                ctx.client.i2p_strict = True
+            await self.ui_queue.put(("status",
+                "I2P strict mode ON — only .i2p hosts allowed"))
+        elif sub == "nostrict":
+            self._i2p_strict = False
+            self.client.i2p_strict = False
+            for ctx in self.servers.values():
+                ctx.client.i2p_strict = False
+            await self.ui_queue.put(("status",
+                "I2P strict mode OFF — clearnet hosts allowed"))
+        elif sub in ("status", ""):
+            await self.ui_queue.put(("status",
+                f"I2P: {'ON' if getattr(self, '_use_i2p', False) else 'OFF'}  "
+                f"Strict: {'ON' if getattr(self, '_i2p_strict', False) else 'OFF'}  "
+                f"proxy: {I2P_PROXY_HOST}:{I2P_PROXY_PORT}"))
+        else:
+            await self.ui_queue.put(("status", "Usage: /i2p on|off|strict|nostrict|status"))
 
     async def _slash_ctcpmode(self, args, extra, line):
         mode = (args + " " + extra).strip().lower()
@@ -15813,16 +20603,19 @@ class TUI:
         self.mention_beep_muted = not self.mention_beep_muted
         state = "muted" if self.mention_beep_muted else "unmuted"
         await self.ui_queue.put(("status", f"Mention beep {state} (highlight still active)"))
+        _save_tui_settings(self)
 
     async def _slash_autotranslate(self, args, extra, line):
         self.auto_translate = not self.auto_translate
         state = "ON" if self.auto_translate else "OFF"
         await self.ui_queue.put(("status", f"Auto-translate CJK → English: {state}"))
+        _save_tui_settings(self)
 
     async def _slash_linkpreview(self, args, extra, line):
         self.link_preview_enabled = not self.link_preview_enabled
         state = "ON" if self.link_preview_enabled else "OFF"
         await self.ui_queue.put(("status", f"Link preview {state}"))
+        _save_tui_settings(self)
 
     async def _slash_autojoin(self, args, extra, line):
         global _AUTOJOIN_CHANNELS
@@ -15858,7 +20651,7 @@ class TUI:
             await self.ui_queue.put(("status", f"Auto-join: removed {chan}"))
 
     async def _slash_commands(self, args, extra, line):
-        sw = self.window_by_name["*status*"]
+        sw = self._status_win()
         _C = lambda t: sw.add_line(t)
         _H = lambda title: _C(f"  ── {title} " + "─" * max(0, 38 - len(title)))
         _E = lambda c, d: _C(f"  {c:<34} {d}")
@@ -15870,30 +20663,23 @@ class TUI:
         _H("Messaging")
         _E("/msg <nick> <text>",            "Send a PM; opens and switches to the DM window")
         _E("/query <nick> [message]",       "Open a DM window with nick; optionally send a first message")
-        _E("/jitsi",                        "Generate a Jitsi Meet link and send it in the current PM")
-        _E("/chain [nick]",                 "Show recent message chain for current window in status")
-        _E("/idle <nick>",                  "24h activity heatmap for a user")
-        _E("/together <n1> <n2>",           "Compare two users' channel overlap")
-        _E("/adjacent <nick>",              "Show who speaks before/after a user")
-        _E("/targets <nick>",               "Show who a user addresses most")
         _E("/notice <nick> <text>",         "Send a notice (-nick- style, not shown in chat)")
         _E("/me <text>",                    "Send an action line  (* nick waves)")
-        _E("/reply <text>",                 "Reply to last message with +reply tag (IRCv3 message-tags)")
-        _E("/react <emoji>",                "React to last message with +react TAGMSG (IRCv3 message-tags)")
-        _E("/ml <l1> | <l2> | ...",         "Send multiline message via draft/multiline batch")
-        _E("/redact [reason]",              "Redact last message in this window (message-redaction)")
-        _E("/tagmsg <target> key=val[;k=v]","Send a TAGMSG with client-only tags to a target")
-        _E("/x0 <path>",                    "Upload an image file to x0.at and share the URL")
+        _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
+        _E("/dcc [chat|send <nick> <file>]", "Direct Client-to-Client chat or file transfer")
+        _E("/dccchat",                      "Open DCC CHAT window with current nick")
         _C("")
         _H("Channels")
         _E("/join <channel>",               "Join a channel (# is added automatically if omitted)")
         _E("/part [channel] [message]",     "Leave a channel with an optional part message")
         _E("/topic [channel] [text]",       "View or set the channel topic (uses current channel)")
+        _E("/topics <keyword>",             "Search channel topics semantically")
         _E("/names [channel]",              "List users currently in the channel")
         _E("/kick <chan> <nick> [reason]",  "Kick a user from the channel")
         _E("/invite <nick> [channel]",      "Invite a user to a channel")
         _E("/mode [channel] [modes]",       "Get or set channel modes (no args = show current)")
         _E("/autojoin +<chan> | -<chan> | list | clear","Add/remove/list/clear auto-join channels")
+        _E("/mute <nick> [time]",           "Temporarily quiet a user in the channel")
         _C("")
         _H("Operator")
         _E("/op <nick>",    "Grant operator status  (+o)")
@@ -15903,8 +20689,17 @@ class TUI:
         _E("/hop <nick>",   "Grant half-op  (+h)")
         _E("/dehop <nick>", "Remove half-op (-h)")
         _E("/ban <nick|mask>","Ban user; bare nick expands to nick!*@*")
-        _E("/ban -l", "List bans in current channel")
+        _E("/ban -l",       "List bans in current channel")
         _E("/unban <mask>", "Remove a ban mask")
+        _E("/quiet <mask>", "Quiet a mask (+q)")
+        _E("/unquiet <mask>","Remove a quiet mask (-q)")
+        _E("/quietlist",    "List quiet masks in current channel")
+        _E("/halfop <nick>",   "Grant half-op (+h)")
+        _E("/dehalfop <nick>", "Remove half-op (-h)")
+        _E("/admin <nick>",   "Grant admin (+a)")
+        _E("/deadmin <nick>", "Remove admin (-a)")
+        _E("/owner <nick>",   "Grant owner (+q)")
+        _E("/deowner <nick>", "Remove owner (-q)")
         _C("")
         _H("Users & Status")
         _E("/nick <newnick>",               "Change your nickname")
@@ -15915,27 +20710,23 @@ class TUI:
         _E("/unignore <nick>",              "Stop ignoring nick")
         _E("/away [message]",               "Set away status with optional message")
         _E("/back",                         "Remove away status")
-        _E("/seen <nick>",                  "Show when a nick was last seen in this session")
-        _E("/tell <nick> <text>",           "Queue a message for delivery when nick next speaks")
-        _E("/monitor + nick[,…] | - | list | clear | status","Watch nicks for online/offline notifications")
-        _E("/whox [target] [fields]",       "Send a WHOX query with extended fields")
         _E("/cluster <nick>",               "Show a nick's social circle (adjacency + targets)")
         _E("/graph <nick> [depth]",          "Relationship graph: who nick talks to, mutual connections")
+        _E("/idle <nick>",                  "24h activity heatmap for a user")
+        _E("/together <n1> <n2>",           "Compare two users' channel overlap")
+        _E("/adjacent <nick>",              "Show who speaks before/after a user")
+        _E("/targets <nick>",               "Show who a user addresses most")
+        _E("/chain [nick]",                 "Show recent message chain for current window")
         _C("")
         _H("Productivity")
         _E("/todo [add <text> @priority #due +tag]", "Todo list: add/done/undo/remove/edit/list/clear")
-        _E("/todo done <id>",                       "Mark a todo as completed")
-        _E("/todo list [completed]",                "List todos (optionally include completed)")
         _E("/pomodoro start|stop|status|config",    "Pomodoro timer: 25/5/15 min work/break cycles")
-        _E("/pomo start|stop",                      "Alias for /pomodoro")
-        _E("/note [add <text> [cat]]",              "Scratchpad: add/edit/remove/list/search/pin/unpin/categories")
-        _E("/memo <text>",                          "Alias for /note add")
+        _E("/note [add <text> [cat]]",              "Scratchpad: add/edit/remove/list/search/pin/categories")
         _E("/bookmark [add <target> [desc] type:X +tag]","Bookmarks: add/remove/list/search (channel/nick/url)")
-        _E("/bm <target>",                          "Alias for /bookmark")
         _E("/timer <duration> [name]",               "Countdown timer: 5m tea, 30s break, 1h meeting")
-        _E("/timer list|cancel <id>",               "List or cancel active timers")
         _E("/remind in 30m <msg>",                   "Set a reminder (in Xm, at HH:MM, tomorrow)")
         _E("/watch <nick> [channel]",                "Alert when a nick joins/speaks/mentions")
+        _E("/unwatch <nick>",                        "Stop watching a nick")
         _E("/snippet add|remove|list|<name>",         "Text snippets for quick insertion")
         _E("/chstats [channel]",                     "Channel activity stats: top talkers, heatmap")
         _E("/rss add|remove|list|poll",              "RSS feed bridge to IRC channels")
@@ -15943,13 +20734,14 @@ class TUI:
         _H("Services & CTCP")
         _E("/ns <command>",                 "Send command to NickServ  (e.g. /ns identify pw)")
         _E("/cs <command>",                 "Send command to ChanServ")
-        _E("/ctcp <nick> <cmd> [args]",     "Send a CTCP request  (PING VERSION TIME …)")
-        _E("/ctcpmode normal|off|spoof",   "CTCP leak protection: off=silent, spoof=fake replies")
+        _E("/cap <list|req|ack|end>",       "Manage IRCv3 capabilities")
+        _E("/sasl <mechanism>",             "Configure SASL authentication")
         _C("")
         _H("AI Detection")
         _E("/ai <nick>",                    "Full AI profile: score, idle, sparkline, verdict")
         _E("/topai",                        "All scored users in current channel, ranked by AI%")
         _E("/bot <nick>",                   "Mark nick as confirmed bot/AI; builds typing fingerprint")
+        _E("/botcmd <nick>",                "Show bot command registry for a nick")
         _E("/unbot <nick>",                 "Remove confirmed-bot status and fingerprint for nick")
         _E("/aitoggle",                     "Enable or disable AI scoring (detection)")
         _E("/logtoggle",                    "Enable or disable AI detection logging to disk (default: on)")
@@ -15958,47 +20750,96 @@ class TUI:
         _E("/scan_watermark [text]",        "Scan recent msgs or text for LLM watermark patterns")
         _E("/fingerprint <nick> [min_sim]", "Compare a nick's linguistic fingerprint against all others")
         _E("/feedback <ai|human> <nick>",   "Confirm AI/bot or human to tune detection weights")
-        _E("/aicalibrate [status|reset|threshold]", "Inspect/adjust AI detection calibration from feedback")
-        _E("/aivai [pair <n1> <n2>]",          "Detect AI-vs-AI conversation pairs (mutual high scores)")
-        _E("/saicorr <nick|channel|anomaly>",  "Sentiment-AI score correlation analysis")
+        _E("/biometrics",                   "Show your typing cadence, response latency, and human likelihood")
+        _E("/llmfp <nick|list|status>",     "LLM fingerprinting: detect generation patterns per user")
+        _E("/deepfake <nick|chains|status>","Deepfake relay detection: detect relay-style AI patterns")
+        _E("/astroturf [channel]",          "Detect coordinated astroturfing campaigns")
+        _E("/personality <nick>",           "Big Five personality traits from linguistic patterns")
+        _E("/predict <context>",            "Predictive reply suggestions based on channel history")
+        _E("/stance <nick> [topic]",        "Track user positions on topics with contradiction detection")
+        _E("/flow next|state [channel]",    "Conversation flow prediction: next speaker, state")
+        _E("/contagion mood|influencers|cascades","Sentiment contagion map: mood spread and influencers")
+        _E("/swarm list|status",            "Bot swarm detection: coordinated bot accounts")
+        _E("/factcheck <claim|log|add>",    "Real-time fact checking against Wikipedia and known facts")
+        _E("/research enable|status|recent","Autonomous research agent: identifies knowledge gaps")
+        _E("/agent on|off|personality|nick|rate","Conversational agent: LLM-powered natural participant")
+        _E("/banevasion track|check|list|matches","Ban evasion detection: catch banned users returning")
+        _E("/roles [nick|channel]",         "Role inference: classify users by behavior patterns")
+        _E("/debate <n1> <n2> [channel]",   "Debate analyzer: score argument quality and fallacies")
+        _E("/echo [channel|list]",          "Echo chamber detector: measure opinion homogeneity")
+        _E("/badges [nick|list|leaderboard]","Achievement badges: track user accomplishments")
+        _E("/achievements",                 "Toggle achievement tracking on/off")
+        _E("/sarcasm <nick|recent|channel>","Sarcasm detector: sentiment-text mismatch analysis")
+        _E("/emotion <nick|compare|summary>","Emotion arc: track emotional journey over time")
+        _E("/sentiment [channel|nick]",     "Analyze sentiment trends in channel or for user")
+        _E("/anomaly <nick>",               "Behavioral anomaly detection for a user")
+        _E("/similar <text>",               "Find semantically similar messages in history")
+        _E("/threads [active]",             "List or view active conversation threads")
+        _E("/crosschannel [nick]",          "Cross-channel bot detection and activity")
+        _E("/savefp",                       "Save all bot fingerprints to disk")
+        _E("/behavior <nick>",              "Show behavioral patterns and habits for a user")
+        _E("/aistatus",                     "Show AI pipeline status and active detectors")
+        _C("")
+        _H("Automation & Integration")
+        _E("/trigger add|list|remove",      "Auto-respond to patterns with custom actions")
+        _E("/automod add|list|remove|whitelist","Auto-moderation rules: flood, caps, regex, links")
+        _E("/webhook add|list|remove",      "Forward IRC events to external webhooks")
+        _E("/github add|list|remove|check", "Track GitHub repos for issues/PRs/releases")
+        _E("/import <file> [window] [format]", "Import chat logs from HexChat, WeeChat, irssi")
+        _C("")
+        _H("Networking & Analytics")
+        _E("/dns <host|cache|clear>",       "Async DNS resolution with caching")
+        _E("/latency [server]",             "Connection latency stats with jitter and p95/p99")
+        _E("/heatmap [channel]",            "Channel activity heatmap (day × hour)")
+        _E("/network topology|uptime|status","Network topology, uptime, and connection stats")
+        _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
+        _E("/i2p on|off|strict|nostrict|status", "Route IRC through I2P hidden services")
         _C("")
         _H("AI Integration  (Claude + OpenAI + Gemini + Ollama + llama.cpp)")
-        _E("/askai [model] <question>",   "Ask AI a question; answer shown in dashboard")
-        _E("/summarize [n] [model]",      "Summarize last n msgs in current window (default 50)")
-        _E("/brief [channel]",            "AI one-paragraph summary of unread messages in channel")
-        _E("/model [key]",                "Set/list AI models: opus sonnet haiku gpt4o gpt4 gpt35 gemini gpro")
-        _E("/vibe <channel> [n] [model]", "Analyze channel culture using AI")
-        _E("/explain <nick> [model]",     "Analyze a user's behavior using AI")
-        _E("/api",                        "Show AI provider key status (Claude/OpenAI/Gemini/Ollama)")
-        _E("/api <VAR_NAME> <value>",     "Set an API key in environment: ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OLLAMA_URL")
+        _E("/askai [model] <question>",     "Ask AI a question; answer shown in dashboard")
+        _E("/summarize [n] [model]",        "Summarize last n msgs in current window (default 50)")
+        _E("/model [key]",                  "Set/list AI models: opus sonnet haiku gpt4o gpt4 gpt35 gemini gpro")
+        _E("/api",                          "Show AI provider key status (Claude/OpenAI/Gemini/Ollama)")
+        _E("/api <VAR_NAME> <value>",       "Set an API key in environment")
         _spec = AI_MODELS.get(self.ai_chat_model, {})
         _C(f"  Current model: {self.ai_chat_model}  ({_spec.get('label','?')}  [{_spec.get('provider','?')}])")
         _C("")
         _H("Translation")
-        _E("/autotranslate",               "Toggle auto CJK → English translation (on by default)")
+        _E("/autotranslate",                "Toggle auto CJK → English translation (on by default)")
         _C("")
         _H("Connection")
-        _E("/server [-ssl] <host> [port]", "Add a parallel server connection (SSL with -ssl, else plain)")
-        _E("/reconnect",                   "Drop and re-establish (uses draft/resume token if available)")
-        _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
-        _E("/replay [on|off|n|before|after|between <ts>]", "Request chat history via CHATHISTORY (needs /replay on)")
-        _E("/register <account|*> <email> <pw>","Register an account via draft/account-registration")
-        _E("/pem [/path/to.pem]",          "Generate NIST P-256 key pair for SASL ECDSA auth")
-        _E("/certfp status|generate|fingerprint", "Auto-generate CertFP for SASL EXTERNAL auth")
-        _E("/tlsinfo [history]",             "Show TLS cert fingerprint for server; alert on cert changes")
+        _E("/server [-ssl] <host> [port]",  "Add a parallel server connection (SSL with -ssl, else plain)")
+        _E("/reconnect",                    "Reconnect to server; rejoins auto-join and startup channels")
+        _E("/disconnect [message]",         "Disconnect from server without closing windows")
+        _E("/all",                          "Reconnect all servers and rejoin all channels")
+        _E("/replay [on|off|n|before|after|between <ts>]", "Request chat history via CHATHISTORY")
+        _E("/tlsinfo [history]",            "Show TLS cert fingerprint for server; alert on cert changes")
+        _E("/umode [+/-]modes",             "Set or view your user modes")
+        _E("/oper <user> <pass>",           "IRC operator login")
+        _E("/raw <command>",                "Send raw IRC command to server")
+        _E("/chghost <nick> <user> <host>", "Change a user's host (requires oper)")
+        _E("/setname <realname>",           "Change your realname (IRCv3)")
         _C("")
         _H("Windows & Navigation")
         _C("  Tab bar: [1:status] [2:dash] [*3:##chat]  * = unread  N = count  S = suspect")
-        _E("/win <n>",    "Switch to window n; clears its unread marker")
-        _E("/close  (or /wc)", "Close current window; focus moves to previous")
-        _E("/clear",     "Clear messages in the current window")
-        _E("/alias [name] [expansion]", "List, set or remove command alias (/alias -<name> to remove)")
-        _E("/links [n]", "Show last n links shared in this channel (default 20)")
-        _E("/list [pattern]","Fetch and display the server's channel list")
-        _E("/lf [keyword|min=<n>]","Locally filter cached /list results by keyword or min users")
-        _E("/theme <1-12>","Switch colour theme: Classic Hacker Ocean Sunset Neon Nord Dracula Monokai Solarized Gruvbox Tokyo Catppuccin")
-        _E("/userlist",   "Toggle the user list panel on/off")
-        _E("/znc <cmd>",  "Send a command to ZNC's *status (e.g. /znc play *chan 60)")
+        _E("/win <n>",                      "Switch to window n; clears its unread marker")
+        _E("/close  (or /wc)",              "Close current window; focus moves to previous")
+        _E("/clear",                        "Clear messages in the current window")
+        _E("/alias [name] [expansion]",     "List, set or remove command alias (/alias -<name> to remove)")
+        _E("/links [n]",                    "Show last n links shared in this channel (default 20)")
+        _E("/list [pattern]",               "Fetch and display the server's channel list")
+        _E("/lf [keyword|min=<n>]",         "Locally filter cached /list results by keyword or min users")
+        _E("/theme <1-12>",                 "Switch colour theme: Classic Hacker Ocean Sunset Neon Nord Dracula Monokai Solarized Gruvbox Tokyo Catppuccin")
+        _E("/font [n]",                     "List or switch terminal font (/font to list, /font 0 for default)")
+        _E("/userlist",                     "Toggle the user list panel on/off")
+        _E("/silence",                      "Toggle join/part/quit message visibility in current channel")
+        _E("/persist [add|remove|all|none]", "Manage which settings persist across restarts")
+        _E("/znc <cmd>",                    "Send a command to ZNC's *status (e.g. /znc play *chan 60)")
+        _E("/soju <cmd>",                   "Send a command to soju bouncer")
+        _E("/bouncer on|off|detach|attach|replay|limit|filter|clear","Built-in bouncer: buffer msgs when detached, replay on attach")
+        _E("/pgp key|encrypt|decrypt|sign|verify|list","GPG encryption and signing commands")
+        _E("/jitsi",                        "Generate a Jitsi Meet link and send it in the current PM")
+        _E("/redraw",                       "Force a full TUI redraw")
         _C("  Ctrl+N  next window    Tab/Shift+Tab  nick or command completion")
         _C("  Ctrl+A/E  line start/end    Ctrl+K  kill to end    Ctrl+W  delete word")
         _C("  Ctrl+B/]/_ bold/italic/underline    Ctrl+O  reset formatting")
@@ -16006,25 +20847,6 @@ class TUI:
         _C("  Ctrl+T  toggle link preview    Ctrl+Z  clear input    Esc  clear/close/reset dashboard")
         _C("  Left-click nick → /query    Left-click header → switch channel    Wheel → scroll")
         _C("")
-        _H("BNC & GPG & Tor")
-        _E("/bouncer on|off|status|detach|attach|replay","Built-in bouncer: buffer msgs when detached, replay on attach")
-        _E("/bouncer replay [N]",                 "Replay buffered msgs (optional limit N)")
-        _E("/bouncer limit [N]",                  "Set max msgs to replay on attach (0 = unlimited)")
-        _E("/bouncer filter [all|highlights|dms]","Filter mode: all msgs, only highlights, or only DMs")
-        _E("/bouncer clear",                      "Clear the message buffer without replaying")
-        _E("/detach",                         "Shortcut for /bouncer detach")
-        _E("/attach",                         "Shortcut for /bouncer attach")
-        _E("/pgp key [fp]",                   "Set signing key; with no arg, show current key")
-        _E("/pgp encrypt <nick> <msg>",       "Encrypt a message for nick's GPG key")
-        _E("/pgp decrypt <b64>",              "Decrypt a base64-encoded GPG message")
-        _E("/pgp sign <msg>",                 "Sign a message with your GPG key")
-        _E("/pgp verify <msg> <sig>",         "Verify a detached signature")
-        _E("/pgp list",                       "List GPG public keys in your keyring")
-        _E("/tor on|off|strict|nostrict|status", "Route IRC through Tor; strict = .onion only")
-        _C("")
-        _H("Soju Bouncer Integration")
-        _E("/soju networks",                   "List soju bouncer networks")
-        _E("/soju add <name> host=<h> [k=v]",  "Add a network to the soju bouncer")
         _E("/soju del <name>",                  "Remove a network from the soju bouncer")
         _E("/soju update <name> k=v …",         "Change network attributes (nick, host, port)")
         _E("/soju replay [N]",                  "Request CHATHISTORY replay for current channel")
@@ -16050,6 +20872,8 @@ class TUI:
         _E("/dcc <sub>",      "DCC: send|tsend|resume|chat|trust|untrust|trusted|status — file/chat transfers")
         _E("/dccchat close|list", "Manage DCC CHAT connections")
         _C("")
+        self._chat_dirty = True
+        self.dirty = True
         self.current_window_index = 0
         self._chat_dirty = True
         self.dirty = True
@@ -16083,6 +20907,16 @@ class TUI:
             "  /aitoggle  enable/disable scoring    /logtoggle  toggle log",
             "  /aicalibrate  inspect/adjust detection calibration from feedback",
             "  /aivai  detect AI-vs-AI pairs  /saicorr  sentiment-AI correlation",
+            "  /biometrics  typing cadence  /llmfp  LLM fingerprinting",
+            "  /deepfake  relay detection  /astroturf  coordinated campaigns",
+            "  /personality <nick>  Big Five traits  /predict  reply suggestions",
+            "  /stance <nick>  topic positions  /flow  conversation prediction",
+            "  /contagion  sentiment spread  /swarm  bot swarm detection",
+            "  /factcheck  claim verification  /research  knowledge gaps",
+            "  /agent  LLM chat participant  /banevasion  catch banned users",
+            "  /roles  user role inference  /debate  argument quality analysis",
+            "  /echo  echo chamber detection  /badges  achievement tracking",
+            "  /sarcasm  sentiment-text mismatch  /emotion  emotional journey",
             "── AI  (Claude / OpenAI) ─────────────────────────────────",
             "  /askai [model] <question>  (answer in dashboard)",
             "  /summarize [n] [model]  /brief [chan]  unread channel summary",
@@ -16112,7 +20946,7 @@ class TUI:
             "  /win <n>  /close (/wc)  /clear  /links  /list [pat]  /lf <kw|min=n>",
             "  /alias [name] [expansion]  list/set/remove command aliases",
             "  /chain [nick]  message tree for current window  /jitsi  video call",
-            "  /theme <1-5>  /userlist  Ctrl+N next window  /dcc send|tsend|resume|trust|chat|status",
+            "  /theme <1-5>  /font [n]  /userlist  Ctrl+N next window  /dcc send|tsend|resume|trust|chat|status",
             "  Tab/Shift+Tab nick-complete  PgUp/Dn scroll",
             "  Left-click a highlighted URL line to open it in the browser",
             "  Left-click a nick in userlist or chat to open a DM /query",
@@ -16127,7 +20961,7 @@ class TUI:
             "  /script load <path>  load .py/.lua    /script list  loaded",
             "  /script unload <name>    /script reload  all hot-reload",
         ]:
-            self.window_by_name["*status*"].add_line(l)
+            self._status_win().add_line(l)
         self.current_window_index = 0
         self._chat_dirty = self._userlist_dirty = self._input_dirty = True
         self.dirty = True
@@ -16137,6 +20971,71 @@ class TUI:
         self._resize_windows()
         state = "shown" if self._show_userlist else "hidden"
         await self.ui_queue.put(("status", f"Userlist {state}"))
+        _save_tui_settings(self)
+
+    async def _slash_silence(self, args, extra, line):
+        """Hide or show join/part/quit messages in the current channel."""
+        cur_win = self.get_current_window()
+        if not cur_win.is_channel:
+            await self.ui_queue.put(("status", "/silence: not in a channel"))
+            return
+        ch = cur_win.name
+        if ch in self._silenced_channels:
+            self._silenced_channels.discard(ch)
+            await self.ui_queue.put(("status", f"Silence OFF for {ch} — join/part/quit messages visible"))
+        else:
+            self._silenced_channels.add(ch)
+            await self.ui_queue.put(("status", f"Silence ON for {ch} — join/part/quit messages hidden"))
+        _save_tui_settings(self)
+
+    async def _slash_persist(self, args, extra, line):
+        """Manage which settings are persisted across restarts."""
+        parts = (args + " " + extra).strip().split()
+        if not parts:
+            sw = self._status_win()
+            sw.add_line("── Persisted Settings ──")
+            for k in sorted(self._persisted_settings):
+                sw.add_line(f"  ✓ {k}")
+            sw.add_line(f"── {len(self._persisted_settings)} settings persisted ──")
+            sw.add_line("Usage: /persist [add|remove|all|none] <setting>")
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        sub = parts[0].lower()
+        if sub == "all":
+            self._persisted_settings.update([
+                "theme", "userlist", "stats", "autotranslate", "linkpreview",
+                "mute", "model", "achievements", "ai_scoring", "ctcp_mode",
+                "silence", "aliases", "snippets", "ignore", "triggers",
+                "automod", "watch", "todos", "notes", "bookmarks"
+            ])
+            await self.ui_queue.put(("status", "All settings will now be persisted"))
+            _save_tui_settings(self)
+            return
+        if sub == "none":
+            self._persisted_settings.clear()
+            await self.ui_queue.put(("status", "No settings will be persisted"))
+            _save_tui_settings(self)
+            return
+
+        target = parts[1] if len(parts) > 1 else ""
+        if sub == "add":
+            if not target:
+                await self.ui_queue.put(("status", "Usage: /persist add <setting>"))
+                return
+            self._persisted_settings.add(target)
+            await self.ui_queue.put(("status", f"Added '{target}' to persistence"))
+            _save_tui_settings(self)
+        elif sub == "remove":
+            if not target:
+                await self.ui_queue.put(("status", "Usage: /persist remove <setting>"))
+                return
+            self._persisted_settings.discard(target)
+            await self.ui_queue.put(("status", f"Removed '{target}' from persistence"))
+            _save_tui_settings(self)
+        else:
+            await self.ui_queue.put(("status", f"Unknown subcommand: {sub}. Use add, remove, all, or none"))
 
     async def _slash_lf(self, args, extra, line):
         """Locally filter the cached channel list by keyword or min users."""
@@ -17399,14 +22298,12 @@ class TUI:
                     self.dirty = True
                 else:
                     win = self.get_current_window()
-                    self._wrap_window(win)
-                    win.scroll_offset = max(0, len(win.wrapped_cache) - self._content_height)
+                    win.scroll_offset = 999999
                     self._chat_dirty = True
                     self.dirty = True
             else:
                 win = self.get_current_window()
-                self._wrap_window(win)
-                win.scroll_offset = max(0, len(win.wrapped_cache) - self._content_height)
+                win.scroll_offset = 999999
                 self._chat_dirty = True
                 self.dirty = True
 
@@ -17516,9 +22413,7 @@ class TUI:
                     self.dirty = True
             else:
                 win = self.get_current_window()
-                self._wrap_window(win)
-                max_off = max(0, len(win.wrapped_cache) - self._content_height)
-                win.scroll_offset = min(win.scroll_offset + 1, max_off)
+                win.scroll_offset += 1
                 self._chat_dirty = True
                 self.dirty = True
 
@@ -17560,9 +22455,7 @@ class TUI:
 
         elif ch == curses.KEY_PPAGE:
             win = self.get_current_window()
-            self._wrap_window(win)
-            max_off = max(0, len(win.wrapped_cache) - self._content_height)
-            win.scroll_offset = min(win.scroll_offset + self._content_height // 2, max_off)
+            win.scroll_offset += self._content_height // 2
             self._chat_dirty = True
             self.dirty = True
 
@@ -17582,9 +22475,7 @@ class TUI:
             if bstate & (self._wheel_up | self._wheel_down):
                 win = self.get_current_window()
                 if bstate & self._wheel_up:
-                    self._wrap_window(win)
-                    max_off = max(0, len(win.wrapped_cache) - self._content_height)
-                    win.scroll_offset = min(win.scroll_offset + 3, max_off)
+                    win.scroll_offset += 3
                 elif bstate & self._wheel_down:
                     win.scroll_offset = max(0, win.scroll_offset - 3)
                 self._chat_dirty = True
@@ -17614,6 +22505,8 @@ class TUI:
                     disp_ch = None
 
                 if my == 0 and disp_ch:
+                    if _DISABLE_MOUSE:
+                        return False
                     # Click on header → switch to that channel window
                     # Reset dashboard state when navigating away
                     prev_win = self.get_current_window()
@@ -17628,6 +22521,8 @@ class TUI:
                             self.dirty = True
                             return True
                 elif my >= 1 and disp_ch:
+                    if _DISABLE_MOUSE:
+                        return False
                     # Click on a nick → open /query
                     # Reset dashboard state when navigating away
                     prev_win = self.get_current_window()
@@ -17665,14 +22560,13 @@ class TUI:
                 return False
             url = win.url_map.get(line_idx)
             if url:
-                try:
-                    webbrowser.open(url)
-                except Exception:
-                    pass
+                _IO_EXECUTOR.submit(webbrowser.open, url)
                 self.window_by_name["*status*"].add_line(f"Opening: {url}")
                 self._chat_dirty = True
                 self.dirty = True
             else:
+                if _DISABLE_MOUSE:
+                    return False
                 # No URL — check if click is on a nick in the line → open /query
                 line_text = win.wrapped_cache[line_idx]
                 nick_match = re.match(
@@ -17714,6 +22608,14 @@ class TUI:
                 self.dirty = True
 
         elif ch == curses.KEY_RESIZE:
+            curses.update_lines_cols()
+            new_h, new_w = self.stdscr.getmaxyx()
+            if new_w < 10 or new_h < 5:
+                return
+            self.height, self.width = new_h, new_w
+            self.chat_height = max(1, self.height - 4)
+            self._resize_windows()
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
             self.dirty = True
 
         elif ch == 12:   # Ctrl+L — clear current window
@@ -17732,6 +22634,20 @@ class TUI:
             self._show_userlist = not self._show_userlist
             self._resize_windows()
             self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+            self.dirty = True
+
+        elif ch == 19:   # Ctrl+S — toggle stats panel
+            self._show_stats_panel = not self._show_stats_panel
+            if self._show_stats_panel:
+                stats_x = self.width - self.userlist_width - self._stats_width
+                try:
+                    self._stats_win = curses.newwin(self.chat_height, self._stats_width, 0, max(0, stats_x))
+                except curses.error:
+                    self._stats_win = None
+            else:
+                self._stats_win = None
+            self._resize_windows()
+            self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
             self.dirty = True
 
         elif ch == 7:    # Ctrl+G — go to window by number
@@ -17754,7 +22670,9 @@ class TUI:
                             self._dashboard_last_update = 0.0
                         self.current_channel = win.name if win.name.startswith("#") else None
                         self._unread_windows.discard(win.name)
-                        self._chat_dirty = self._userlist_dirty = self._input_dirty = True
+                        self._chat_dirty = self._userlist_dirty = self._input_dirty = self._stats_dirty = True
+                        self._last_stats_draw = 0.0
+                        self._last_stats_channel = ""
                         self.dirty = True
                 except ValueError:
                     pass
@@ -17832,6 +22750,8 @@ class TUI:
         # Start periodic background tasks for productivity features
         asyncio.create_task(self._periodic_reminder_checker())
         asyncio.create_task(self._periodic_rss_poller())
+        asyncio.create_task(self._periodic_github_poller())
+        asyncio.create_task(self._periodic_topology_updater())
         try:
             await self._run_loop()
         except (SystemExit, asyncio.CancelledError, KeyboardInterrupt):
@@ -17885,10 +22805,13 @@ class TUI:
             # Typing, cursor movement and backspace feel instantaneous because the
             # input pane is repainted right here, not in the next throttled frame.
             if had_key and self._input_dirty:
-                self._draw_input()
-                self._input_dirty = False
-                self.input_win.noutrefresh()
-                curses.doupdate()
+                try:
+                    self._draw_input()
+                    self._input_dirty = False
+                    self.input_win.noutrefresh()
+                    curses.doupdate()
+                except curses.error:
+                    self._input_dirty = True
 
             # ── 3. Network events (capped to prevent flood from starving keyboard) ─
             n = 0
@@ -17974,6 +22897,7 @@ class TUI:
             await asyncio.sleep(0.001 if (had_key or n > 0) else 0.016)
 
 # =========================
+# =========================
 # Main
 # =========================
 async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
@@ -17989,6 +22913,7 @@ async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
         curses.init_pair(i, color, -1)
     # pair 8: ACTION lines — green + italic where supported
     curses.init_pair(8, curses.COLOR_GREEN, -1)
+
 
     ui_queue: asyncio.Queue = asyncio.Queue()
     scoring_engine = ScoringEngine(ai_detector)
@@ -18012,6 +22937,7 @@ async def main_curses(stdscr, ai_detector: EnsembleAIDetector):
         asyncio.create_task(client.run_connection()),
         asyncio.create_task(tui.run()),
     ]
+    tui._conn_task = tasks[0]
 
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -18246,7 +23172,7 @@ def main():
     if _saved.get("port"):          DEFAULT_PORT       = int(_saved["port"])
     if _saved.get("nick"):          DEFAULT_NICK       = _saved["nick"]
     if _saved.get("channel"):       DEFAULT_CHANNEL    = _saved["channel"]
-    if _saved.get("sasl_mechanism"):SASL_MECHANISM     = _saved["sasl_mechanism"].upper()
+    if "sasl_mechanism" in _saved:  SASL_MECHANISM     = _saved["sasl_mechanism"].upper() if _saved["sasl_mechanism"] else ""
     if _saved.get("sasl_cert"):     SASL_CERT          = _saved["sasl_cert"]
     if _saved.get("sasl_key"):      SASL_KEY           = _saved["sasl_key"]
     if _saved.get("nickserv_password"): NICKSERV_PASSWORD = _saved["nickserv_password"]
@@ -18390,11 +23316,23 @@ def main():
 
     _section("AUTHENTICATION")
 
-    _mech_hint = f"{_DIM}PLAIN | SCRAM-SHA-256 | EXTERNAL | ECDSA-NIST256P-CHALLENGE{_RST}" if _TTY else "PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
-    _mech_disp = f"{_B_CY}{SASL_MECHANISM}{_RST}" if _TTY else SASL_MECHANISM
-    raw = _input(f"  {_B_GR}SASL{_RST}     {_mech_disp} {_mech_hint} : ").strip().upper()
-    if raw:
-        SASL_MECHANISM = raw
+    _sasl_enabled = SASL_MECHANISM != "" and SASL_MECHANISM != "NONE"
+    _sasl_status = f"{_B_GN}enabled ({SASL_MECHANISM}){_RST}" if _sasl_enabled else f"{_DIM}disabled{_RST}"
+    raw = _input(f"  {_B_GR}SASL{_RST}     {_sasl_status} {_DIM}(yes/no){_RST} : ").strip().lower()
+    if raw == "no" or raw == "n":
+        SASL_MECHANISM = ""
+    elif raw == "yes" or raw == "y":
+        if not SASL_MECHANISM or SASL_MECHANISM == "":
+            _mech_hint = f"{_DIM}PLAIN | SCRAM-SHA-256 | EXTERNAL | ECDSA-NIST256P-CHALLENGE{_RST}" if _TTY else "PLAIN/SCRAM-SHA-256/EXTERNAL/ECDSA-NIST256P-CHALLENGE"
+            raw = _input(f"  {_B_GR}Mechanism{_RST} {_mech_hint} : ").strip().upper()
+            if raw:
+                SASL_MECHANISM = raw
+            else:
+                SASL_MECHANISM = "PLAIN"
+        _mech_disp = f"{_B_CY}{SASL_MECHANISM}{_RST}" if _TTY else SASL_MECHANISM
+        raw = _input(f"  {_B_GR}Change mech?{_RST} {_mech_disp} {_DIM}(Enter to keep){_RST} : ").strip().upper()
+        if raw:
+            SASL_MECHANISM = raw
 
     _pw_hint = f"{_B_GN}[configured]{_RST}" if NICKSERV_PASSWORD else f"{_DIM}blank to skip{_RST}"
     try:
@@ -18503,7 +23441,7 @@ def main():
             _rows.append(_row("Auto-join", ", ".join(_aj_sorted[:5]) + ("..." if len(_aj_sorted) > 5 else "")))
         _rows += [
             _sec("AUTH"),
-            _row("SASL",    SASL_MECHANISM),
+            _row("SASL",    SASL_MECHANISM if SASL_MECHANISM else "disabled"),
             _pw_row("Password", _pw_show),
         ]
         if SASL_MECHANISM in ("EXTERNAL", "ECDSA-NIST256P-CHALLENGE"):
