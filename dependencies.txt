@@ -1,10 +1,11 @@
-anthropic	Claude AI chat/agent	pip install anthropic
-openai	GPT-4/GPT-3.5 chat/agent	pip install openai
-google-genai	Gemini chat/agent	pip install google-genai
-cryptography	ECDSA SASL auth	pip install cryptography
-Pillow (PIL)	Image compression for x0.at uploads	pip install Pillow
-transformers + torch	AI detection (classifiers, Binoculars, embeddings)	pip install transformers torch
-peft	LoRA fine-tuning for AI classifiers	pip install peft
-sentence-transformers	Semantic similarity detection	pip install sentence-transformers
-numpy	Embedding vector math	pip install numpy
-lupa	Lua scripting engine	pip install lupa
+anthropic
+openai
+google-genai
+cryptography
+Pillow
+transformers
+torch
+peft
+sentence-transformers
+numpy
+lupa
