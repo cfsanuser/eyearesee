@@ -52,6 +52,7 @@ from analyzers import (
 # =========================
 _NO_AI:         bool = "--no-ai"              in sys.argv
 _NO_INSTALL:    bool = "--no-install"         in sys.argv
+_LLM_ONLY:      bool = "--llm-only"           in sys.argv
 _REQUIRE_VENV:  bool = "--require-virtualenv" in sys.argv
 _DISABLE_MOUSE: bool = "--disable-mouse"      in sys.argv
 
@@ -22995,7 +22996,7 @@ def _ensure_deps() -> bool:
         ("openai",              "openai",                 "OpenAI API client  (/askai, /summarize with GPT models)"),
         ("google.genai", "google-genai",    "Google AI SDK  (/askai, /summarize with Gemini)"),
     ]
-    if not _NO_AI:
+    if not _NO_AI and not _LLM_ONLY:
         wanted += [
             ("transformers", "transformers",   "AI text detection  (HuggingFace)"),
             ("torch",        "torch",          "AI text detection  (PyTorch)"),
@@ -23477,6 +23478,8 @@ def main():
     # terminal and don't corrupt the TUI display.
     if _NO_AI:
         print("  AI detection: DISABLED (--no-ai)")
+    elif _LLM_ONLY:
+        print("  Install mode: LLM-only (--llm-only)  — skipping torch/transformers")
     ai_detector = EnsembleAIDetector(disabled=_NO_AI)
     if not _NO_AI:
         _load_all_nick_ai_history()
