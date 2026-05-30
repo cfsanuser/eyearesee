@@ -8,3 +8,6 @@ peft	LoRA fine-tuning for AI classifiers	pip install peft
 sentence-transformers	Semantic similarity detection	pip install sentence-transformers
 numpy	Embedding vector math	pip install numpy
 lupa	Lua scripting engine	pip install lupa
+
+
+torch alone is the culprit — it ships CUDA libraries for every GPU architecture. If you manually pip install torch --index-url https://download.pytorch.org/whl/cpu you get the CPU-only build at ~200 MB instead of 2.5 GB.
