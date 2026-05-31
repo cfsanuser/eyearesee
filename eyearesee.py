@@ -867,6 +867,47 @@ def irc_strip_formatting(text: str) -> str:
     """Remove all IRC formatting codes, returning plain text."""
     return _IRC_FMT_RE.sub("", text)
 
+
+_CTRL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def sanitize_clipboard(text: str) -> str:
+    """Strip control characters and IRC formatting from pasted text."""
+    text = _CTRL_CHARS_RE.sub("", text)
+    text = _IRC_FMT_RE.sub("", text)
+    # Replace invisible/confusable Unicode with safe ASCII equivalents
+    replacements = {
+        '\u200b': '', '\u200c': '', '\u200d': '', '\u200e': '', '\u200f': '',
+        '\u2028': '\n', '\u2029': '\n', '\u00a0': ' ',
+    }
+    for ch, repl in replacements.items():
+        text = text.replace(ch, repl)
+    return text
+
+
+def obfuscate_text(text: str) -> str:
+    """Apply random perturbations to resist stylometric fingerprinting."""
+    if len(text) < 10:
+        return text
+    words = text.split()
+    if not words:
+        return text
+    # Randomize capitalization of 15% of words
+    for i in range(len(words)):
+        if random.random() < 0.15 and words[i].isalpha() and len(words[i]) > 2:
+            words[i] = words[i].upper() if random.random() < 0.5 else words[i].lower()
+    # Randomly add/remove a trailing space before punctuation
+    result = " ".join(words)
+    # Vary spacing around commas/parentheses in 20% of placements
+    if random.random() < 0.2:
+        result = result.replace(" ,", ",").replace("( ", "(").replace(" )", ")")
+    if random.random() < 0.2:
+        result = result.replace(",", ", ").replace("(", " (").replace(")", ") ")
+    # Randomly capitalize first letter or entire sentence
+    if random.random() < 0.1 and result and result[0].isalpha():
+        result = result[0].upper() + result[1:]
+    return result
+
 # =========================
 # Wide-character helpers
 # =========================
@@ -7712,6 +7753,29 @@ class IRCClient:
             user, host = params[2], params[3]
             real = params[5] if len(params) > 5 else ""
             text = f"[whois] {w}  ({user}@{host})  \"{real}\""
+            # Account hijack detection — track user@host per nick
+            if not hasattr(self, '_authcheck_cache'):
+                self._authcheck_cache = {}
+            cache = self._authcheck_cache
+            nl = w.lower()
+            current_uh = f"{user}@{host}"
+            if nl not in cache:
+                cache[nl] = {
+                    "nick": w, "account": "", "userhost": current_uh,
+                    "first_seen": time.time(), "changes": 0, "change_log": [],
+                }
+            elif cache[nl]["userhost"] != current_uh:
+                cache[nl]["changes"] += 1
+                cache[nl]["change_log"].append({
+                    "ts": time.time(), "old": cache[nl]["userhost"], "new": current_uh,
+                })
+                cache[nl]["userhost"] = current_uh
+                await self.ui_queue.put(("status",
+                    f"[auth] ⚠ {w} user@host changed: "
+                    f"{cache[nl]['change_log'][-1]['old']} → {current_uh} "
+                    f"(change #{cache[nl]['changes']})"))
+            else:
+                cache[nl]["userhost"] = current_uh
         elif cmd_key == "312" and len(params) >= 3:
             srv  = params[2]
             info = params[3] if len(params) > 3 else ""
@@ -10033,6 +10097,8 @@ class TUI:
         self.ignored_masks: list = load_irc_config().get("ignored_masks", [])  # list of glob patterns
         self._aliases: Dict[str, str] = dict(load_irc_config().get("aliases", {}))
         self.mention_beep_muted: bool = False
+        self._antifp_enabled: bool = False       # fingerprinting resistance
+        self._clipboard_sanitize: bool = True     # auto-strip on paste
         self._msg_hours: Dict[str, List[int]] = {}
         self._last_speaker: Dict[str, str] = {}
         self._adjacency: Dict[str, Counter] = {}
@@ -12900,6 +12966,7 @@ class TUI:
         h["me"] = h["action"] = self._slash_me
         h["ctcp"]       = self._slash_ctcp
         h["whois"]      = self._slash_whois
+        h["authcheck"]  = self._slash_authcheck
         h["mode"]       = self._slash_mode
         h["topic"]      = self._slash_topic
         h["kick"]       = self._slash_kick
@@ -12929,6 +12996,7 @@ class TUI:
         h["savefp"]     = self._slash_savefp
         h["behavior"]   = self._slash_behavior
         h["biometrics"] = self._slash_biometrics
+        h["antifp"]     = self._slash_antifp
         h["llmfp"]      = self._slash_llmfp
         h["deepfake"]   = self._slash_deepfake
         h["relay"]      = self._slash_deepfake
@@ -13122,6 +13190,9 @@ class TUI:
     async def handle_input_line(self, line: str) -> None:
         if not line.strip():
             return
+        # Clipboard sanitization — strip control chars + IRC formatting on paste
+        if self._clipboard_sanitize and len(line) > 1:
+            line = sanitize_clipboard(line)
         # Sync context to the server owning the current window so slash commands
         # and plain text go to the right server.
         self._sync_draw_ctx()
@@ -13190,6 +13261,9 @@ class TUI:
     async def _send_plain_text(self, line: str) -> None:
         cur_win = self.get_current_window()
         client = self._active_client()
+        # Fingerprinting resistance — perturb text before sending
+        if self._antifp_enabled and not line.startswith("/"):
+            line = obfuscate_text(line)
         client.biometrics.record_composition_complete()
         client.biometrics.record_response()
         # DCC CHAT: route text over the direct TCP connection
@@ -13239,6 +13313,61 @@ class TUI:
     async def _slash_whois(self, args, extra, line):
         if args:
             self._active_client().cmd_whois(args)
+
+    async def _slash_authcheck(self, args, extra, line):
+        """Check for potential account hijacking by comparing WHOIS user@host.
+
+        Usage:
+          /authcheck <nick>   — check if nick's user@host changed since last WHOIS
+          /authcheck list     — show all tracked accounts with suspicious activity
+
+        Tracks account → user@host mappings across WHOIS replies. Alerts when
+        a NickServ-identified nick appears from a different user@host.
+        """
+        client = self._active_client()
+        sw = self._status_win()
+        if not hasattr(client, '_authcheck_cache'):
+            client._authcheck_cache = {}
+        cache = client._authcheck_cache
+        nick = (args or "").strip()
+
+        if nick.lower() == "list":
+            if not cache:
+                sw.add_line("-!- No accounts tracked yet. Run /whois on some users first.")
+            else:
+                sw.add_line("=== Account Identity History ===")
+                for account, info in sorted(cache.items()):
+                    changes = info.get("changes", 0)
+                    sw.add_line(f"  {account}: {info['nick']} ({info['userhost']}) "
+                                f"first seen {time.strftime('%H:%M', time.localtime(info['first_seen']))}"
+                                + (f"  ⚠ {changes} host change(s)" if changes else ""))
+            self._chat_dirty = True
+            self.dirty = True
+            return
+
+        if not nick:
+            await self.ui_queue.put(("status", "Usage: /authcheck <nick>  or  /authcheck list"))
+            return
+
+        # Trigger a fresh WHOIS to get current user@host
+        info = cache.get(nick.lower())
+        if info:
+            sw.add_line(f"=== Account audit: {nick} ===")
+            sw.add_line(f"  Account   : {info.get('account', 'unknown')}")
+            sw.add_line(f"  User@host : {info.get('userhost', 'unknown')}")
+            sw.add_line(f"  First seen: {time.strftime('%Y-%m-%d %H:%M', time.localtime(info['first_seen']))}")
+            if info.get("changes"):
+                sw.add_line(f"  ⚠ Host changes detected: {info['changes']}")
+                for ch in info.get("change_log", []):
+                    sw.add_line(f"    {time.strftime('%H:%M', time.localtime(ch['ts']))}  {ch['old']} → {ch['new']}")
+            else:
+                sw.add_line(f"  ✓ No suspicious host changes")
+            sw.add_line(f"  (Re-fetching WHOIS for current state...)")
+        else:
+            sw.add_line(f"-!- No data for {nick} yet. Running WHOIS now...")
+        client.cmd_whois(nick)
+        self._chat_dirty = True
+        self.dirty = True
 
     async def _ev_chanmode(self, event):
         _, channel, modestr, mode_args = event
@@ -14235,6 +14364,30 @@ class TUI:
             sw.add_line("  IRCv3 read-marker: active")
         self._chat_dirty = True
         self.dirty = True
+
+    async def _slash_antifp(self, args, extra, line):
+        """Toggle fingerprinting resistance for outgoing messages.
+
+        Usage:
+          /antifp         — toggle on/off
+          /antifp on      — enable
+          /antifp off     — disable
+
+        When enabled, outgoing messages are randomly perturbed (capitalization,
+        spacing, punctuation) to resist stylometric tracking by AI detectors.
+        """
+        sub = (args or "").strip().lower()
+        if sub in ("on", "enable", "1"):
+            self._antifp_enabled = True
+        elif sub in ("off", "disable", "0"):
+            self._antifp_enabled = False
+        else:
+            self._antifp_enabled = not self._antifp_enabled
+        state = "ON" if self._antifp_enabled else "OFF"
+        await self.ui_queue.put(("status",
+            f"Fingerprinting resistance: {state}  "
+            f"(randomizes case/spacing/punctuation)"))
+        _save_tui_settings(self)
 
     async def _slash_llmfp(self, args, extra, line):
         """Show LLM fingerprint analysis for a nick or list top suspects.
