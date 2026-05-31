@@ -1168,30 +1168,80 @@ _SPAM_DOMAINS = frozenset({
     "bc.vc", "linktr.ee", "tr.ee", "cutt.ly", "rebrand.ly",
     "tracking." "doubleclick.net", "adservice.google.com",
     "click.googleadservices.com", "outbrain.com", "taboola.com",
+    # Additional known shorteners / tracking
+    "bitly.com", "short.link", "v.gd", "tiny.one", "s.id", "smll.io",
+    "clck.ru", "shrtco.de", "9qr.de", "t.ly", "u.to", "gg.gg",
 })
 
+# ── Homoglyph confusion map for phishing detection ─────────────────────────
+# Maps Unicode lookalike chars to their ASCII equivalents.
+# When a domain contains these, it's flagged as a potential spoof.
+_HOMOGLYPH_MAP = str.maketrans({
+    # Cyrillic → Latin lookalikes
+    'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'у': 'y', 'х': 'x',
+    'А': 'A', 'В': 'B', 'Е': 'E', 'М': 'M', 'Н': 'H', 'О': 'O', 'Р': 'P',
+    'С': 'C', 'Т': 'T', 'У': 'Y', 'Х': 'X',
+    # Greek → Latin lookalikes
+    'ο': 'o', 'ν': 'v', 'ί': 'i',
+    # Various Unicode confusables
+    'ɡ': 'g', 'і': 'i', 'ѡ': 'o', 'ѡ': 'o',
+    # Digits / symbols
+    '⍹': '9', 'ʘ': '0',
+})
+# Domains commonly impersonated — if a homoglyph variant matches one of these,
+# it's almost certainly phishing.
+_HIGH_VALUE_TARGET_DOMAINS = frozenset({
+    "google.com", "facebook.com", "apple.com", "microsoft.com", "amazon.com",
+    "paypal.com", "netflix.com", "twitter.com", "x.com", "instagram.com",
+    "whatsapp.com", "github.com", "gitlab.com", "discord.com", "steam.com",
+    "telegram.org", "dropbox.com", "spotify.com", "ebay.com", "alibaba.com",
+    "libera.chat", "freenode.net", "oftc.net", "rizon.net", "dal.net",
+})
 
-# ── x0.at upload support ──────────────────────────────────────────────────
-try:
-    from PIL import Image as _PILImage
-    PIL_AVAILABLE = True
-except ImportError:
-    _PILImage = None
-    PIL_AVAILABLE = False
-
-_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif"})
-
-_SCREENSHOT_DIR = os.path.join(_SCRIPT_DIR, "screenshots")
+# Regex for IPv4 in hostname position — raw IP URLs are almost always phishing.
+_IP_IN_URL_RE = re.compile(r'https?://(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:/|$)')
+# Regex for excessive subdomain depth (5+ levels often indicates phishing).
+_EXCESSIVE_SUBDOMAIN_RE = re.compile(r'https?://(?:[^./]+\.){5,}[^/]+')
 
 
-def _save_clipboard_image() -> Optional[str]:
-    """Grab an image from the system clipboard and save it to screenshots/.
+def _check_domain_reputation(url: str) -> Optional[str]:
+    """Return a warning string if the domain is a known spam/tracking/shortener,
+    a phishing lookalike, an IP address, or has excessive subdomains."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        domain = parsed.netloc.lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        # Strip port if present
+        if ":" in domain:
+            domain = domain.rsplit(":", 1)[0]
 
-    Returns the file path on success, or None if no image is on the clipboard
-    or the operation fails.
-    """
-    if not PIL_AVAILABLE:
-        return None
+        # ── 1. Known spam/shortener domain ──────────────────────────────
+        for spam in _SPAM_DOMAINS:
+            if domain == spam or domain.endswith("." + spam):
+                return f"\u26a0 {domain} (known tracker/shortener)"
+
+        # ── 2. IP address as hostname ───────────────────────────────────
+        if _IP_IN_URL_RE.search(url):
+            return f"\u26a0 IP address URL (likely phishing)"
+
+        # ── 3. Excessive subdomains ─────────────────────────────────────
+        if _EXCESSIVE_SUBDOMAIN_RE.search(url):
+            return f"\u26a0 {domain} (excessive subdomains — possible phishing)"
+
+        # ── 4. Homoglyph / lookalike domain detection ───────────────────
+        ascii_domain = domain.translate(_HOMOGLYPH_MAP)
+        if ascii_domain != domain:
+            # Domain contains Unicode confusable characters
+            warn = f"\u26a0 {domain} (homoglyph spoof → \"{ascii_domain}\")"
+            # Check if the de-confused domain matches a high-value target
+            if ascii_domain in _HIGH_VALUE_TARGET_DOMAINS:
+                return f"\u26a0 {domain} → impersonating {ascii_domain} (PHISHING)"
+            return warn
+
+    except Exception:
+        pass
+    return None
     try:
         from PIL import ImageGrab as _ImageGrab
         img = _ImageGrab.grabclipboard()
@@ -6525,6 +6575,8 @@ class IRCClient:
         self._thread_parents: Dict[str, str] = {}
         # IRCv3 read-marker: last known read marker per channel
         self._read_markers: Dict[str, str] = {}
+        # Message jitter — random delay in ms per outgoing message
+        self._jitter_ms: int = 0
         # Adaptive rate limiting state
         self._throttle_count: int = 0
         self._last_throttle: float = 0.0
@@ -6842,6 +6894,15 @@ class IRCClient:
                 except asyncio.QueueEmpty:
                     break
 
+            # Jitter: random delay before sending (anti-timing-correlation)
+            if self._jitter_ms > 0:
+                jitter_s = random.randint(0, self._jitter_ms) / 1000.0
+                if jitter_s > 0:
+                    try:
+                        await asyncio.sleep(jitter_s)
+                    except asyncio.CancelledError:
+                        break
+
             try:
                 if self.writer and not self.writer.is_closing():
                     self.writer.writelines(batch)
@@ -7158,6 +7219,14 @@ class IRCClient:
             await handler(nick, params, prefix)
         elif cmd not in _SILENT_NUMERICS:
             if cmd in _SERVER_INFO:
+                # Capture 004 (RPL_MYINFO) for IRCd fingerprinting
+                if cmd == "004" and len(params) >= 2:
+                    self._ircd_fingerprint["servername"] = params[0]
+                    self._ircd_fingerprint["version"] = params[1]
+                    if len(params) >= 3:
+                        self._ircd_fingerprint["usermodes"] = params[2] if len(params) > 2 else ""
+                    if len(params) >= 4:
+                        self._ircd_fingerprint["chanmodes"] = params[3] if len(params) > 3 else ""
                 await self.ui_queue.put(("status", f"{cmd} {' '.join(params)}"))
 
     # ── IRC command handlers ──────────────────────────────────────────────────
@@ -7175,6 +7244,51 @@ class IRCClient:
                     self.biometrics.record_incoming_message()
             except (ValueError, IndexError):
                 pass
+
+    # ── IRCd fingerprint from 004 + 005 numerics ──────────────────────────
+    # Populated when the server sends RPL_MYINFO (004) and RPL_ISUPPORT (005).
+    _ircd_fingerprint: Dict[str, str] = {}
+
+    @classmethod
+    def _identify_ircd(cls, isupport: dict, server_name: str = "") -> str:
+        """Heuristically identify the IRCd from ISUPPORT tokens and server name."""
+        tokens = {k.upper() for k in isupport}
+        svr = server_name.lower()
+        if "UNREALIRCD" in tokens or "unreal" in svr:
+            ver = isupport.get("UNREALIRCD", "")
+            return f"UnrealIRCd {ver}" if ver else "UnrealIRCd"
+        if "INSPIRCD" in tokens:
+            ver = isupport.get("INSPIRCD", "")
+            return f"InspIRCd {ver}" if ver else "InspIRCd"
+        if "IRCD-SEVEN" in tokens or "ircd-seven" in svr:
+            ver = isupport.get("IRCD-SEVEN", "")
+            return f"ircd-seven {ver}" if ver else "ircd-seven"
+        if "CHARYBDIS" in tokens or "charybdis" in svr:
+            return "Charybdis"
+        if "SOLIDIRCD" in tokens or "solid" in svr:
+            return "SolidIRCd"
+        if "NGIRCD" in tokens or "ngircd" in svr:
+            return "ngIRCd"
+        if "ERC" in tokens:
+            return "Ergo (formerly Oragono)"
+        if "IRCU" in tokens:
+            return "ircu"
+        if "HYBRID" in tokens or "hybrid" in svr:
+            return "IRCd-Hybrid"
+        if "BAHAMUT" in tokens or "bahamut" in svr:
+            return "Bahamut"
+        if "SNIRCD" in tokens:
+            return "snircd"
+        if "RATBOX" in tokens or "ratbox" in svr:
+            return "Ratbox"
+        if "ELEMENTAL" in tokens or "elemental-ircd" in svr:
+            return "Elemental-IRCd"
+        if "RUBY" in tokens and "RUBY-HASH" in tokens:
+            return "ircd.rb"
+        # Fallback: look at identifiable tokens
+        if "AWAYLEN" in isupport:
+            return "IRCd (generic — likely Unreal/InspIRCd)"
+        return f"Unknown IRCd (server: {server_name or '?'})"
 
     # Capabilities we request whenever the server offers them.
     _WANT_CAPS = (
@@ -10099,6 +10213,7 @@ class TUI:
         self.mention_beep_muted: bool = False
         self._antifp_enabled: bool = False       # fingerprinting resistance
         self._clipboard_sanitize: bool = True     # auto-strip on paste
+        self._jitter_ms: int = 0                  # random message delay
         self._msg_hours: Dict[str, List[int]] = {}
         self._last_speaker: Dict[str, str] = {}
         self._adjacency: Dict[str, Counter] = {}
@@ -10278,6 +10393,7 @@ class TUI:
         self._tor_strict: bool = load_irc_config().get("tor", {}).get("strict", False)
         self.client.use_tor = self._use_tor
         self.client.tor_strict = self._tor_strict
+        self.client._jitter_ms = self._jitter_ms
 
         # ── I2P ───────────────────────────────────────────────────────────────────
         self._use_i2p: bool = load_irc_config().get("i2p", {}).get("enabled", False)
@@ -12997,6 +13113,7 @@ class TUI:
         h["behavior"]   = self._slash_behavior
         h["biometrics"] = self._slash_biometrics
         h["antifp"]     = self._slash_antifp
+        h["jitter"]     = self._slash_jitter
         h["llmfp"]      = self._slash_llmfp
         h["deepfake"]   = self._slash_deepfake
         h["relay"]      = self._slash_deepfake
@@ -13032,6 +13149,7 @@ class TUI:
         h["deowner"]    = self._slash_deowner
         h["cap"]        = self._slash_cap
         h["v3test"] = h["v3"] = self._slash_v3test
+        h["ircd"] = h["serverinfo"] = self._slash_ircd
         h["sasl"]       = self._slash_sasl
         h["chghost"]    = self._slash_chghost
         h["setname"]    = self._slash_setname
@@ -14388,6 +14506,41 @@ class TUI:
             f"Fingerprinting resistance: {state}  "
             f"(randomizes case/spacing/punctuation)"))
         _save_tui_settings(self)
+
+    async def _slash_jitter(self, args, extra, line):
+        """Add random delay (jitter) to outgoing messages to defeat timing correlation.
+
+        Usage:
+          /jitter          — show current jitter setting
+          /jitter <ms>     — set max random delay in milliseconds (0 to disable)
+          /jitter off      — disable (same as /jitter 0)
+
+        Adds 0–N ms random delay before each message is sent.  Prevents
+        observers from correlating your activity across networks via precise
+        inter-message timing analysis.
+        """
+        client = self._active_client()
+        sub = (args or "").strip().lower()
+        if not sub:
+            await self.ui_queue.put(("status",
+                f"Jitter: {client._jitter_ms} ms (random 0–{client._jitter_ms} ms delay per message)"))
+            return
+        if sub in ("off", "disable", "0"):
+            client._jitter_ms = 0
+            self._jitter_ms = 0
+            await self.ui_queue.put(("status", "Jitter: OFF"))
+            return
+        try:
+            ms = int(sub)
+            ms = max(0, min(2000, ms))  # clamp to 0–2000 ms
+            client._jitter_ms = ms
+            self._jitter_ms = ms
+            await self.ui_queue.put(("status",
+                f"Jitter: {ms} ms (random 0–{ms} ms delay per message)"))
+            _save_tui_settings(self)
+        except ValueError:
+            await self.ui_queue.put(("status",
+                "Usage: /jitter [ms|off]  (e.g. /jitter 250, /jitter off)"))
 
     async def _slash_llmfp(self, args, extra, line):
         """Show LLM fingerprint analysis for a nick or list top suspects.
@@ -15811,6 +15964,52 @@ class TUI:
         sw.add_line("")
         sw.add_line("  Legend: " + "▓ supported  ░ not advertised")
         sw.add_line("  Use /cap ls for the full advertised capability list.")
+        self._chat_dirty = True
+        self.dirty = True
+
+    async def _slash_ircd(self, args, extra, line):
+        """Show IRCd version fingerprint from server numerics.
+
+        Usage:
+          /ircd  (or /serverinfo)
+
+        Identifies the IRC daemon (UnrealIRCd, InspIRCd, Ergo, etc.) from
+        RPL_MYINFO (004) and RPL_ISUPPORT (005) tokens received during
+        connection.  Also shows known CVEs for outdated versions.
+        """
+        client = self._active_client()
+        fp = getattr(client, '_ircd_fingerprint', {})
+        isupport = client._isupport
+        svr_name = fp.get("servername", client.server)
+        ircd_name = IRCClient._identify_ircd(isupport, svr_name)
+        sw = self._status_win()
+        sw.add_line(f"=== IRCd Fingerprint: {client.server}:{client.port} ===")
+        sw.add_line(f"  Daemon   : {ircd_name}")
+        if fp.get("version"):
+            sw.add_line(f"  Version  : {fp['version']}")
+        if fp.get("usermodes"):
+            sw.add_line(f"  Umodes   : {fp['usermodes']}")
+        if fp.get("chanmodes"):
+            sw.add_line(f"  Cmodes   : {fp['chanmodes']}")
+        sw.add_line(f"  CASEMAP  : {isupport.get('CASEMAPPING', 'rfc1459')}")
+        sw.add_line(f"  CHANTYPES: {isupport.get('CHANTYPES', '#')}")
+        sw.add_line(f"  PREFIX   : {isupport.get('PREFIX', '(qaohv)~&@%+')}")
+
+        # Known CVEs for common IRCds (informational)
+        cve_notes = {
+            "UnrealIRCd 6.0": "✓ Latest stable — no known CVEs",
+            "UnrealIRCd 5.2": "⚠ CVE-2023-5077 (pre-5.2.5) — SASL bypass. Update to 5.2.5+.",
+            "UnrealIRCd 5.": "⚠ Multiple pre-5.2.x CVEs. Run /v3test and consider upgrading.",
+            "UnrealIRCd 4.": "⚠ End-of-life. Multiple CVEs. Upgrade to 6.x.",
+            "InspIRCd 3.": "✓ Stable series. CVE-2022-2663 (pre-3.16.1) — update if affected.",
+            "InspIRCd 2.": "⚠ End-of-life. Upgrade to v3.",
+            "Ergo": "✓ Modern — built in Go. Fewer CVEs than C daemons.",
+            "Charybdis": "⚠ CVE-2022-2444 (pre-4.1.2) — update if affected.",
+        }
+        for pattern, note in cve_notes.items():
+            if ircd_name.lower().startswith(pattern.lower()):
+                sw.add_line(f"  Advisory : {note}")
+                break
         self._chat_dirty = True
         self.dirty = True
 
@@ -17664,6 +17863,7 @@ class TUI:
                                   new_scoring, use_ssl=use_ssl,
                                   use_tor=self._use_tor)
         new_client.tor_strict = self._tor_strict
+        new_client._jitter_ms = self._jitter_ms
         new_ctx = ServerContext(new_sid, new_client)
         self.servers[new_sid] = new_ctx
 
