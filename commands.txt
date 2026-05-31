@@ -191,3 +191,5 @@ Command	Aliases	Description
 /win	/window	Switch to window N
 /x0	 	Upload image to x0.at
 /znc	 	Send command to ZNC bouncer
+/private  Private channels have no chat logs written to disk, no link history logged, and no automatic link title/preview fetching.  
+Use for sensitive conversations, password channels, or operational channels.
